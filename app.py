@@ -45,7 +45,6 @@ def callback():
 
 def handle_message(user_text):
 
-    # 如果使用者輸入「確認」
     if user_text == "確認":
 
         return (
@@ -55,7 +54,6 @@ def handle_message(user_text):
             "下一步會把訂單寫入 Google 試算表。"
         )
 
-    # 其他文字都先視為訂購內容
     return (
         "📚 訂購確認\n"
         "\n"
@@ -70,9 +68,19 @@ def reply_to_line(reply_token, message):
 
     url = "https://api.line.me/v2/bot/message/reply"
 
+    # 檢查 Render 到底有沒有真的讀到 Token
+    if not CHANNEL_ACCESS_TOKEN:
+        print("❌ CHANNEL_ACCESS_TOKEN 沒有讀到")
+        return
+
+    print("✅ CHANNEL_ACCESS_TOKEN 有讀到")
+    print("Token length:", len(CHANNEL_ACCESS_TOKEN))
+    print("Token first 5:", CHANNEL_ACCESS_TOKEN[:5])
+    print("Token last 5:", CHANNEL_ACCESS_TOKEN[-5:])
+
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+        "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
     }
 
     data = {
@@ -88,7 +96,8 @@ def reply_to_line(reply_token, message):
     response = requests.post(
         url,
         headers=headers,
-        json=data
+        json=data,
+        timeout=10
     )
 
     print("LINE reply status:", response.status_code)
