@@ -1,79 +1,84 @@
 from flask import Flask, request
 import os
-import json
-import urllib.request
+import requests
 
 app = Flask(__name__)
 
+CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN")
+CHANNEL_SECRET = os.environ.get("CHANNEL_SECRET")
+
+
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE Order Bot is running!", 200
+    return "LINE Order Bot is running!"
 
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    body = request.get_json(silent=True)
+    body = request.get_json()
 
     print("Webhook received")
     print(body)
 
-    if not body:
-        return "OK", 200
-
     events = body.get("events", [])
 
     for event in events:
-        if (
-            event.get("type") == "message"
-            and event.get("message", {}).get("type") == "text"
-        ):
-            user_message = event["message"]["text"]
-            reply_token = event.get("replyToken")
+        if event.get("type") == "message":
+            message = event.get("message", {})
 
-            print("收到訊息：", user_message)
+            if message.get("type") == "text":
+                user_text = message.get("text", "")
+                reply_token = event.get("replyToken")
 
-            if reply_token:
-                reply_message(reply_token, f"我收到你的訊息了：{user_message}")
+                reply_message = make_order_reply(user_text)
+
+                reply_to_line(reply_token, reply_message)
 
     return "OK", 200
 
 
-def reply_message(reply_token, text):
-    channel_access_token = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+def make_order_reply(user_text):
 
-    if not channel_access_token:
-        print("錯誤：找不到 LINE_CHANNEL_ACCESS_TOKEN")
-        return
+    # 測試用：先把收到的文字整理成訂購確認格式
+    reply_message = (
+        "📚 訂購確認\n"
+        "\n"
+        f"訂購內容：{user_text}\n"
+        "\n"
+        "請確認以上內容。\n"
+        "如果正確，請回覆「確認」"
+    )
+
+    return reply_message
+
+
+def reply_to_line(reply_token, message_text):
 
     url = "https://api.line.me/v2/bot/message/reply"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
+    }
 
     data = {
         "replyToken": reply_token,
         "messages": [
             {
                 "type": "text",
-                "text": text
+                "text": message_text
             }
         ]
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {channel_access_token}"
-    }
-
-    req = urllib.request.Request(
+    response = requests.post(
         url,
-        data=json.dumps(data).encode("utf-8"),
         headers=headers,
-        method="POST"
+        json=data
     )
 
-    try:
-        with urllib.request.urlopen(req) as response:
-            print("LINE 回覆成功：", response.status)
-    except Exception as e:
-        print("LINE 回覆失敗：", e)
+    print("LINE reply status:", response.status_code)
+    print("LINE reply response:", response.text)
 
 
 if __name__ == "__main__":
