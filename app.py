@@ -4,9 +4,8 @@ import requests
 
 app = Flask(__name__)
 
-# Render Environment Variables
-CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
+CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN")
+CHANNEL_SECRET = os.environ.get("CHANNEL_SECRET")
 
 
 @app.route("/", methods=["GET"])
@@ -16,7 +15,8 @@ def home():
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    body = request.get_json(silent=True) or {}
+
+    body = request.get_json()
 
     print("Webhook received")
     print(body)
@@ -24,6 +24,7 @@ def callback():
     events = body.get("events", [])
 
     for event in events:
+
         if event.get("type") != "message":
             continue
 
@@ -32,24 +33,29 @@ def callback():
         if message.get("type") != "text":
             continue
 
-        user_text = message.get("text", "")
+        user_text = message.get("text", "").strip()
         reply_token = event.get("replyToken")
 
-        print("User text:", user_text)
-        print("Reply token exists:", bool(reply_token))
-        print("Access token loaded:", bool(CHANNEL_ACCESS_TOKEN))
+        reply_message = handle_message(user_text)
 
-        if not reply_token:
-            print("No reply token")
-            continue
-
-        reply_message = make_order_reply(user_text)
         reply_to_line(reply_token, reply_message)
 
     return "OK", 200
 
 
-def make_order_reply(user_text):
+def handle_message(user_text):
+
+    # 如果使用者輸入「確認」
+    if user_text == "確認":
+
+        return (
+            "✅ 訂單已確認\n"
+            "\n"
+            "目前測試階段先到這裡。\n"
+            "下一步會把訂單寫入 Google 試算表。"
+        )
+
+    # 其他文字都先視為訂購內容
     return (
         "📚 訂購確認\n"
         "\n"
@@ -60,16 +66,13 @@ def make_order_reply(user_text):
     )
 
 
-def reply_to_line(reply_token, message_text):
-    if not CHANNEL_ACCESS_TOKEN:
-        print("ERROR: LINE_CHANNEL_ACCESS_TOKEN is missing")
-        return
+def reply_to_line(reply_token, message):
 
     url = "https://api.line.me/v2/bot/message/reply"
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}",
+        "Authorization": f"Bearer {CHANNEL_ACCESS_TOKEN}"
     }
 
     data = {
@@ -77,26 +80,26 @@ def reply_to_line(reply_token, message_text):
         "messages": [
             {
                 "type": "text",
-                "text": message_text,
+                "text": message
             }
-        ],
+        ]
     }
 
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=data,
-            timeout=10,
-        )
+    response = requests.post(
+        url,
+        headers=headers,
+        json=data
+    )
 
-        print("LINE reply status:", response.status_code)
-        print("LINE reply response:", response.text)
-
-    except Exception as e:
-        print("LINE reply error:", str(e))
+    print("LINE reply status:", response.status_code)
+    print("LINE reply response:", response.text)
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+
+    port = int(os.environ.get("PORT", 5000))
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
