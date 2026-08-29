@@ -318,7 +318,33 @@ def handle_message(user_id, user_text):
             return change_book(user_id, text)
 
     # -----------------------------------------------------
-    # 11. 查老師教哪幾班
+    # 11. AI 草擬／整理訊息
+    # 這類句子即使出現「王老師」「訂書」，也不要誤判成下單。
+    # 若句子有訂單編號，例如「依照訂單001幫我寫一段話」，
+    # 會先讀 Google 的真實訂單資料，再交給 AI 草擬。
+    # -----------------------------------------------------
+    if is_ai_writing_request(text):
+
+        referenced_order_number = extract_referenced_order_number(text)
+
+        if referenced_order_number:
+            order = lookup_google_order(referenced_order_number)
+
+            if not order:
+                return f"⚠️ 查不到訂單 {referenced_order_number}。"
+
+            historical_order_context[user_id] = order
+
+            return ask_ai_with_order(
+                user_id,
+                user_text,
+                order
+            )
+
+        return ask_ai(user_id, user_text)
+
+    # -----------------------------------------------------
+    # 12. 查老師教哪幾班
     # -----------------------------------------------------
     if (
         "老師" in text
@@ -335,7 +361,7 @@ def handle_message(user_id, user_text):
         return handle_teacher_lookup(user_id, text)
 
     # -----------------------------------------------------
-    # 12. 延續剛剛老師直接訂
+    # 13. 延續剛剛老師直接訂
     # -----------------------------------------------------
     if text.startswith("訂") and "老師" not in text:
 
@@ -349,7 +375,7 @@ def handle_message(user_id, user_text):
             )
 
     # -----------------------------------------------------
-    # 13. 完整一句話訂書
+    # 14. 完整一句話訂書
     # -----------------------------------------------------
     if "訂" in text and "老師" in text:
 
@@ -359,7 +385,7 @@ def handle_message(user_id, user_text):
         )
 
     # -----------------------------------------------------
-    # 14. 原本的查老師格式
+    # 15. 原本的查老師格式
     # -----------------------------------------------------
     if text.startswith("查老師"):
 
@@ -369,16 +395,116 @@ def handle_message(user_id, user_text):
         )
 
     # -----------------------------------------------------
-    # 15. 不是訂書指令 → 交給 AI 一般問答
+    # 16. 不是訂書指令 → 交給 AI 一般問答
     # AI 只負責回答文字，不直接修改 Google 訂單。
     # -----------------------------------------------------
     return ask_ai(user_id, user_text)
 
 
 # =========================================================
+# 判斷是不是「請 AI 幫忙寫／改／整理文字」
+# =========================================================
+def is_ai_writing_request(text):
+
+    writing_words = [
+        "幫我寫",
+        "幫我擬",
+        "幫我打",
+        "幫我整理",
+        "幫我改寫",
+        "幫我潤飾",
+        "幫我回覆",
+        "幫我回",
+        "寫一段",
+        "寫訊息",
+        "寫給",
+        "傳給",
+        "怎麼跟",
+        "怎麼回",
+        "口氣",
+        "正式一點",
+        "輕鬆一點",
+        "簡短一點"
+    ]
+
+    return any(
+        word in text
+        for word in writing_words
+    )
+
+
+# =========================================================
+# 從一般句子抓「被引用的訂單編號」
+# 例如：
+# 依照訂單001幫我寫...
+# 001幫我寫得簡短一點
+# 根據001訂單...
+# =========================================================
+def extract_referenced_order_number(text):
+
+    patterns = [
+        r"訂單\s*(\d{1,})",
+        r"依照\s*(\d{1,})\s*訂單",
+        r"根據\s*(\d{1,})\s*訂單",
+        r"^(\d{1,})\s*(?:幫我|請幫我|寫|改|整理)"
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, text)
+
+        if match:
+            return normalize_order_number(
+                match.group(1)
+            )
+
+    return None
+
+
+# =========================================================
+# 用 Google 真實訂單資料協助 AI 草擬訊息
+# 只讀資料，不修改訂單。
+# =========================================================
+def ask_ai_with_order(
+    user_id,
+    user_text,
+    order
+):
+
+    class_lines = []
+
+    for item in order.get("classes", []):
+        class_lines.append(
+            f"{item['class_name']}："
+            f"{int(item['students'])}本"
+        )
+
+    order_context = (
+        "以下是 Google 試算表查到的真實訂單資料：\\n"
+        f"訂單編號：{order.get('order_number', '')}\\n"
+        f"老師：{order.get('teacher', '')}\\n"
+        f"學校：{order.get('school', '')}\\n"
+        f"書名：{order.get('book', '')}\\n"
+        f"出版社：{order.get('publisher', '')}\\n"
+        + "\\n".join(class_lines)
+        + f"\\n總數量：{order.get('quantity', 0)}本\\n"
+        f"狀態：{order.get('status', '')}"
+    )
+
+    return ask_ai(
+        user_id,
+        user_text,
+        extra_context=order_context
+    )
+
+
+# =========================================================
 # 一般 AI 問答
 # =========================================================
-def ask_ai(user_id, user_text):
+def ask_ai(
+    user_id,
+    user_text,
+    extra_context=""
+):
 
     if not OPENAI_API_KEY:
         print("OpenAI API key missing")
@@ -404,6 +530,13 @@ def ask_ai(user_id, user_text):
             f"{role_name}：{item['text']}\n"
         )
 
+    if extra_context:
+        conversation_text += (
+            "\n【系統提供的訂單資料】\n"
+            + extra_context
+            + "\n【訂單資料結束】\n"
+        )
+
     conversation_text += (
         f"使用者：{user_text}\n助理："
     )
@@ -415,6 +548,11 @@ def ask_ai(user_id, user_text):
         "計算與提供工作上的建議。"
         "你不能聲稱自己已經修改、建立或取消任何訂單，"
         "也不能聲稱已經修改 Google 試算表。"
+        "如果系統提供了真實訂單資料，你可以引用那些資料，"
+        "協助使用者草擬要傳給老師的 LINE 訊息、摘要或通知。"
+        "不要自行捏造訂單中沒有的班級、數量、書名或處理進度。"
+        "若使用者只說『正在處理中』，可以照此語意草擬，"
+        "但不要擅自改成『已完成』『已出貨』或『已到貨』。"
         "訂單查詢、建立、修改與確認都由外層固定程式處理。"
         "如果使用者要求你直接更動訂單資料，"
         "請提醒他使用明確的訂書指令。"
