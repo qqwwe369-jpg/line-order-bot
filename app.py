@@ -1137,6 +1137,50 @@ def adjust_pending_order(
     text
 ):
 
+    # -----------------------------------------------------
+    # 自然語句：只取消／移除某一個班級
+    # 701取消 / 取消701 / 不要701 / 701不要
+    # 移除701 / 刪掉701 / 刪除701 / 701移除
+    # 單獨「取消」仍然是取消整張訂單，由外層處理。
+    # -----------------------------------------------------
+    remove_patterns = [
+        r"^(\d{2,4})\s*(?:取消|不要|移除|刪掉|刪除|拿掉)$",
+        r"^(?:取消|不要|移除|刪掉|刪除|拿掉)\s*(\d{2,4})$"
+    ]
+
+    for pattern in remove_patterns:
+        match = re.fullmatch(pattern, text.strip())
+
+        if match:
+            class_name = match.group(1)
+
+            target = find_order_class(
+                order,
+                class_name
+            )
+
+            if not target:
+                return (
+                    f"⚠️ 目前訂單裡沒有 {class_name}。"
+                )
+
+            if len(order["classes"]) <= 1:
+                return (
+                    "⚠️ 目前只剩最後一個班級。\\n"
+                    "如果要取消整張訂單，請直接輸入「取消」。"
+                )
+
+            order["classes"] = [
+                item
+                for item in order["classes"]
+                if str(item["class_name"])
+                != str(class_name)
+            ]
+
+            refresh_order_total(order)
+
+            return make_order_confirmation(order)
+
     order = pending_orders[user_id]
 
     pattern = re.compile(
