@@ -15,6 +15,12 @@ pending_orders = {}
 # 最近查詢的老師
 conversation_context = {}
 
+# 最近查詢的歷史訂單
+historical_order_context = {}
+
+# 等待確認的歷史訂單修改
+pending_history_updates = {}
+
 
 @app.route("/", methods=["GET"])
 def home():
@@ -74,16 +80,124 @@ def handle_message(user_id, user_text):
 
         pending_orders.pop(user_id, None)
         conversation_context.pop(user_id, None)
+        historical_order_context.pop(user_id, None)
+        pending_history_updates.pop(user_id, None)
 
         return (
             "🔄 已重新開始\n\n"
-            "目前的老師與尚未確認訂單都已清除。\n\n"
+            "目前的老師、尚未確認訂單與歷史訂單修改狀態都已清除。\n\n"
             "請告訴我你要查哪位老師。"
         )
 
+    # -----------------------------------------------------
+    # 2. 取消歷史訂單修改
+    # -----------------------------------------------------
+    if text in ["取消修改", "不要修改"]:
+
+        if user_id not in pending_history_updates:
+            return "目前沒有等待確認的歷史訂單修改。"
+
+        pending_history_updates.pop(user_id, None)
+
+        return "❌ 已取消這次歷史訂單修改，Google 原訂單沒有變動。"
 
     # -----------------------------------------------------
-    # 2. 取消目前訂單
+    # 3. 確認歷史訂單修改
+    # -----------------------------------------------------
+    if text == "確認修改":
+
+        update_data = pending_history_updates.get(user_id)
+
+        if not update_data:
+            return "⚠️ 找不到等待確認的歷史訂單修改。"
+
+        success, result = update_google_order(
+            update_data["order"],
+            update_data["modification_text"]
+        )
+
+        if not success:
+            return "❌ 歷史訂單修改失敗，Google 原訂單沒有變動。"
+
+        order_number = update_data["order"]["order_number"]
+
+        refreshed = lookup_google_order(order_number)
+
+        if refreshed:
+            historical_order_context[user_id] = refreshed
+
+        pending_history_updates.pop(user_id, None)
+
+        return (
+            "✅ 訂單修改完成\n\n"
+            f"訂單編號：{order_number}\n"
+            "Google 試算表已更新。\n"
+            "狀態：已修改\n"
+            "修改紀錄：已保存"
+        )
+
+    # -----------------------------------------------------
+    # 4. 查歷史訂單
+    # 支援：查001 / 001訂單內容是什麼 / 訂單001
+    # -----------------------------------------------------
+    order_number = extract_order_lookup_number(text)
+
+    if order_number:
+
+        order = lookup_google_order(order_number)
+
+        if not order:
+            return f"⚠️ 查不到訂單 {order_number}。"
+
+        historical_order_context[user_id] = order
+        pending_history_updates.pop(user_id, None)
+
+        return make_historical_order_reply(order)
+
+    # -----------------------------------------------------
+    # 5. 直接指定歷史訂單修改
+    # 例如：001的701改28本
+    # -----------------------------------------------------
+    direct_history = parse_direct_history_adjustment(text)
+
+    if direct_history:
+
+        order_number = direct_history["order_number"]
+        edit_text = direct_history["edit_text"]
+
+        order = lookup_google_order(order_number)
+
+        if not order:
+            return f"⚠️ 查不到訂單 {order_number}。"
+
+        historical_order_context[user_id] = order
+
+        return prepare_history_adjustment(
+            user_id,
+            order,
+            edit_text
+        )
+
+    # -----------------------------------------------------
+    # 6. 查過歷史訂單後，可直接說 701改28
+    # -----------------------------------------------------
+    if (
+        user_id in historical_order_context
+        and re.search(
+            r"\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
+            text
+        )
+        and user_id not in pending_orders
+    ):
+
+        return prepare_history_adjustment(
+            user_id,
+            historical_order_context[user_id],
+            text
+        )
+
+    # -----------------------------------------------------
+    # 7. 取消目前新訂單
     # -----------------------------------------------------
     if text in [
         "取消",
@@ -93,10 +207,7 @@ def handle_message(user_id, user_text):
     ]:
 
         if user_id not in pending_orders:
-
-            return (
-                "目前沒有尚未確認的訂單。"
-            )
+            return "目前沒有尚未確認的新訂單。"
 
         pending_orders.pop(user_id, None)
 
@@ -106,9 +217,8 @@ def handle_message(user_id, user_text):
             "你可以繼續重新選班級訂書。"
         )
 
-
     # -----------------------------------------------------
-    # 3. 顯示目前訂單
+    # 8. 顯示目前新訂單
     # -----------------------------------------------------
     if text in [
         "目前訂單",
@@ -120,29 +230,25 @@ def handle_message(user_id, user_text):
         order = pending_orders.get(user_id)
 
         if not order:
-
-            return (
-                "目前沒有尚未確認的訂單。"
-            )
+            return "目前沒有尚未確認的新訂單。"
 
         return make_order_confirmation(order)
 
-
     # -----------------------------------------------------
-    # 4. 確認訂單
+    # 9. 確認新訂單
+    # Google 端此時正式產生 001 / 002 / 003...
     # -----------------------------------------------------
     if text == "確認":
 
         order = pending_orders.get(user_id)
 
         if not order:
-
             return (
                 "⚠️ 找不到尚未確認的訂單，"
                 "請重新輸入。"
             )
 
-        success = write_to_google_sheet(order)
+        success, order_number = write_to_google_sheet(order)
 
         if success:
 
@@ -150,78 +256,56 @@ def handle_message(user_id, user_text):
 
             return (
                 "✅ 訂單已確認\n\n"
+                f"訂單編號：{order_number}\n"
                 "已成功寫入 Google 試算表。\n\n"
                 f"老師：{order['teacher']}\n"
                 f"書名：{order['book']}\n"
                 f"出版社：{order['publisher']}\n"
-                f"總數量：{order['quantity']}本"
+                f"總數量：{order['quantity']}本\n\n"
+                f"之後可以直接問「查{order_number}」"
             )
 
-        return (
-            "❌ 訂單寫入失敗，請稍後再試。"
-        )
-
+        return "❌ 訂單寫入失敗，請稍後再試。"
 
     # -----------------------------------------------------
-    # 5. 已有待確認訂單時，優先判斷修改指令
+    # 10. 已有待確認新訂單時，優先判斷修改指令
     # -----------------------------------------------------
     if user_id in pending_orders:
 
-        # 不要705
         if re.search(
             r"(不要|刪除|拿掉|移除)\s*\d{2,4}",
             text
         ):
-            return remove_class_from_order(
-                user_id,
-                text
-            )
+            return remove_class_from_order(user_id, text)
 
-        # 加703
         if re.search(
             r"(加|加入|增加)\s*\d{2,4}",
             text
         ):
-            return add_class_to_order(
-                user_id,
-                text
-            )
+            return add_class_to_order(user_id, text)
 
-        # 701改成703
         if re.search(
             r"\d{2,4}\s*(?:改成|換成|改為)\s*\d{2,4}",
             text
         ):
-            return replace_class_in_order(
-                user_id,
-                text
-            )
+            return replace_class_in_order(user_id, text)
 
-        # 701改28 / 701少2 / 701多1
         if re.search(
             r"\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+",
             text
         ):
-            return adjust_pending_order(
-                user_id,
-                text
-            )
+            return adjust_pending_order(user_id, text)
 
-        # 改成國一自然講義
         if (
             text.startswith("改成")
             or text.startswith("書名改成")
             or text.startswith("換成")
             or text.startswith("書改成")
         ):
-            return change_book(
-                user_id,
-                text
-            )
-
+            return change_book(user_id, text)
 
     # -----------------------------------------------------
-    # 6. 查老師教哪幾班
+    # 11. 查老師教哪幾班
     # -----------------------------------------------------
     if (
         "老師" in text
@@ -235,49 +319,34 @@ def handle_message(user_id, user_text):
         and "訂" not in text
     ):
 
-        return handle_teacher_lookup(
-            user_id,
-            text
-        )
-
+        return handle_teacher_lookup(user_id, text)
 
     # -----------------------------------------------------
-    # 7. 延續剛剛老師直接訂
+    # 12. 延續剛剛老師直接訂
     # -----------------------------------------------------
-    if (
-        text.startswith("訂")
-        and "老師" not in text
-    ):
+    if text.startswith("訂") and "老師" not in text:
 
-        context = conversation_context.get(
-            user_id
-        )
+        context = conversation_context.get(user_id)
 
         if context:
-
             return create_order_from_context(
                 user_id,
                 text,
                 context
             )
 
-
     # -----------------------------------------------------
-    # 8. 完整一句話訂書
+    # 13. 完整一句話訂書
     # -----------------------------------------------------
-    if (
-        "訂" in text
-        and "老師" in text
-    ):
+    if "訂" in text and "老師" in text:
 
         return create_order_from_sentence(
             user_id,
             text
         )
 
-
     # -----------------------------------------------------
-    # 9. 原本的查老師格式
+    # 14. 原本的查老師格式
     # -----------------------------------------------------
     if text.startswith("查老師"):
 
@@ -286,13 +355,14 @@ def handle_message(user_id, user_text):
             user_text
         )
 
-
     return (
         "📚 請輸入訂購內容\n\n"
         "你可以先問：\n"
         "王老師教哪幾班？\n\n"
         "也可以直接說：\n"
-        "王老師訂國一數學講義三個班"
+        "王老師訂國一數學講義三個班\n\n"
+        "查歷史訂單可以說：\n"
+        "查001"
     )
 
 
@@ -1094,6 +1164,334 @@ def change_book(
 
 
 # =========================================================
+# 歷史訂單：辨識查詢
+# =========================================================
+def extract_order_lookup_number(text):
+
+    patterns = [
+        r"^查\s*(\d{1,})$",
+        r"^查\s*訂單\s*(\d{1,})$",
+        r"^訂單\s*(\d{1,})$",
+        r"^(\d{1,})\s*訂單(?:內容)?(?:是什麼|內容是什麼|呢|？|\?)?$",
+        r"^查\s*(\d{1,})\s*訂單(?:內容)?$"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(pattern, text)
+
+        if match:
+            return normalize_order_number(match.group(1))
+
+    return None
+
+
+# =========================================================
+# 歷史訂單：直接指定訂單修改
+# 001的701改28本
+# =========================================================
+def parse_direct_history_adjustment(text):
+
+    match = re.search(
+        r"^(?:訂單)?(\d{1,})\s*(?:的)?\s*"
+        r"(\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?)$",
+        text
+    )
+
+    if not match:
+        return None
+
+    return {
+        "order_number": normalize_order_number(match.group(1)),
+        "edit_text": match.group(2)
+    }
+
+
+# =========================================================
+# 歷史訂單：準備修改，但先不寫 Google
+# =========================================================
+def prepare_history_adjustment(
+    user_id,
+    original_order,
+    text
+):
+
+    order = copy_order(original_order)
+
+    pattern = re.compile(
+        r"(?<!\d)"
+        r"(\d{2,4})"
+        r"(?!\d)"
+        r"\s*"
+        r"(改成|改為|改|多|少)"
+        r"\s*"
+        r"(\d+)"
+        r"\s*"
+        r"(?:人|本)?"
+    )
+
+    matches = list(pattern.finditer(text))
+
+    if not matches:
+        return "⚠️ 我看不懂要修改哪個班級的數量。"
+
+    changes = []
+
+    for match in matches:
+
+        class_name = match.group(1)
+        action = match.group(2)
+        value = int(match.group(3))
+
+        target = find_order_class(
+            order,
+            class_name
+        )
+
+        if not target:
+            return (
+                f"⚠️ 訂單 {order['order_number']} "
+                f"裡沒有 {class_name}。"
+            )
+
+        old_value = int(target["students"])
+
+        if action in ["改", "改成", "改為"]:
+            new_value = value
+        elif action == "多":
+            new_value = old_value + value
+        else:
+            new_value = old_value - value
+
+        if new_value < 0:
+            return "⚠️ 數量不能小於 0。"
+
+        target["students"] = new_value
+
+        changes.append(
+            f"{class_name}：{old_value}→{new_value}本"
+        )
+
+    refresh_order_total(order)
+
+    modification_text = "；".join(changes)
+
+    pending_history_updates[user_id] = {
+        "order": order,
+        "modification_text": modification_text
+    }
+
+    return make_history_update_confirmation(
+        original_order,
+        order,
+        changes
+    )
+
+
+# =========================================================
+# 歷史訂單：修改確認畫面
+# =========================================================
+def make_history_update_confirmation(
+    original_order,
+    new_order,
+    changes
+):
+
+    class_lines = []
+
+    for item in new_order["classes"]:
+
+        class_lines.append(
+            f"{item['class_name']}："
+            f"{item['students']}本"
+        )
+
+    return (
+        "🔄 訂單修改確認\n\n"
+        f"訂單編號：{new_order['order_number']}\n"
+        f"老師：{new_order['teacher']}\n"
+        f"書名：{new_order['book']}\n\n"
+        "修改內容：\n"
+        + "\n".join(changes)
+        + "\n\n修改後：\n"
+        + "\n".join(class_lines)
+        + f"\n\n原總數：{original_order['quantity']}本"
+        + f"\n新總數：{new_order['quantity']}本\n\n"
+        "如果正確，請回覆「確認修改」\n"
+        "不要修改請回覆「取消修改」"
+    )
+
+
+# =========================================================
+# 歷史訂單：顯示查詢結果
+# =========================================================
+def make_historical_order_reply(order):
+
+    class_lines = []
+
+    for item in order.get("classes", []):
+
+        class_lines.append(
+            f"{item['class_name']}："
+            f"{item['students']}本"
+        )
+
+    message = (
+        "📋 歷史訂單\n\n"
+        f"訂單編號：{order['order_number']}\n"
+        f"老師：{order['teacher']}\n"
+        f"學校：{order['school']}\n"
+        f"書名：{order['book']}\n"
+        f"出版社：{order['publisher']}\n\n"
+        + "\n".join(class_lines)
+        + f"\n\n總數量：{order['quantity']}本\n"
+        + f"狀態：{order.get('status', '')}"
+    )
+
+    if order.get("order_time"):
+        message += f"\n訂購時間：{order['order_time']}"
+
+    if order.get("last_modified"):
+        message += f"\n最後修改：{order['last_modified']}"
+
+    if order.get("modification_log"):
+        message += f"\n修改紀錄：{order['modification_log']}"
+
+    message += (
+        "\n\n如果要調整，可以直接說：\n"
+        "701改28本"
+    )
+
+    return message
+
+
+# =========================================================
+# 歷史訂單：從 Google 查詢
+# =========================================================
+def lookup_google_order(order_number):
+
+    if not GOOGLE_SCRIPT_URL:
+        return None
+
+    data = {
+        "action": "lookup_order",
+        "order_number": normalize_order_number(order_number)
+    }
+
+    try:
+
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=data,
+            timeout=15
+        )
+
+        result = response.json()
+
+        if not result.get("success"):
+            print("Lookup order error:", result)
+            return None
+
+        if not result.get("found"):
+            return None
+
+        order = result.get("order", {})
+
+        order["order_number"] = normalize_order_number(
+            order.get("order_number", order_number)
+        )
+
+        order["classes"] = copy_classes(
+            order.get("classes", [])
+        )
+
+        order["quantity"] = calculate_total(
+            order["classes"]
+        )
+
+        return order
+
+    except Exception as error:
+
+        print("Lookup order error:", error)
+        return None
+
+
+# =========================================================
+# 歷史訂單：正式更新 Google
+# =========================================================
+def update_google_order(
+    order,
+    modification_text
+):
+
+    if not GOOGLE_SCRIPT_URL:
+        return False, None
+
+    data = {
+        "action": "update_order",
+        "order_number": order["order_number"],
+        "book": order["book"],
+        "publisher": order["publisher"],
+        "classes": order.get("classes", []),
+        "modification_text": modification_text
+    }
+
+    try:
+
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=data,
+            timeout=15
+        )
+
+        result = response.json()
+
+        print("Update order status:", response.status_code)
+        print("Update order response:", response.text)
+
+        return (
+            response.status_code == 200
+            and result.get("success") is True,
+            result
+        )
+
+    except Exception as error:
+
+        print("Update order error:", error)
+        return False, None
+
+
+def normalize_order_number(value):
+
+    digits = re.sub(
+        r"\D",
+        "",
+        str(value or "")
+    )
+
+    if not digits:
+        return ""
+
+    return str(int(digits)).zfill(3)
+
+
+def copy_order(order):
+
+    result = dict(order)
+
+    result["classes"] = copy_classes(
+        order.get("classes", [])
+    )
+
+    result["quantity"] = calculate_total(
+        result["classes"]
+    )
+
+    return result
+
+
+# =========================================================
 # 訂購確認
 # =========================================================
 def make_order_confirmation(order):
@@ -1344,19 +1742,18 @@ def get_book_publisher(book):
 def write_to_google_sheet(order):
 
     if not GOOGLE_SCRIPT_URL:
-        return False
+        return False, None
 
     data = {
+        "action": "create_order",
         "teacher": order["teacher"],
         "school": order["school"],
         "book": order["book"],
-        "quantity": order["quantity"],
         "publisher": order["publisher"],
         "classes": order.get(
             "classes",
             []
-        ),
-        "status": "已確認"
+        )
     }
 
     try:
@@ -1366,6 +1763,8 @@ def write_to_google_sheet(order):
             json=data,
             timeout=15
         )
+
+        result = response.json()
 
         print(
             "Google Sheet status:",
@@ -1377,9 +1776,16 @@ def write_to_google_sheet(order):
             response.text
         )
 
-        return (
+        if (
             response.status_code == 200
-        )
+            and result.get("success") is True
+        ):
+            return (
+                True,
+                result.get("order_number")
+            )
+
+        return False, None
 
     except Exception as error:
 
@@ -1388,7 +1794,7 @@ def write_to_google_sheet(order):
             error
         )
 
-        return False
+        return False, None
 
 
 # =========================================================
