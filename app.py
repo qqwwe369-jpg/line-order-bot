@@ -574,6 +574,41 @@ def handle_message(user_id, user_text):
         )
 
     # -----------------------------------------------------
+    # 學校教科書版本資料庫查詢
+    # 例如：
+    # 天母國中七年級數學什麼版本
+    # 天母國中國一各科版本
+    # 天母國中教科書版本
+    # -----------------------------------------------------
+    version_query = parse_school_version_query(
+        user_id,
+        text
+    )
+
+    if version_query:
+        return handle_school_version_query(
+            version_query
+        )
+
+    # -----------------------------------------------------
+    # 學校／年級／班級學生資料查詢
+    # 例如：
+    # 天母國中七年級多少人
+    # 天母國中七年級幾個班
+    # 天母國中七年級有哪些班
+    # 天母國中701幾個人
+    # -----------------------------------------------------
+    school_stats_query = parse_school_stats_query(
+        user_id,
+        text
+    )
+
+    if school_stats_query:
+        return handle_school_stats_query(
+            school_stats_query
+        )
+
+    # -----------------------------------------------------
     # 老師資料庫查詢
     # 只要是在問老師的班級／人數，就一律重新讀 Google。
     # 不可拿目前訂單或歷史訂單的班級來回答。
@@ -3420,6 +3455,686 @@ def extract_class_count(text):
         return int(value)
 
     return number_map.get(value)
+
+
+
+# =========================================================
+# 學校資料／教科書版本：自然語言解析
+# =========================================================
+def extract_school_name(text):
+
+    match = re.search(
+        r"([\u4e00-\u9fff]{2,16}(?:國中|高中|國小))",
+        text
+    )
+
+    if match:
+        return match.group(1).strip()
+
+    return ""
+
+
+def extract_grade_text(text):
+
+    grade_patterns = [
+        ("七年級", "七年級"),
+        ("八年級", "八年級"),
+        ("九年級", "九年級"),
+        ("國中一年級", "七年級"),
+        ("國中二年級", "八年級"),
+        ("國中三年級", "九年級"),
+        ("國一", "七年級"),
+        ("國二", "八年級"),
+        ("國三", "九年級"),
+    ]
+
+    for keyword, normalized in grade_patterns:
+        if keyword in text:
+            return normalized
+
+    # 「一年級 / 二年級 / 三年級」在國中語境下視為七／八／九年級。
+    if "一年級" in text:
+        return "七年級"
+
+    if "二年級" in text:
+        return "八年級"
+
+    if "三年級" in text:
+        return "九年級"
+
+    return ""
+
+
+def grade_from_class_name(class_name):
+
+    value = str(class_name or "").strip()
+
+    if value.startswith("7"):
+        return "七年級"
+
+    if value.startswith("8"):
+        return "八年級"
+
+    if value.startswith("9"):
+        return "九年級"
+
+    return ""
+
+
+def get_context_school(user_id):
+
+    for context_store in [
+        teacher_lookup_context,
+        conversation_context
+    ]:
+        context = context_store.get(
+            user_id,
+            {}
+        )
+
+        school = str(
+            context.get("school", "")
+        ).strip()
+
+        if school:
+            return school
+
+    return ""
+
+
+def parse_school_stats_query(
+    user_id,
+    text
+):
+
+    clean_text = text.strip()
+
+    # 老師個人的班級／學生問題交給既有老師資料查詢處理。
+    if "老師" in clean_text:
+        return None
+
+    intent_words = [
+        "多少人",
+        "幾人",
+        "幾個人",
+        "學生人數",
+        "總人數",
+        "幾個學生",
+        "多少學生",
+        "幾個班",
+        "多少班",
+        "有哪些班",
+        "哪幾班",
+        "哪幾個班",
+        "班級"
+    ]
+
+    if not any(
+        word in clean_text
+        for word in intent_words
+    ):
+        return None
+
+    school = extract_school_name(
+        clean_text
+    )
+
+    class_match = re.search(
+        r"(?<!\d)([789]\d{2})(?:班)?(?!\d)",
+        clean_text
+    )
+
+    class_name = (
+        class_match.group(1)
+        if class_match
+        else ""
+    )
+
+    grade = extract_grade_text(
+        clean_text
+    )
+
+    if not grade and class_name:
+        grade = grade_from_class_name(
+            class_name
+        )
+
+    # 若使用者只問「701班多少人」，
+    # 可沿用最近查過老師的學校。
+    if not school:
+        school = get_context_school(
+            user_id
+        )
+
+    # 沒有學校又沒有可沿用的上下文時，
+    # 不要冒然把問題送去 Google。
+    if not school:
+        return None
+
+    if not grade and not class_name:
+        # 像「天母國中多少人」也允許查全校目前資料。
+        if not any(
+            word in clean_text
+            for word in [
+                "多少人",
+                "幾人",
+                "幾個人",
+                "學生人數",
+                "總人數",
+                "幾個班",
+                "多少班",
+                "有哪些班",
+                "哪幾班",
+                "哪幾個班"
+            ]
+        ):
+            return None
+
+    intent = "summary"
+
+    if any(
+        word in clean_text
+        for word in [
+            "有哪些班",
+            "哪幾班",
+            "哪幾個班"
+        ]
+    ):
+        intent = "classes"
+
+    elif any(
+        word in clean_text
+        for word in [
+            "幾個班",
+            "多少班"
+        ]
+    ):
+        intent = "class_count"
+
+    elif any(
+        word in clean_text
+        for word in [
+            "多少人",
+            "幾人",
+            "幾個人",
+            "學生人數",
+            "總人數",
+            "幾個學生",
+            "多少學生"
+        ]
+    ):
+        intent = "students"
+
+    return {
+        "school": school,
+        "grade": grade,
+        "class_name": class_name,
+        "intent": intent
+    }
+
+
+def lookup_school_classes(
+    school,
+    grade="",
+    class_name=""
+):
+
+    if not GOOGLE_SCRIPT_URL:
+        return None
+
+    payload = {
+        "action": "lookup_school_classes",
+        "school": school,
+        "grade": grade,
+        "class_name": class_name
+    }
+
+    try:
+
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=payload,
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            print(
+                "School classes HTTP error:",
+                response.status_code,
+                response.text
+            )
+            return None
+
+        result = response.json()
+
+        if not result.get("success"):
+            print(
+                "School classes API error:",
+                result
+            )
+            return None
+
+        classes = []
+
+        for item in result.get(
+            "classes",
+            []
+        ):
+            classes.append({
+                "school": str(
+                    item.get("school", school)
+                ),
+                "class_name": str(
+                    item.get("class_name", "")
+                ),
+                "students": int(
+                    item.get("students", 0) or 0
+                )
+            })
+
+        return {
+            "classes": classes,
+            "class_count": int(
+                result.get(
+                    "class_count",
+                    len(classes)
+                ) or 0
+            ),
+            "total_students": int(
+                result.get(
+                    "total_students",
+                    0
+                ) or 0
+            )
+        }
+
+    except Exception as error:
+
+        print(
+            "School classes lookup error:",
+            error
+        )
+
+        return None
+
+
+def handle_school_stats_query(query):
+
+    school = query["school"]
+    grade = query.get("grade", "")
+    class_name = query.get(
+        "class_name",
+        ""
+    )
+    intent = query.get(
+        "intent",
+        "summary"
+    )
+
+    result = lookup_school_classes(
+        school,
+        grade,
+        class_name
+    )
+
+    if result is None:
+        return (
+            "⚠️ 學校資料庫暫時查詢失敗，"
+            "請稍後再試。"
+        )
+
+    classes = result["classes"]
+
+    if not classes:
+        target = school
+
+        if grade:
+            target += f" {grade}"
+
+        if class_name:
+            target += f" {class_name}班"
+
+        return (
+            "⚠️ 查不到學生資料\n\n"
+            f"查詢：{target}"
+        )
+
+    if class_name:
+
+        item = classes[0]
+
+        return (
+            "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
+            "🏫 班級資料\n"
+            f"學校：{school}\n"
+            f"班級：{item['class_name']}班\n"
+            f"學生人數：{item['students']}人"
+        )
+
+    title = school
+
+    if grade:
+        title += f" {grade}"
+
+    class_lines = []
+
+    for item in classes:
+        class_lines.append(
+            f"• {item['class_name']}班："
+            f"{item['students']}人"
+        )
+
+    if intent == "class_count":
+
+        return (
+            "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
+            f"🏫 {title}\n"
+            f"班級總數：{result['class_count']}個班\n\n"
+            "班級："
+            + "、".join(
+                item["class_name"]
+                for item in classes
+            )
+        )
+
+    if intent == "classes":
+
+        return (
+            "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
+            f"🏫 {title}\n"
+            f"共有 {result['class_count']} 個班：\n"
+            + "\n".join(class_lines)
+            + f"\n\n總學生人數：{result['total_students']}人"
+        )
+
+    return (
+        "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
+        f"🏫 {title}\n"
+        f"班級總數：{result['class_count']}個班\n"
+        f"學生總人數：{result['total_students']}人\n\n"
+        "各班人數：\n"
+        + "\n".join(class_lines)
+    )
+
+
+def parse_school_version_query(
+    user_id,
+    text
+):
+
+    clean_text = text.strip()
+
+    version_words = [
+        "版本",
+        "哪一版",
+        "哪個版本",
+        "什麼版本",
+        "教科書"
+    ]
+
+    if not any(
+        word in clean_text
+        for word in version_words
+    ):
+        return None
+
+    # 「這本書版本」等一般問題不應誤送資料庫；
+    # 至少要有學校名稱，或可沿用最近學校上下文。
+    school = extract_school_name(
+        clean_text
+    )
+
+    if not school:
+        school = get_context_school(
+            user_id
+        )
+
+    if not school:
+        return None
+
+    grade = extract_grade_text(
+        clean_text
+    )
+
+    subjects = [
+        "國文",
+        "英文",
+        "數學",
+        "自然",
+        "生物",
+        "理化",
+        "地科",
+        "社會",
+        "歷史",
+        "地理",
+        "公民"
+    ]
+
+    subject = ""
+
+    for item in subjects:
+        if item in clean_text:
+            subject = item
+            break
+
+    period_match = re.search(
+        r"(?<!\d)(\d{2,3}\s*(?:上|下))(?!\d)",
+        clean_text
+    )
+
+    academic_period = ""
+
+    if period_match:
+        academic_period = re.sub(
+            r"\s+",
+            "",
+            period_match.group(1)
+        )
+
+    return {
+        "school": school,
+        "grade": grade,
+        "subject": subject,
+        "academic_period": academic_period
+    }
+
+
+def lookup_school_versions(
+    school,
+    grade="",
+    subject="",
+    academic_period=""
+):
+
+    if not GOOGLE_SCRIPT_URL:
+        return None
+
+    payload = {
+        "action": "lookup_versions",
+        "school": school,
+        "grade": grade,
+        "subject": subject,
+        "academic_period": academic_period
+    }
+
+    try:
+
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=payload,
+            timeout=15
+        )
+
+        if response.status_code != 200:
+            print(
+                "Version lookup HTTP error:",
+                response.status_code,
+                response.text
+            )
+            return None
+
+        result = response.json()
+
+        if not result.get("success"):
+            print(
+                "Version lookup API error:",
+                result
+            )
+            return None
+
+        versions = []
+
+        for item in result.get(
+            "versions",
+            []
+        ):
+            versions.append({
+                "school": str(
+                    item.get("school", school)
+                ),
+                "grade": str(
+                    item.get("grade", "")
+                ),
+                "subject": str(
+                    item.get("subject", "")
+                ),
+                "version": str(
+                    item.get("version", "")
+                ),
+                "academic_period": str(
+                    item.get(
+                        "academic_period",
+                        ""
+                    )
+                )
+            })
+
+        return {
+            "latest_period": str(
+                result.get(
+                    "latest_period",
+                    ""
+                )
+            ),
+            "versions": versions
+        }
+
+    except Exception as error:
+
+        print(
+            "Version lookup error:",
+            error
+        )
+
+        return None
+
+
+def handle_school_version_query(query):
+
+    school = query["school"]
+    grade = query.get("grade", "")
+    subject = query.get(
+        "subject",
+        ""
+    )
+    academic_period = query.get(
+        "academic_period",
+        ""
+    )
+
+    result = lookup_school_versions(
+        school,
+        grade,
+        subject,
+        academic_period
+    )
+
+    if result is None:
+        return (
+            "⚠️ 教科書版本資料庫暫時查詢失敗，"
+            "請稍後再試。"
+        )
+
+    versions = result["versions"]
+
+    if not versions:
+        target = school
+
+        if grade:
+            target += f" {grade}"
+
+        if subject:
+            target += f" {subject}"
+
+        if academic_period:
+            target += f" {academic_period}"
+
+        return (
+            "⚠️ 查不到教科書版本資料\n\n"
+            f"查詢：{target}\n\n"
+            "請確認 Google「學校版本資料」是否已建立這筆資料。"
+        )
+
+    period = (
+        academic_period
+        or result.get(
+            "latest_period",
+            ""
+        )
+    )
+
+    if len(versions) == 1:
+
+        item = versions[0]
+
+        return (
+            "👑 LeBron James 幫你查了 Google 教科書版本資料：\n\n"
+            "📚 教科書版本\n"
+            f"學校：{item['school']}\n"
+            f"年級：{item['grade']}\n"
+            f"科目：{item['subject']}\n"
+            f"版本：{item['version']}"
+            + (
+                f"\n學年度：{item['academic_period']}"
+                if item["academic_period"]
+                else ""
+            )
+        )
+
+    lines = []
+
+    for item in versions:
+        grade_prefix = ""
+
+        # 若使用者沒有指定年級，避免不同年級資料混在一起看不懂。
+        if not grade:
+            grade_prefix = (
+                f"{item['grade']} "
+                if item["grade"]
+                else ""
+            )
+
+        lines.append(
+            f"• {grade_prefix}"
+            f"{item['subject']}："
+            f"{item['version']}"
+        )
+
+    title = school
+
+    if grade:
+        title += f" {grade}"
+
+    return (
+        "👑 LeBron James 幫你查了 Google 教科書版本資料：\n\n"
+        f"📚 {title}\n"
+        + (
+            f"學年度：{period}\n\n"
+            if period
+            else "\n"
+        )
+        + "\n".join(lines)
+    )
 
 
 # =========================================================
