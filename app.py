@@ -103,8 +103,12 @@ def handle_message(user_id, user_text):
 
     # -----------------------------------------------------
     # 3. 確認歷史訂單修改
+    # 支援「確認修改」與直接「確認」
     # -----------------------------------------------------
-    if text == "確認修改":
+    if (
+        text in ["確認修改", "確認"]
+        and user_id in pending_history_updates
+    ):
 
         update_data = pending_history_updates.get(user_id)
 
@@ -161,10 +165,7 @@ def handle_message(user_id, user_text):
     # -----------------------------------------------------
     if (
         user_id in historical_order_context
-        and re.fullmatch(
-            r"\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
-            text
-        )
+        and looks_like_history_edit(text)
         and user_id not in pending_orders
     ):
 
@@ -1198,20 +1199,50 @@ def parse_direct_history_adjustment(text):
     # 必須明確寫出「的」，例如：
     # 001的705改35
     # 訂單001的705改35
-    # 這樣 705改35 才不會被誤認成訂單編號。
+    # 001的705改50本 701取消
+    # 這樣單獨的 705改35 不會被誤認成訂單編號。
     match = re.search(
-        r"^(?:訂單)?(\d{1,})\s*的\s*"
-        r"(\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?)$",
+        r"^(?:訂單)?(\d{1,})\s*的\s*(.+)$",
         text
     )
 
     if not match:
         return None
 
+    edit_text = match.group(2).strip()
+
+    if not looks_like_history_edit(edit_text):
+        return None
+
     return {
         "order_number": normalize_order_number(match.group(1)),
-        "edit_text": match.group(2)
+        "edit_text": edit_text
     }
+
+
+# =========================================================
+# 歷史訂單：判斷是否像修改指令
+# 支援：
+# 705改50
+# 701取消
+# 705改50本 701取消
+# =========================================================
+def looks_like_history_edit(text):
+
+    has_quantity_edit = re.search(
+        r"\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
+        text
+    )
+
+    has_remove_edit = re.search(
+        r"\d{2,4}\s*(?:取消|不要|移除|刪除|拿掉)",
+        text
+    )
+
+    return bool(
+        has_quantity_edit
+        or has_remove_edit
+    )
 
 
 # =========================================================
@@ -1225,7 +1256,7 @@ def prepare_history_adjustment(
 
     order = copy_order(original_order)
 
-    pattern = re.compile(
+    quantity_pattern = re.compile(
         r"(?<!\d)"
         r"(\d{2,4})"
         r"(?!\d)"
@@ -1237,14 +1268,31 @@ def prepare_history_adjustment(
         r"(?:人|本)?"
     )
 
-    matches = list(pattern.finditer(text))
+    remove_pattern = re.compile(
+        r"(?<!\d)"
+        r"(\d{2,4})"
+        r"(?!\d)"
+        r"\s*"
+        r"(取消|不要|移除|刪除|拿掉)"
+    )
 
-    if not matches:
-        return "⚠️ 我看不懂要修改哪個班級的數量。"
+    quantity_matches = list(
+        quantity_pattern.finditer(text)
+    )
+
+    remove_matches = list(
+        remove_pattern.finditer(text)
+    )
+
+    if not quantity_matches and not remove_matches:
+        return "⚠️ 我看不懂要修改哪個班級。"
 
     changes = []
 
-    for match in matches:
+    # -----------------------------------------------------
+    # 先處理數量修改
+    # -----------------------------------------------------
+    for match in quantity_matches:
 
         class_name = match.group(1)
         action = match.group(2)
@@ -1261,12 +1309,16 @@ def prepare_history_adjustment(
                 f"裡沒有 {class_name}。"
             )
 
-        old_value = int(target["students"])
+        old_value = int(
+            target["students"]
+        )
 
         if action in ["改", "改成", "改為"]:
             new_value = value
+
         elif action == "多":
             new_value = old_value + value
+
         else:
             new_value = old_value - value
 
@@ -1277,6 +1329,44 @@ def prepare_history_adjustment(
 
         changes.append(
             f"{class_name}：{old_value}→{new_value}本"
+        )
+
+    # -----------------------------------------------------
+    # 再處理取消／移除班級
+    # -----------------------------------------------------
+    for match in remove_matches:
+
+        class_name = match.group(1)
+
+        target = find_order_class(
+            order,
+            class_name
+        )
+
+        if not target:
+            return (
+                f"⚠️ 訂單 {order['order_number']} "
+                f"裡沒有 {class_name}。"
+            )
+
+        if len(order["classes"]) <= 1:
+            return (
+                "⚠️ 不能取消這張訂單最後一個班級。"
+            )
+
+        old_value = int(
+            target["students"]
+        )
+
+        order["classes"] = [
+            item
+            for item in order["classes"]
+            if str(item["class_name"])
+            != str(class_name)
+        ]
+
+        changes.append(
+            f"{class_name}：{old_value}本→取消"
         )
 
     refresh_order_total(order)
@@ -1324,7 +1414,7 @@ def make_history_update_confirmation(
         + "\n".join(class_lines)
         + f"\n\n原總數：{original_order['quantity']}本"
         + f"\n新總數：{new_order['quantity']}本\n\n"
-        "如果正確，請回覆「確認修改」\n"
+        "如果正確，請回覆「確認」或「確認修改」\n"
         "不要修改請回覆「取消修改」"
     )
 
