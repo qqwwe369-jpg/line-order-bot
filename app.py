@@ -21,6 +21,7 @@ def home():
 def callback():
 
     body = request.get_json()
+
     print("Webhook received")
     print(body)
 
@@ -51,7 +52,9 @@ def callback():
 
 def handle_message(user_id, user_text):
 
-    # ===== 確認訂單 =====
+    # =========================
+    # 確認訂單
+    # =========================
     if user_text == "確認":
 
         order = pending_orders.get(user_id)
@@ -77,7 +80,9 @@ def handle_message(user_id, user_text):
         return "❌ 訂單寫入失敗，請稍後再試。"
 
 
-    # ===== 一句話訂書 =====
+    # =========================
+    # 一句話訂書
+    # =========================
     if "訂" in user_text and "老師" in user_text:
 
         return create_order_from_sentence(
@@ -86,7 +91,9 @@ def handle_message(user_id, user_text):
         )
 
 
-    # ===== 查老師 =====
+    # =========================
+    # 查老師
+    # =========================
     if user_text.startswith("查老師"):
 
         lines = user_text.splitlines()
@@ -176,18 +183,18 @@ def create_order_from_sentence(user_id, text):
 
     teacher = teacher_match.group(1).strip()
 
-    # 找「訂」的位置
+    # 找「訂」
     order_position = text.find("訂")
 
     if order_position == -1:
         return "⚠️ 找不到訂購內容"
 
-    # 抓「訂」後面的文字
+    # 抓書名
     book_part = text[
         order_position + 1:
     ].strip()
 
-    # 移除「三個班 / 3個班」等字樣
+    # 移除「三個班 / 3個班」
     book = re.sub(
         r"[一二三四五六七八九十\d]+個班.*$",
         "",
@@ -213,7 +220,7 @@ def create_order_from_sentence(user_id, text):
             f"老師：{teacher}"
         )
 
-    # 判斷使用者說幾個班
+    # 判斷幾個班
     requested_count = extract_class_count(text)
 
     if requested_count:
@@ -240,11 +247,13 @@ def create_order_from_sentence(user_id, text):
             "請先到「書籍資料」工作表新增這本書與出版社。"
         )
 
+    # 算總數量
     total = sum(
         item["students"]
         for item in classes
     )
 
+    # 暫存訂單
     order = {
         "teacher": teacher,
         "school": school,
@@ -256,6 +265,7 @@ def create_order_from_sentence(user_id, text):
 
     pending_orders[user_id] = order
 
+    # LINE 顯示每班數量
     class_lines = []
 
     for item in classes:
@@ -386,7 +396,10 @@ def get_book_publisher(book):
         result = response.json()
 
         if result.get("found"):
-            return result.get("publisher", "")
+            return result.get(
+                "publisher",
+                ""
+            )
 
         return None
 
@@ -411,6 +424,14 @@ def write_to_google_sheet(order):
         "book": order["book"],
         "quantity": order["quantity"],
         "publisher": order["publisher"],
+
+        # 重要：
+        # 把每個班級一起傳給 Apps Script
+        "classes": order.get(
+            "classes",
+            []
+        ),
+
         "status": "已確認"
     }
 
@@ -452,19 +473,26 @@ def reply_to_line(reply_token, message):
     )
 
     if not CHANNEL_ACCESS_TOKEN:
+
         print(
             "❌ LINE_CHANNEL_ACCESS_TOKEN "
             "沒有讀到"
         )
+
         return
 
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
+        "Content-Type":
+            "application/json",
+
+        "Authorization":
+            "Bearer " +
+            CHANNEL_ACCESS_TOKEN
     }
 
     data = {
         "replyToken": reply_token,
+
         "messages": [
             {
                 "type": "text",
