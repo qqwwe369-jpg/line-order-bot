@@ -217,11 +217,184 @@ def get_help_reply(text):
 
 
 # =========================================================
+# 新手歡迎 / 訂書逐步引導
+# =========================================================
+
+guided_order_context = {}
+
+
+def get_welcome_reply():
+    return (
+        "👑 歡迎使用訂書小幫手\n\n"
+        "直接用平常講話就可以。\n\n"
+        "常用功能：\n"
+        "📚 訂書\n"
+        "👨‍🏫 查老師／班級\n"
+        "🏫 查學生人數\n"
+        "📖 查教科書版本\n"
+        "🔎 查詢／修改訂單\n\n"
+        "輸入「功能」可以看簡單範例。"
+    )
+
+
+def extract_guided_classes(text):
+    matches = re.findall(
+        r"(?<!\d)([789]\d{2})(?!\d)",
+        str(text or "")
+    )
+
+    result = []
+
+    for item in matches:
+        if item not in result:
+            result.append(item)
+
+    return result
+
+
+def start_guided_order(user_id):
+    guided_order_context[user_id] = {
+        "active": True,
+        "teacher": "",
+        "classes": [],
+        "book": ""
+    }
+
+    return (
+        "📚 好，我帶你一步一步訂書。\n\n"
+        "先告訴我「老師」。\n"
+        "例如：王老師"
+    )
+
+
+def handle_guided_order(user_id, text):
+    ctx = guided_order_context.get(user_id)
+
+    if not ctx or not ctx.get("active"):
+        return None
+
+    clean_text = str(text or "").strip()
+
+    if clean_text in [
+        "取消",
+        "取消訂書",
+        "不要了",
+        "重來",
+        "重新開始"
+    ]:
+        guided_order_context.pop(user_id, None)
+        return "已取消這次訂書。"
+
+    if not ctx.get("teacher"):
+        teacher_match = re.search(
+            r"([\u4e00-\u9fff]{1,4})老師",
+            clean_text
+        )
+
+        if not teacher_match:
+            return (
+                "還差老師姓名。\n"
+                "例如：王老師"
+            )
+
+        teacher = teacher_match.group(1) + "老師"
+        ctx["teacher"] = teacher
+
+        classes = extract_guided_classes(clean_text)
+
+        if classes:
+            ctx["classes"] = classes
+            return (
+                f"收到：{teacher}\n"
+                f"班級：{'、'.join(classes)}\n\n"
+                "最後告訴我「書名」。\n"
+                "例如：國一數學講義"
+            )
+
+        return (
+            f"收到：{teacher}\n\n"
+            "接著告訴我「班級」。\n"
+            "例如：701、703"
+        )
+
+    if not ctx.get("classes"):
+        classes = extract_guided_classes(clean_text)
+
+        if not classes:
+            return (
+                "還差班級。\n"
+                "例如：701、703"
+            )
+
+        ctx["classes"] = classes
+
+        return (
+            f"班級收到：{'、'.join(classes)}\n\n"
+            "最後告訴我「書名」。\n"
+            "例如：國一數學講義"
+        )
+
+    if not ctx.get("book"):
+        if len(clean_text) < 2:
+            return (
+                "還差書名。\n"
+                "例如：國一數學講義"
+            )
+
+        ctx["book"] = clean_text
+
+        teacher = ctx["teacher"]
+        classes = ctx["classes"]
+        book = ctx["book"]
+
+        guided_order_context.pop(user_id, None)
+
+        combined_text = (
+            f"{teacher}"
+            f"{'、'.join(classes)}"
+            f"訂{book}"
+        )
+
+        return handle_message(
+            user_id,
+            combined_text
+        )
+
+    return None
+
+
+# =========================================================
 # 主對話處理
 # =========================================================
 def handle_message(user_id, user_text):
 
     text = normalize_text(user_text)
+
+    # -----------------------------------------------------
+    # 新手歡迎 / 訂書逐步引導
+    # -----------------------------------------------------
+    if text in [
+        "開始",
+        "新手",
+        "第一次使用",
+        "歡迎"
+    ]:
+        return get_welcome_reply()
+
+    if text in [
+        "訂書",
+        "我要訂書",
+        "開始訂書"
+    ]:
+        return start_guided_order(user_id)
+
+    guided_reply = handle_guided_order(
+        user_id,
+        text
+    )
+
+    if guided_reply is not None:
+        return guided_reply
 
     # -----------------------------------------------------
     # 1. 重來
@@ -239,6 +412,7 @@ def handle_message(user_id, user_text):
         order_draft_context.pop(user_id, None)
         proposed_teacher_context.pop(user_id, None)
         teacher_lookup_context.pop(user_id, None)
+        guided_order_context.pop(user_id, None)
 
         return (
             "🔄 已重新開始\n\n"
@@ -859,7 +1033,72 @@ def handle_message(user_id, user_text):
         )
 
     # -----------------------------------------------------
-    # 16. 不是訂書指令 → 交給 AI 一般問答
+    # 16. 訂書資訊不完整時，改成一步一步帶著填
+    # -----------------------------------------------------
+    order_intent_words = [
+        "訂書",
+        "要訂",
+        "想訂",
+        "幫我訂",
+        "訂講義",
+        "訂評量",
+        "訂教材"
+    ]
+
+    if any(word in text for word in order_intent_words):
+        guided_order_context[user_id] = {
+            "active": True,
+            "teacher": "",
+            "classes": [],
+            "book": ""
+        }
+
+        teacher_match = re.search(
+            r"([\u4e00-\u9fff]{1,4})老師",
+            text
+        )
+        classes = extract_guided_classes(text)
+
+        if teacher_match:
+            guided_order_context[user_id]["teacher"] = (
+                teacher_match.group(1) + "老師"
+            )
+
+        if classes:
+            guided_order_context[user_id]["classes"] = classes
+
+        if (
+            guided_order_context[user_id]["teacher"]
+            and guided_order_context[user_id]["classes"]
+        ):
+            return (
+                "老師和班級我先記下來了。\n\n"
+                "還差書名。\n"
+                "例如：國一數學講義"
+            )
+
+        if guided_order_context[user_id]["teacher"]:
+            return (
+                f"收到：{guided_order_context[user_id]['teacher']}\n\n"
+                "還差班級。\n"
+                "例如：701、703"
+            )
+
+        if guided_order_context[user_id]["classes"]:
+            return (
+                f"班級收到：{'、'.join(guided_order_context[user_id]['classes'])}\n\n"
+                "還差老師。\n"
+                "例如：王老師"
+            )
+
+        return (
+            "📚 看起來你要訂書，我帶你一步一步完成。\n\n"
+            "先告訴我「老師」。\n"
+            "例如：王老師"
+        )
+
+    # -----------------------------------------------------
+    # 17. 其他內容 → 交給 AI 一般問答
     # AI 只負責回答文字，不直接修改 Google 訂單。
     # -----------------------------------------------------
     return ask_ai(user_id, user_text)
