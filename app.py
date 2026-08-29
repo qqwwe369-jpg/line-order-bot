@@ -16,6 +16,7 @@ AI_FALLBACK_MESSAGE = "👑 LeBron James 正在幫你處理中，請稍後再試
 
 # 尚未確認的訂單
 pending_orders = {}
+pending_other_orders = {}
 
 # 最近查詢的老師
 conversation_context = {}
@@ -90,6 +91,7 @@ def handle_message(user_id, user_text):
     if text in ["重來", "重新開始", "全部重來"]:
 
         pending_orders.pop(user_id, None)
+        pending_other_orders.pop(user_id, None)
         conversation_context.pop(user_id, None)
         historical_order_context.pop(user_id, None)
         pending_history_updates.pop(user_id, None)
@@ -216,7 +218,55 @@ def handle_message(user_id, user_text):
         )
 
     # -----------------------------------------------------
-    # 7. 取消目前新訂單
+    # 7. 其他訂單：確認 / 取消 / 建立
+    # 例如：天母王老師 買書面紙20張
+    # -----------------------------------------------------
+    if text == "確認" and user_id in pending_other_orders:
+
+        other_order = pending_other_orders[user_id]
+
+        success, result = write_other_order_to_google_sheet(
+            other_order
+        )
+
+        if not success:
+            return "❌ 其他訂單寫入失敗，請稍後再試。"
+
+        pending_other_orders.pop(user_id, None)
+
+        return (
+            "👑 LeBron James：其他訂單我幫你收好了。📦\n\n"
+            "✅ 已寫入 Google「其他訂單」\n\n"
+            f"日期：{result.get('date', '今天')}\n"
+            f"學校：{other_order['school']}\n"
+            f"老師：{other_order['teacher']}\n"
+            f"項目：{other_order['item']}\n\n"
+            "進度、備註目前保持空白。"
+        )
+
+    if (
+        text in ["取消", "取消訂單", "不要了", "這筆不要"]
+        and user_id in pending_other_orders
+    ):
+        pending_other_orders.pop(user_id, None)
+
+        return "❌ 已取消這筆「其他訂單」，Google 沒有寫入。"
+
+    parsed_other_order = parse_other_order(
+        user_id,
+        text
+    )
+
+    if parsed_other_order:
+
+        pending_other_orders[user_id] = parsed_other_order
+
+        return make_other_order_confirmation(
+            parsed_other_order
+        )
+
+    # -----------------------------------------------------
+    # 8. 取消目前新訂單
     # -----------------------------------------------------
     if text in [
         "取消",
@@ -237,7 +287,7 @@ def handle_message(user_id, user_text):
         )
 
     # -----------------------------------------------------
-    # 8. 顯示目前新訂單
+    # 9. 顯示目前新訂單
     # -----------------------------------------------------
     if text in [
         "目前訂單",
@@ -254,7 +304,7 @@ def handle_message(user_id, user_text):
         return make_order_confirmation(order)
 
     # -----------------------------------------------------
-    # 9. 確認新訂單
+    # 10. 確認新訂單
     # Google 端此時正式產生 001 / 002 / 003...
     # -----------------------------------------------------
     if text == "確認":
@@ -288,7 +338,7 @@ def handle_message(user_id, user_text):
         return "❌ 訂單寫入失敗，請稍後再試。"
 
     # -----------------------------------------------------
-    # 10. 已有待確認新訂單時，優先判斷修改指令
+    # 11. 已有待確認新訂單時，優先判斷修改指令
     # -----------------------------------------------------
     if user_id in pending_orders:
 
@@ -468,6 +518,148 @@ def handle_message(user_id, user_text):
     # AI 只負責回答文字，不直接修改 Google 訂單。
     # -----------------------------------------------------
     return ask_ai(user_id, user_text)
+
+
+# =========================================================
+# 其他訂單
+# =========================================================
+def parse_other_order(user_id, text):
+
+    clean_text = text.strip()
+
+    # 完整學校名稱：天母國中王老師 買書面紙20張
+    match = re.fullmatch(
+        r"(.+?(?:國中|高中|國小))"
+        r"([\u4e00-\u9fff]{1,4})老師"
+        r"\s*(?:買|購買|要買)\s*(.+)",
+        clean_text
+    )
+
+    school = ""
+    teacher = ""
+    item = ""
+
+    if match:
+        school = match.group(1).strip()
+        teacher = match.group(2).strip() + "老師"
+        item = match.group(3).strip()
+
+    else:
+        # 學校簡稱：天母王老師 買書面紙20張
+        match = re.fullmatch(
+            r"([\u4e00-\u9fff]{2,8})"
+            r"([\u4e00-\u9fff])老師"
+            r"\s*(?:買|購買|要買)\s*(.+)",
+            clean_text
+        )
+
+        if match:
+            school = match.group(1).strip() + "國中"
+            teacher = match.group(2).strip() + "老師"
+            item = match.group(3).strip()
+
+    # 若只說「王老師 買書面紙20張」，
+    # 就沿用最近查過的老師學校。
+    if not teacher:
+        match = re.fullmatch(
+            r"([\u4e00-\u9fff]{1,4})老師"
+            r"\s*(?:買|購買|要買)\s*(.+)",
+            clean_text
+        )
+
+        if match:
+            teacher = match.group(1).strip() + "老師"
+            item = match.group(2).strip()
+
+            context = teacher_lookup_context.get(
+                user_id
+            ) or conversation_context.get(
+                user_id,
+                {}
+            )
+
+            if context.get("teacher") == teacher:
+                school = context.get("school", "")
+
+    if not school or not teacher or not item:
+        return None
+
+    # 老師資料仍以 Google 資料庫為準，避免打錯人名。
+    classes = get_teacher_classes(
+        school,
+        teacher
+    )
+
+    if not classes:
+        return None
+
+    return {
+        "school": school,
+        "teacher": teacher,
+        "item": item
+    }
+
+
+def make_other_order_confirmation(order):
+
+    return (
+        "👑 LeBron James 幫你把「其他訂單」整理好了：📦\n\n"
+        "🧾 其他訂單確認\n\n"
+        f"學校：{order['school']}\n"
+        f"老師：{order['teacher']}\n"
+        f"項目：{order['item']}\n"
+        "進度：（空白）\n"
+        "備註：（空白）\n\n"
+        "如果正確，請回覆「確認」\n"
+        "不要這筆請回覆「取消」"
+    )
+
+
+def write_other_order_to_google_sheet(order):
+
+    if not GOOGLE_SCRIPT_URL:
+        print("GOOGLE_SCRIPT_URL not found")
+        return False, {}
+
+    payload = {
+        "action": "create_other_order",
+        "school": order["school"],
+        "teacher": order["teacher"],
+        "item": order["item"]
+    }
+
+    try:
+
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=payload,
+            timeout=15
+        )
+
+        print(
+            "Other order Google response:",
+            response.status_code,
+            response.text
+        )
+
+        if response.status_code != 200:
+            return False, {}
+
+        data = response.json()
+
+        if not data.get("success"):
+            return False, data
+
+        return True, data
+
+    except Exception as error:
+
+        print(
+            "Other order write error:",
+            error
+        )
+
+        return False, {}
 
 
 # =========================================================
