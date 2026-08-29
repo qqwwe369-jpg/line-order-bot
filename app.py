@@ -4,8 +4,8 @@ import requests
 
 app = Flask(__name__)
 
-CHANNEL_ACCESS_TOKEN = os.environ.get("CHANNEL_ACCESS_TOKEN")
-CHANNEL_SECRET = os.environ.get("CHANNEL_SECRET")
+CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
+CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 
 
 @app.route("/", methods=["GET"])
@@ -68,15 +68,9 @@ def reply_to_line(reply_token, message):
 
     url = "https://api.line.me/v2/bot/message/reply"
 
-    # 檢查 Render 到底有沒有真的讀到 Token
     if not CHANNEL_ACCESS_TOKEN:
-        print("❌ CHANNEL_ACCESS_TOKEN 沒有讀到")
+        print("❌ LINE_CHANNEL_ACCESS_TOKEN 沒有讀到")
         return
-
-    print("✅ CHANNEL_ACCESS_TOKEN 有讀到")
-    print("Token length:", len(CHANNEL_ACCESS_TOKEN))
-    print("Token first 5:", CHANNEL_ACCESS_TOKEN[:5])
-    print("Token last 5:", CHANNEL_ACCESS_TOKEN[-5:])
 
     headers = {
         "Content-Type": "application/json",
