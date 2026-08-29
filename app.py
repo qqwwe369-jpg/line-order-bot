@@ -638,15 +638,24 @@ def handle_message(user_id, user_text):
 
     # -----------------------------------------------------
     # 13. 延續剛剛老師直接訂
+    # 支援自然講法：
+    # 701 703定國一數學講義
+    # 701跟703訂國一數學講義
+    # 701、703 國一數學講義
     # -----------------------------------------------------
-    if text.startswith("訂") and "老師" not in text:
+    context = conversation_context.get(user_id)
 
-        context = conversation_context.get(user_id)
+    if context and "老師" not in text:
 
-        if context:
+        contextual_order_text = normalize_contextual_order_request(
+            text,
+            context
+        )
+
+        if contextual_order_text:
             return create_order_from_context(
                 user_id,
-                text,
+                contextual_order_text,
                 context
             )
 
@@ -1798,6 +1807,87 @@ def make_teacher_reply(
         + f"\n\n👥 總學生人數：{total}人\n\n"
         "以上是目前 Google「老師班級資料」中的完整資料。"
     )
+
+
+# =========================================================
+# 自然語句轉成既有訂書格式
+# =========================================================
+def normalize_contextual_order_request(
+    text,
+    context
+):
+
+    clean_text = text.strip()
+
+    # 原本就有「訂」開頭，直接沿用。
+    if clean_text.startswith("訂"):
+        return clean_text
+
+    known_classes = [
+        str(item["class_name"])
+        for item in context.get("classes", [])
+    ]
+
+    mentioned_classes = []
+
+    for class_name in known_classes:
+        if re.search(
+            r"(?<!\d)"
+            + re.escape(class_name)
+            + r"(?!\d)",
+            clean_text
+        ):
+            mentioned_classes.append(
+                class_name
+            )
+
+    if not mentioned_classes:
+        return None
+
+    # 常見口語／輸入法：
+    # 「定」視為「訂」，但只在班級後面出現時處理。
+    normalized = re.sub(
+        r"(?<=\d)\s*定\s*",
+        "訂",
+        clean_text,
+        count=1
+    )
+
+    # 如果句子裡本來就有「訂」，把它移到最前面，
+    # 讓既有 build_order 邏輯處理。
+    if "訂" in normalized:
+        normalized = normalized.replace(
+            "訂",
+            " ",
+            1
+        )
+
+        return "訂" + normalized.strip()
+
+    # 沒寫「訂」也允許：
+    # 701 703 國一數學講義
+    # 但至少要看起來還有書名內容，避免單純打班級就誤下單。
+    remainder = normalized
+
+    for class_name in mentioned_classes:
+        remainder = re.sub(
+            r"(?<!\d)"
+            + re.escape(class_name)
+            + r"(?!\d)",
+            " ",
+            remainder
+        )
+
+    remainder = re.sub(
+        r"[跟和與、,，/\s]+",
+        " ",
+        remainder
+    ).strip()
+
+    if not remainder:
+        return None
+
+    return "訂" + normalized
 
 
 # =========================================================
