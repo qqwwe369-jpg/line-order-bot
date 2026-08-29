@@ -155,8 +155,29 @@ def handle_message(user_id, user_text):
         return make_historical_order_reply(order)
 
     # -----------------------------------------------------
-    # 5. 直接指定歷史訂單修改
+    # 5. 查過歷史訂單後，可直接說 701改28
+    # 這段一定要放在「直接指定訂單」之前，
+    # 避免把 705改35 誤判成訂單 007。
+    # -----------------------------------------------------
+    if (
+        user_id in historical_order_context
+        and re.fullmatch(
+            r"\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
+            text
+        )
+        and user_id not in pending_orders
+    ):
+
+        return prepare_history_adjustment(
+            user_id,
+            historical_order_context[user_id],
+            text
+        )
+
+    # -----------------------------------------------------
+    # 6. 直接指定歷史訂單修改
     # 例如：001的701改28本
+    # 或：訂單001的701改28本
     # -----------------------------------------------------
     direct_history = parse_direct_history_adjustment(text)
 
@@ -176,24 +197,6 @@ def handle_message(user_id, user_text):
             user_id,
             order,
             edit_text
-        )
-
-    # -----------------------------------------------------
-    # 6. 查過歷史訂單後，可直接說 701改28
-    # -----------------------------------------------------
-    if (
-        user_id in historical_order_context
-        and re.search(
-            r"\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
-            text
-        )
-        and user_id not in pending_orders
-    ):
-
-        return prepare_history_adjustment(
-            user_id,
-            historical_order_context[user_id],
-            text
         )
 
     # -----------------------------------------------------
@@ -1192,8 +1195,12 @@ def extract_order_lookup_number(text):
 # =========================================================
 def parse_direct_history_adjustment(text):
 
+    # 必須明確寫出「的」，例如：
+    # 001的705改35
+    # 訂單001的705改35
+    # 這樣 705改35 才不會被誤認成訂單編號。
     match = re.search(
-        r"^(?:訂單)?(\d{1,})\s*(?:的)?\s*"
+        r"^(?:訂單)?(\d{1,})\s*的\s*"
         r"(\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?)$",
         text
     )
