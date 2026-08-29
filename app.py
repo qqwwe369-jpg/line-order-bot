@@ -3689,73 +3689,119 @@ def lookup_school_classes(
         "class_name": class_name
     }
 
-    try:
+    # Apps Script 本身可能已完成，但 Google 的回傳節點偶爾會 timeout。
+    # 這裡採 3 次重試，避免一次暫時性網路問題就直接回報失敗。
+    for attempt in range(3):
 
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=payload,
-            timeout=15
-        )
+        try:
 
-        if response.status_code != 200:
+            response = requests.post(
+                GOOGLE_SCRIPT_URL,
+                json=payload,
+                timeout=20
+            )
+
             print(
-                "School classes HTTP error:",
+                "School classes status:",
                 response.status_code,
-                response.text
+                "attempt:",
+                attempt + 1
             )
-            return None
 
-        result = response.json()
-
-        if not result.get("success"):
-            print(
-                "School classes API error:",
-                result
-            )
-            return None
-
-        classes = []
-
-        for item in result.get(
-            "classes",
-            []
-        ):
-            classes.append({
-                "school": str(
-                    item.get("school", school)
-                ),
-                "class_name": str(
-                    item.get("class_name", "")
-                ),
-                "students": int(
-                    item.get("students", 0) or 0
+            if response.status_code != 200:
+                print(
+                    "School classes HTTP error:",
+                    response.status_code,
+                    response.text
                 )
-            })
 
-        return {
-            "classes": classes,
-            "class_count": int(
-                result.get(
-                    "class_count",
-                    len(classes)
-                ) or 0
-            ),
-            "total_students": int(
-                result.get(
-                    "total_students",
-                    0
-                ) or 0
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+
+                return None
+
+            try:
+                result = response.json()
+            except Exception as json_error:
+                print(
+                    "School classes JSON error:",
+                    json_error,
+                    response.text[:500]
+                )
+
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+
+                return None
+
+            if not result.get("success"):
+                print(
+                    "School classes API error:",
+                    result
+                )
+                return None
+
+            classes = []
+
+            for item in result.get(
+                "classes",
+                []
+            ):
+                classes.append({
+                    "school": str(
+                        item.get("school", school)
+                    ),
+                    "class_name": str(
+                        item.get("class_name", "")
+                    ),
+                    "students": int(
+                        item.get("students", 0) or 0
+                    )
+                })
+
+            return {
+                "classes": classes,
+                "class_count": int(
+                    result.get(
+                        "class_count",
+                        len(classes)
+                    ) or 0
+                ),
+                "total_students": int(
+                    result.get(
+                        "total_students",
+                        0
+                    ) or 0
+                )
+            }
+
+        except requests.exceptions.RequestException as error:
+
+            print(
+                "School classes lookup error:",
+                error,
+                "attempt:",
+                attempt + 1
             )
-        }
 
-    except Exception as error:
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
 
-        print(
-            "School classes lookup error:",
-            error
-        )
+            return None
 
-        return None
+        except Exception as error:
+
+            print(
+                "School classes unexpected error:",
+                error
+            )
+
+            return None
+
+    return None
 
 
 def handle_school_stats_query(query):
@@ -3957,76 +4003,121 @@ def lookup_school_versions(
         "academic_period": academic_period
     }
 
-    try:
+    # 與學生資料查詢相同，針對 Google 回傳節點的暫時 timeout 做重試。
+    for attempt in range(3):
 
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=payload,
-            timeout=15
-        )
+        try:
 
-        if response.status_code != 200:
+            response = requests.post(
+                GOOGLE_SCRIPT_URL,
+                json=payload,
+                timeout=20
+            )
+
             print(
-                "Version lookup HTTP error:",
+                "Version lookup status:",
                 response.status_code,
-                response.text
+                "attempt:",
+                attempt + 1
             )
-            return None
 
-        result = response.json()
+            if response.status_code != 200:
+                print(
+                    "Version lookup HTTP error:",
+                    response.status_code,
+                    response.text
+                )
 
-        if not result.get("success"):
-            print(
-                "Version lookup API error:",
-                result
-            )
-            return None
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
 
-        versions = []
+                return None
 
-        for item in result.get(
-            "versions",
-            []
-        ):
-            versions.append({
-                "school": str(
-                    item.get("school", school)
-                ),
-                "grade": str(
-                    item.get("grade", "")
-                ),
-                "subject": str(
-                    item.get("subject", "")
-                ),
-                "version": str(
-                    item.get("version", "")
-                ),
-                "academic_period": str(
-                    item.get(
-                        "academic_period",
+            try:
+                result = response.json()
+            except Exception as json_error:
+                print(
+                    "Version lookup JSON error:",
+                    json_error,
+                    response.text[:500]
+                )
+
+                if attempt < 2:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+
+                return None
+
+            if not result.get("success"):
+                print(
+                    "Version lookup API error:",
+                    result
+                )
+                return None
+
+            versions = []
+
+            for item in result.get(
+                "versions",
+                []
+            ):
+                versions.append({
+                    "school": str(
+                        item.get("school", school)
+                    ),
+                    "grade": str(
+                        item.get("grade", "")
+                    ),
+                    "subject": str(
+                        item.get("subject", "")
+                    ),
+                    "version": str(
+                        item.get("version", "")
+                    ),
+                    "academic_period": str(
+                        item.get(
+                            "academic_period",
+                            ""
+                        )
+                    )
+                })
+
+            return {
+                "latest_period": str(
+                    result.get(
+                        "latest_period",
                         ""
                     )
-                )
-            })
+                ),
+                "versions": versions
+            }
 
-        return {
-            "latest_period": str(
-                result.get(
-                    "latest_period",
-                    ""
-                )
-            ),
-            "versions": versions
-        }
+        except requests.exceptions.RequestException as error:
 
-    except Exception as error:
+            print(
+                "Version lookup error:",
+                error,
+                "attempt:",
+                attempt + 1
+            )
 
-        print(
-            "Version lookup error:",
-            error
-        )
+            if attempt < 2:
+                time.sleep(0.5 * (attempt + 1))
+                continue
 
-        return None
+            return None
+
+        except Exception as error:
+
+            print(
+                "Version lookup unexpected error:",
+                error
+            )
+
+            return None
+
+    return None
 
 
 def handle_school_version_query(query):
