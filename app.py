@@ -1,6 +1,7 @@
 from flask import Flask, request
 import os
 import requests
+import re
 
 app = Flask(__name__)
 
@@ -18,8 +19,8 @@ def home():
 
 @app.route("/callback", methods=["POST"])
 def callback():
-    body = request.get_json()
 
+    body = request.get_json()
     print("Webhook received")
     print(body)
 
@@ -50,7 +51,52 @@ def callback():
 
 def handle_message(user_id, user_text):
 
-    # ===== 測試查老師班級 =====
+    # =========================
+    # 確認訂單
+    # =========================
+
+    if user_text == "確認":
+
+        order = pending_orders.get(user_id)
+
+        if not order:
+            return "⚠️ 找不到尚未確認的訂單，請重新輸入。"
+
+        success = write_to_google_sheet(order)
+
+        if success:
+
+            pending_orders.pop(user_id, None)
+
+            return (
+                "✅ 訂單已確認\n\n"
+                "已成功寫入 Google 試算表。\n\n"
+                f"老師：{order['teacher']}\n"
+                f"書名：{order['book']}\n"
+                f"總數量：{order['quantity']}本"
+            )
+
+        return "❌ 訂單寫入失敗，請稍後再試。"
+
+
+    # =========================
+    # 一句話訂書
+    # 例如：
+    # 王老師訂國一數學講義三個班
+    # =========================
+
+    if "訂" in user_text and "老師" in user_text:
+
+        return create_order_from_sentence(
+            user_id,
+            user_text
+        )
+
+
+    # =========================
+    # 查老師功能保留
+    # =========================
+
     if user_text.startswith("查老師"):
 
         lines = user_text.splitlines()
@@ -59,12 +105,15 @@ def handle_message(user_id, user_text):
         teacher = ""
 
         for line in lines:
+
             line = line.strip()
 
             if "：" in line:
                 key, value = line.split("：", 1)
+
             elif ":" in line:
                 key, value = line.split(":", 1)
+
             else:
                 continue
 
@@ -78,6 +127,7 @@ def handle_message(user_id, user_text):
                 teacher = value
 
         if not school or not teacher:
+
             return (
                 "⚠️ 請用以下格式：\n\n"
                 "查老師\n"
@@ -85,77 +135,194 @@ def handle_message(user_id, user_text):
                 "老師姓名：王老師"
             )
 
-        return lookup_teacher(school, teacher)
+        result = get_teacher_classes(
+            school,
+            teacher
+        )
 
-    # ===== 訂單確認 =====
-    if user_text == "確認":
+        if not result:
+            return "⚠️ 查不到老師資料"
 
-        order = pending_orders.get(user_id)
+        classes = result
 
-        if not order:
-            return "⚠️ 找不到尚未確認的訂單，請重新輸入。"
+        total = sum(
+            item["students"]
+            for item in classes
+        )
 
-        success = write_to_google_sheet(order)
+        lines = []
 
-        if success:
-            pending_orders.pop(user_id, None)
+        for item in classes:
 
-            return (
-                "✅ 訂單已確認\n\n"
-                "已成功寫入 Google 試算表。"
+            lines.append(
+                f"{item['class_name']}："
+                f"{item['students']}人"
             )
 
-        return "❌ 訂單寫入失敗，請稍後再試。"
-
-    # ===== 一般訂單 =====
-    order = parse_order(user_text)
-
-    missing = []
-
-    if not order["teacher"]:
-        missing.append("老師姓名")
-
-    if not order["school"]:
-        missing.append("學校")
-
-    if not order["book"]:
-        missing.append("書名")
-
-    if not order["quantity"]:
-        missing.append("數量")
-
-    if not order["publisher"]:
-        missing.append("出版社")
-
-    if missing:
         return (
-            "⚠️ 訂單資料不完整\n\n"
-            "缺少：" + "、".join(missing) + "\n\n"
-            "請用以下格式輸入：\n\n"
-            "老師姓名：王老師\n"
-            "學校：天母國中\n"
-            "書名：國一數學講義\n"
-            "數量：5\n"
-            "出版社：翰林"
+            "👨‍🏫 老師班級資料\n\n"
+            f"學校：{school}\n"
+            f"老師：{teacher}\n\n"
+            + "\n".join(lines)
+            + f"\n\n總人數：{total}人"
         )
+
+
+    return (
+        "📚 請輸入訂購內容\n\n"
+        "例如：\n"
+        "王老師訂國一數學講義三個班"
+    )
+
+
+def create_order_from_sentence(user_id, text):
+
+    # 找老師姓名
+    teacher_match = re.search(
+        r"(.+?老師)",
+        text
+    )
+
+    if not teacher_match:
+        return "⚠️ 找不到老師姓名"
+
+    teacher = teacher_match.group(1).strip()
+
+
+    # 找「訂」的位置
+    order_position = text.find("訂")
+
+    if order_position == -1:
+        return "⚠️ 找不到訂購內容"
+
+
+    # 抓「訂」後面的文字
+    book_part = text[
+        order_position + 1:
+    ].strip()
+
+
+    # 移除「三個班 / 3個班」等字樣
+    book = re.sub(
+        r"[一二三四五六七八九十\d]+個班.*$",
+        "",
+        book_part
+    ).strip()
+
+
+    if not book:
+        return "⚠️ 找不到書名"
+
+
+    # 目前測試學校
+    school = "天母國中"
+
+
+    # 查老師班級
+    classes = get_teacher_classes(
+        school,
+        teacher
+    )
+
+    if not classes:
+
+        return (
+            "⚠️ 查不到老師班級資料\n\n"
+            f"老師：{teacher}"
+        )
+
+
+    # 判斷使用者說幾個班
+    requested_count = extract_class_count(text)
+
+    if requested_count:
+
+        if requested_count != len(classes):
+
+            return (
+                "⚠️ 班級數量不一致\n\n"
+                f"{teacher}資料庫共有 "
+                f"{len(classes)} 個班，\n"
+                f"但你這次說要訂 "
+                f"{requested_count} 個班。\n\n"
+                "請指定要訂哪些班級。"
+            )
+
+
+    total = sum(
+        item["students"]
+        for item in classes
+    )
+
+
+    order = {
+        "teacher": teacher,
+        "school": school,
+        "book": book,
+        "quantity": total,
+        "publisher": "",
+        "classes": classes
+    }
 
     pending_orders[user_id] = order
 
+
+    class_lines = []
+
+    for item in classes:
+
+        class_lines.append(
+            f"{item['class_name']}："
+            f"{item['students']}本"
+        )
+
+
     return (
         "📚 訂購確認\n\n"
-        f"老師姓名：{order['teacher']}\n"
-        f"學校：{order['school']}\n"
-        f"書名：{order['book']}\n"
-        f"數量：{order['quantity']}\n"
-        f"出版社：{order['publisher']}\n\n"
+        f"老師：{teacher}\n"
+        f"學校：{school}\n"
+        f"書名：{book}\n\n"
+        + "\n".join(class_lines)
+        + f"\n\n總數量：{total}本\n\n"
         "如果正確，請回覆「確認」"
     )
 
 
-def lookup_teacher(school, teacher):
+def extract_class_count(text):
+
+    number_map = {
+        "一": 1,
+        "二": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+        "六": 6,
+        "七": 7,
+        "八": 8,
+        "九": 9,
+        "十": 10
+    }
+
+    match = re.search(
+        r"([一二三四五六七八九十\d]+)個班",
+        text
+    )
+
+    if not match:
+        return None
+
+    value = match.group(1)
+
+    if value.isdigit():
+        return int(value)
+
+    return number_map.get(value)
+
+
+def get_teacher_classes(school, teacher):
 
     if not GOOGLE_SCRIPT_URL:
-        return "❌ GOOGLE_SCRIPT_URL 沒有設定"
+        return None
 
     data = {
         "action": "lookup_teacher",
@@ -164,6 +331,7 @@ def lookup_teacher(school, teacher):
     }
 
     try:
+
         response = requests.post(
             GOOGLE_SCRIPT_URL,
             json=data,
@@ -172,84 +340,43 @@ def lookup_teacher(school, teacher):
 
         result = response.json()
 
-        classes = result.get("classes", [])
-
-        if not classes:
-            return (
-                "⚠️ 查不到老師資料\n\n"
-                f"學校：{school}\n"
-                f"老師：{teacher}"
-            )
-
-        total = 0
-        class_lines = []
-
-        for item in classes:
-            class_name = item.get("class_name", "")
-            students = int(item.get("students", 0))
-
-            total += students
-
-            class_lines.append(
-                f"{class_name}：{students}人"
-            )
-
-        return (
-            "👨‍🏫 老師班級資料\n\n"
-            f"學校：{school}\n"
-            f"老師：{teacher}\n\n"
-            + "\n".join(class_lines)
-            + f"\n\n總人數：{total}人"
+        raw_classes = result.get(
+            "classes",
+            []
         )
 
+        classes = []
+
+        for item in raw_classes:
+
+            classes.append({
+                "class_name":
+                    str(
+                        item.get(
+                            "class_name",
+                            ""
+                        )
+                    ),
+
+                "students":
+                    int(
+                        item.get(
+                            "students",
+                            0
+                        )
+                    )
+            })
+
+        return classes
+
     except Exception as error:
-        print("Teacher lookup error:", error)
-        return "❌ 老師資料查詢失敗"
 
+        print(
+            "Teacher lookup error:",
+            error
+        )
 
-def parse_order(user_text):
-
-    order = {
-        "teacher": "",
-        "school": "",
-        "book": "",
-        "quantity": "",
-        "publisher": ""
-    }
-
-    lines = user_text.splitlines()
-
-    for line in lines:
-        line = line.strip()
-
-        if "：" in line:
-            key, value = line.split("：", 1)
-
-        elif ":" in line:
-            key, value = line.split(":", 1)
-
-        else:
-            continue
-
-        key = key.strip()
-        value = value.strip()
-
-        if key in ["老師姓名", "老師"]:
-            order["teacher"] = value
-
-        elif key == "學校":
-            order["school"] = value
-
-        elif key == "書名":
-            order["book"] = value
-
-        elif key == "數量":
-            order["quantity"] = value
-
-        elif key == "出版社":
-            order["publisher"] = value
-
-    return order
+        return None
 
 
 def write_to_google_sheet(order):
@@ -267,37 +394,61 @@ def write_to_google_sheet(order):
     }
 
     try:
+
         response = requests.post(
             GOOGLE_SCRIPT_URL,
             json=data,
             timeout=15
         )
 
-        print("Google Sheet status:", response.status_code)
-        print("Google Sheet response:", response.text)
+        print(
+            "Google Sheet status:",
+            response.status_code
+        )
+
+        print(
+            "Google Sheet response:",
+            response.text
+        )
 
         return response.status_code == 200
 
     except Exception as error:
-        print("Google Sheet error:", error)
+
+        print(
+            "Google Sheet error:",
+            error
+        )
+
         return False
 
 
 def reply_to_line(reply_token, message):
 
-    url = "https://api.line.me/v2/bot/message/reply"
+    url = (
+        "https://api.line.me/"
+        "v2/bot/message/reply"
+    )
 
     if not CHANNEL_ACCESS_TOKEN:
-        print("❌ LINE_CHANNEL_ACCESS_TOKEN 沒有讀到")
+        print(
+            "❌ LINE_CHANNEL_ACCESS_TOKEN "
+            "沒有讀到"
+        )
         return
 
     headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
+        "Content-Type":
+            "application/json",
+
+        "Authorization":
+            "Bearer " +
+            CHANNEL_ACCESS_TOKEN
     }
 
     data = {
         "replyToken": reply_token,
+
         "messages": [
             {
                 "type": "text",
@@ -313,13 +464,25 @@ def reply_to_line(reply_token, message):
         timeout=10
     )
 
-    print("LINE reply status:", response.status_code)
-    print("LINE reply response:", response.text)
+    print(
+        "LINE reply status:",
+        response.status_code
+    )
+
+    print(
+        "LINE reply response:",
+        response.text
+    )
 
 
 if __name__ == "__main__":
 
-    port = int(os.environ.get("PORT", 5000))
+    port = int(
+        os.environ.get(
+            "PORT",
+            5000
+        )
+    )
 
     app.run(
         host="0.0.0.0",
