@@ -145,9 +145,6 @@ def handle_message(user_id, user_text):
 
     # =========================
     # 4. 完整一句話訂書
-    # 例如：
-    # 王老師訂國一數學講義三個班
-    # 王老師訂國一數學講義 701、705
     # =========================
     if (
         "訂" in user_text
@@ -236,9 +233,7 @@ def handle_message(user_id, user_text):
         "例如：\n"
         "王老師訂國一數學講義三個班\n\n"
         "也可以先問：\n"
-        "王老師教哪幾班？\n\n"
-        "再接著說：\n"
-        "訂701跟705，國一數學講義"
+        "王老師教哪幾班？"
     )
 
 
@@ -314,8 +309,7 @@ def make_teacher_reply(
         f"共教 {len(classes)} 個班\n\n"
         + "\n".join(class_lines)
         + f"\n\n總人數：{total}人\n\n"
-        "接下來你可以直接說：\n"
-        "訂701跟705，國一數學講義"
+        "你希望我幫你訂哪幾個班？"
     )
 
 
@@ -482,35 +476,23 @@ def build_order(
                 book
             )
 
-        # 清掉「跟、和、與」等連接詞
+        # 清掉標點
         book = re.sub(
             r"[、,，/]+",
             " ",
             book
         )
 
+        # 清掉連接詞
         book = re.sub(
-            r"^(跟|和|與)+",
+            r"^[跟和與]+",
             "",
-            book
-        )
-
-        book = re.sub(
-            r"\b(跟|和|與)\b",
-            " ",
             book
         )
 
         book = re.sub(
             r"\s+",
             " ",
-            book
-        ).strip()
-
-        # 移除最前面的連接字
-        book = re.sub(
-            r"^[跟和與]+",
-            "",
             book
         ).strip()
 
@@ -550,8 +532,7 @@ def build_order(
                     f"{class_names}\n\n"
                     f"你這次要訂 "
                     f"{requested_count} 個班。\n\n"
-                    "請直接告訴我要哪幾班，例如：\n"
-                    "訂701跟705，國一數學講義"
+                    "請直接告訴我要哪幾班。"
                 )
 
 
@@ -571,8 +552,7 @@ def build_order(
             return (
                 f"好的，目前選的是 "
                 f"{class_names}。\n\n"
-                "請再告訴我書名，例如：\n"
-                "國一數學講義"
+                "請再告訴我書名。"
             )
 
         return "⚠️ 找不到書名"
@@ -647,13 +627,14 @@ def clean_book_name(book):
 
     book = book.strip()
 
-    # 清除最前面的標點與連接詞
+    # 清除最前面的標點
     book = re.sub(
         r"^[、,，。:：\s]+",
         "",
         book
     )
 
+    # 清除最前面的連接詞
     book = re.sub(
         r"^[跟和與]+",
         "",
