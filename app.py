@@ -51,10 +51,7 @@ def callback():
 
 def handle_message(user_id, user_text):
 
-    # =========================
-    # 確認訂單
-    # =========================
-
+    # ===== 確認訂單 =====
     if user_text == "確認":
 
         order = pending_orders.get(user_id)
@@ -73,18 +70,14 @@ def handle_message(user_id, user_text):
                 "已成功寫入 Google 試算表。\n\n"
                 f"老師：{order['teacher']}\n"
                 f"書名：{order['book']}\n"
+                f"出版社：{order['publisher']}\n"
                 f"總數量：{order['quantity']}本"
             )
 
         return "❌ 訂單寫入失敗，請稍後再試。"
 
 
-    # =========================
-    # 一句話訂書
-    # 例如：
-    # 王老師訂國一數學講義三個班
-    # =========================
-
+    # ===== 一句話訂書 =====
     if "訂" in user_text and "老師" in user_text:
 
         return create_order_from_sentence(
@@ -93,10 +86,7 @@ def handle_message(user_id, user_text):
         )
 
 
-    # =========================
-    # 查老師功能保留
-    # =========================
-
+    # ===== 查老師 =====
     if user_text.startswith("查老師"):
 
         lines = user_text.splitlines()
@@ -135,26 +125,24 @@ def handle_message(user_id, user_text):
                 "老師姓名：王老師"
             )
 
-        result = get_teacher_classes(
+        classes = get_teacher_classes(
             school,
             teacher
         )
 
-        if not result:
+        if not classes:
             return "⚠️ 查不到老師資料"
-
-        classes = result
 
         total = sum(
             item["students"]
             for item in classes
         )
 
-        lines = []
+        class_lines = []
 
         for item in classes:
 
-            lines.append(
+            class_lines.append(
                 f"{item['class_name']}："
                 f"{item['students']}人"
             )
@@ -163,7 +151,7 @@ def handle_message(user_id, user_text):
             "👨‍🏫 老師班級資料\n\n"
             f"學校：{school}\n"
             f"老師：{teacher}\n\n"
-            + "\n".join(lines)
+            + "\n".join(class_lines)
             + f"\n\n總人數：{total}人"
         )
 
@@ -188,19 +176,16 @@ def create_order_from_sentence(user_id, text):
 
     teacher = teacher_match.group(1).strip()
 
-
     # 找「訂」的位置
     order_position = text.find("訂")
 
     if order_position == -1:
         return "⚠️ 找不到訂購內容"
 
-
     # 抓「訂」後面的文字
     book_part = text[
         order_position + 1:
     ].strip()
-
 
     # 移除「三個班 / 3個班」等字樣
     book = re.sub(
@@ -209,14 +194,11 @@ def create_order_from_sentence(user_id, text):
         book_part
     ).strip()
 
-
     if not book:
         return "⚠️ 找不到書名"
 
-
     # 目前測試學校
     school = "天母國中"
-
 
     # 查老師班級
     classes = get_teacher_classes(
@@ -230,7 +212,6 @@ def create_order_from_sentence(user_id, text):
             "⚠️ 查不到老師班級資料\n\n"
             f"老師：{teacher}"
         )
-
 
     # 判斷使用者說幾個班
     requested_count = extract_class_count(text)
@@ -248,24 +229,32 @@ def create_order_from_sentence(user_id, text):
                 "請指定要訂哪些班級。"
             )
 
+    # 查出版社
+    publisher = get_book_publisher(book)
+
+    if not publisher:
+
+        return (
+            "⚠️ 查不到書籍資料\n\n"
+            f"書名：{book}\n\n"
+            "請先到「書籍資料」工作表新增這本書與出版社。"
+        )
 
     total = sum(
         item["students"]
         for item in classes
     )
 
-
     order = {
         "teacher": teacher,
         "school": school,
         "book": book,
         "quantity": total,
-        "publisher": "",
+        "publisher": publisher,
         "classes": classes
     }
 
     pending_orders[user_id] = order
-
 
     class_lines = []
 
@@ -276,12 +265,12 @@ def create_order_from_sentence(user_id, text):
             f"{item['students']}本"
         )
 
-
     return (
         "📚 訂購確認\n\n"
         f"老師：{teacher}\n"
         f"學校：{school}\n"
-        f"書名：{book}\n\n"
+        f"書名：{book}\n"
+        f"出版社：{publisher}\n\n"
         + "\n".join(class_lines)
         + f"\n\n總數量：{total}本\n\n"
         "如果正確，請回覆「確認」"
@@ -350,21 +339,18 @@ def get_teacher_classes(school, teacher):
         for item in raw_classes:
 
             classes.append({
-                "class_name":
-                    str(
-                        item.get(
-                            "class_name",
-                            ""
-                        )
-                    ),
-
-                "students":
-                    int(
-                        item.get(
-                            "students",
-                            0
-                        )
+                "class_name": str(
+                    item.get(
+                        "class_name",
+                        ""
                     )
+                ),
+                "students": int(
+                    item.get(
+                        "students",
+                        0
+                    )
+                )
             })
 
         return classes
@@ -373,6 +359,41 @@ def get_teacher_classes(school, teacher):
 
         print(
             "Teacher lookup error:",
+            error
+        )
+
+        return None
+
+
+def get_book_publisher(book):
+
+    if not GOOGLE_SCRIPT_URL:
+        return None
+
+    data = {
+        "action": "lookup_book",
+        "book": book
+    }
+
+    try:
+
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=data,
+            timeout=15
+        )
+
+        result = response.json()
+
+        if result.get("found"):
+            return result.get("publisher", "")
+
+        return None
+
+    except Exception as error:
+
+        print(
+            "Book lookup error:",
             error
         )
 
@@ -438,17 +459,12 @@ def reply_to_line(reply_token, message):
         return
 
     headers = {
-        "Content-Type":
-            "application/json",
-
-        "Authorization":
-            "Bearer " +
-            CHANNEL_ACCESS_TOKEN
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
     }
 
     data = {
         "replyToken": reply_token,
-
         "messages": [
             {
                 "type": "text",
