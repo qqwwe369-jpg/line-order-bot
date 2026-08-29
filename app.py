@@ -17,6 +17,8 @@ AI_FALLBACK_MESSAGE = "👑 LeBron James 正在幫你處理中，請稍後再試
 # 尚未確認的訂單
 pending_orders = {}
 pending_other_orders = {}
+pending_other_updates = {}
+other_order_context = {}
 
 # 最近查詢的老師
 conversation_context = {}
@@ -92,6 +94,8 @@ def handle_message(user_id, user_text):
 
         pending_orders.pop(user_id, None)
         pending_other_orders.pop(user_id, None)
+        pending_other_updates.pop(user_id, None)
+        other_order_context.pop(user_id, None)
         conversation_context.pop(user_id, None)
         historical_order_context.pop(user_id, None)
         pending_history_updates.pop(user_id, None)
@@ -107,7 +111,58 @@ def handle_message(user_id, user_text):
         )
 
     # -----------------------------------------------------
-    # 2. 取消歷史訂單修改
+    # 2. 取消「其他訂單」修改
+    # -----------------------------------------------------
+    if (
+        text in ["取消修改", "不要修改"]
+        and user_id in pending_other_updates
+    ):
+        pending_other_updates.pop(user_id, None)
+        return "❌ 已取消這次「其他訂單」修改，Google 資料沒有變動。"
+
+    # -----------------------------------------------------
+    # 3. 確認「其他訂單」修改
+    # -----------------------------------------------------
+    if (
+        text in ["確認修改", "確認"]
+        and user_id in pending_other_updates
+    ):
+        update_data = pending_other_updates.get(user_id)
+
+        success, result = update_other_order_in_google_sheet(
+            update_data["row_number"],
+            update_data["field"],
+            update_data["value"]
+        )
+
+        if not success:
+            return "❌ 其他訂單修改失敗，Google 資料沒有變動。"
+
+        pending_other_updates.pop(user_id, None)
+
+        refreshed = lookup_other_orders(
+            teacher=update_data.get("teacher", ""),
+            row_number=update_data["row_number"]
+        )
+
+        if refreshed:
+            other_order_context[user_id] = refreshed[0]
+
+        field_name = (
+            "進度"
+            if update_data["field"] == "progress"
+            else "備註"
+        )
+
+        return (
+            "👑 LeBron James：其他訂單已更新。📦\n\n"
+            f"✅ 其他訂單 #{update_data['row_number']}\n"
+            f"{field_name}：{update_data['value']}\n\n"
+            "Google「其他訂單」已同步更新。"
+        )
+
+    # -----------------------------------------------------
+    # 4. 取消歷史訂單修改
     # -----------------------------------------------------
     if text in ["取消修改", "不要修改"]:
 
@@ -218,7 +273,81 @@ def handle_message(user_id, user_text):
         )
 
     # -----------------------------------------------------
-    # 7. 其他訂單：確認 / 取消 / 建立
+    # 7. 查詢「其他訂單」
+    # 支援：
+    # 查王老師其他訂單 / 查詢王老師其他訂單
+    # 王老師其他訂單 / 查其他訂單 王老師
+    # -----------------------------------------------------
+    other_query = parse_other_order_query(text)
+
+    if other_query:
+        orders = lookup_other_orders(
+            teacher=other_query.get("teacher", ""),
+            item_keyword=other_query.get("item_keyword", "")
+        )
+
+        if not orders:
+            teacher_text = other_query.get("teacher", "")
+            return (
+                "⚠️ 查不到符合條件的其他訂單。"
+                + (
+                    f"\n老師：{teacher_text}"
+                    if teacher_text else ""
+                )
+            )
+
+        # 只有一筆時，後續可直接說「進度改成已訂購」
+        if len(orders) == 1:
+            other_order_context[user_id] = orders[0]
+        else:
+            other_order_context.pop(user_id, None)
+
+        return make_other_orders_reply(orders)
+
+    # -----------------------------------------------------
+    # 8. 修改「其他訂單」進度 / 備註
+    # 支援：
+    # 王老師書面紙進度改成已訂購
+    # 王老師書面紙備註改成週一送達
+    # 其他訂單2進度改成已訂購
+    # 查到單筆後：進度改成已訂購 / 備註改成週一送達
+    # -----------------------------------------------------
+    other_update = parse_other_order_update(
+        user_id,
+        text
+    )
+
+    if other_update:
+
+        target = resolve_other_order_target(
+            user_id,
+            other_update
+        )
+
+        if isinstance(target, str):
+            return target
+
+        if not target:
+            return "⚠️ 找不到要修改的其他訂單。"
+
+        field = other_update["field"]
+        value = other_update["value"]
+
+        pending_other_updates[user_id] = {
+            "row_number": target["row_number"],
+            "teacher": target["teacher"],
+            "field": field,
+            "value": value
+        }
+
+        return make_other_order_update_confirmation(
+            target,
+            field,
+            value
+        )
+
+    # -----------------------------------------------------
+    # 9. 其他訂單：確認 / 取消 / 建立
     # 例如：天母王老師 買書面紙20張
     # -----------------------------------------------------
     if text == "確認" and user_id in pending_other_orders:
@@ -660,6 +789,300 @@ def write_other_order_to_google_sheet(order):
         )
 
         return False, {}
+
+
+# =========================================================
+# 查詢 / 修改「其他訂單」
+# =========================================================
+def parse_other_order_query(text):
+
+    patterns = [
+        r"^(?:查|查詢)?\s*([\u4e00-\u9fff]{1,4}老師)\s*其他訂單$",
+        r"^(?:查|查詢)\s*其他訂單\s*([\u4e00-\u9fff]{1,4}老師)$",
+        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*(.+?)\s*其他訂單$"
+    ]
+
+    for index, pattern in enumerate(patterns):
+        match = re.fullmatch(pattern, text.strip())
+
+        if not match:
+            continue
+
+        teacher = match.group(1).strip()
+
+        item_keyword = ""
+        if index == 2 and match.lastindex and match.lastindex >= 2:
+            item_keyword = match.group(2).strip()
+
+        return {
+            "teacher": teacher,
+            "item_keyword": item_keyword
+        }
+
+    return None
+
+
+def parse_other_order_update(user_id, text):
+
+    clean_text = text.strip()
+
+    # 直接指定列號：其他訂單2進度改成已訂購
+    match = re.fullmatch(
+        r"(?:其他訂單|其他單)\s*#?\s*(\d+)\s*"
+        r"(進度|備註)\s*(?:改成|改為|改|設成|設為)\s*(.+)",
+        clean_text
+    )
+
+    if match:
+        return {
+            "row_number": int(match.group(1)),
+            "field": (
+                "progress"
+                if match.group(2) == "進度"
+                else "note"
+            ),
+            "value": match.group(3).strip()
+        }
+
+    # 老師＋品項關鍵字：王老師書面紙進度改成已訂購
+    match = re.fullmatch(
+        r"(?:把)?\s*([\u4e00-\u9fff]{1,4}老師)\s*"
+        r"(.+?)\s*(進度|備註)\s*"
+        r"(?:改成|改為|改|設成|設為)\s*(.+)",
+        clean_text
+    )
+
+    if match:
+        return {
+            "teacher": match.group(1).strip(),
+            "item_keyword": match.group(2).strip(),
+            "field": (
+                "progress"
+                if match.group(3) == "進度"
+                else "note"
+            ),
+            "value": match.group(4).strip()
+        }
+
+    # 查到單筆後：進度改成已訂購 / 備註改成週一送達
+    match = re.fullmatch(
+        r"(進度|備註)\s*(?:改成|改為|改|設成|設為)\s*(.+)",
+        clean_text
+    )
+
+    if match and user_id in other_order_context:
+        return {
+            "use_context": True,
+            "field": (
+                "progress"
+                if match.group(1) == "進度"
+                else "note"
+            ),
+            "value": match.group(2).strip()
+        }
+
+    return None
+
+
+def resolve_other_order_target(
+    user_id,
+    update_data
+):
+
+    if update_data.get("use_context"):
+        return other_order_context.get(user_id)
+
+    if update_data.get("row_number"):
+        orders = lookup_other_orders(
+            row_number=update_data["row_number"]
+        )
+
+        if not orders:
+            return None
+
+        return orders[0]
+
+    orders = lookup_other_orders(
+        teacher=update_data.get("teacher", ""),
+        item_keyword=update_data.get("item_keyword", "")
+    )
+
+    if not orders:
+        return None
+
+    if len(orders) > 1:
+        lines = [
+            "⚠️ 找到多筆符合的其他訂單，為了避免改錯，請指定編號：\n"
+        ]
+
+        for order in orders[:10]:
+            lines.append(
+                f"#{order['row_number']} "
+                f"{order['date']}｜"
+                f"{order['item']}｜"
+                f"進度：{order['progress'] or '空白'}"
+            )
+
+        lines.append(
+            "\n例如：其他訂單2進度改成已訂購"
+        )
+
+        return "\n".join(lines)
+
+    return orders[0]
+
+
+def lookup_other_orders(
+    teacher="",
+    item_keyword="",
+    row_number=None
+):
+
+    if not GOOGLE_SCRIPT_URL:
+        print("GOOGLE_SCRIPT_URL not found")
+        return []
+
+    payload = {
+        "action": "lookup_other_orders",
+        "teacher": teacher,
+        "item_keyword": item_keyword
+    }
+
+    if row_number is not None:
+        payload["row_number"] = int(row_number)
+
+    try:
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=payload,
+            timeout=15
+        )
+
+        print(
+            "Lookup other orders response:",
+            response.status_code,
+            response.text
+        )
+
+        if response.status_code != 200:
+            return []
+
+        data = response.json()
+
+        if not data.get("success"):
+            return []
+
+        return data.get("orders", [])
+
+    except Exception as error:
+        print("Lookup other orders error:", error)
+        return []
+
+
+def update_other_order_in_google_sheet(
+    row_number,
+    field,
+    value
+):
+
+    if not GOOGLE_SCRIPT_URL:
+        return False, {}
+
+    payload = {
+        "action": "update_other_order",
+        "row_number": int(row_number),
+        "field": field,
+        "value": value
+    }
+
+    try:
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=payload,
+            timeout=15
+        )
+
+        print(
+            "Update other order response:",
+            response.status_code,
+            response.text
+        )
+
+        if response.status_code != 200:
+            return False, {}
+
+        data = response.json()
+
+        return bool(data.get("success")), data
+
+    except Exception as error:
+        print("Update other order error:", error)
+        return False, {}
+
+
+def make_other_orders_reply(orders):
+
+    lines = [
+        "👑 LeBron James 幫你查了「其他訂單」：📦",
+        ""
+    ]
+
+    for order in orders[:10]:
+        lines.extend([
+            f"🧾 其他訂單 #{order['row_number']}",
+            f"日期：{order['date']}",
+            f"學校：{order['school']}",
+            f"老師：{order['teacher']}",
+            f"項目：{order['item']}",
+            f"進度：{order['progress'] or '（空白）'}",
+            f"備註：{order['note'] or '（空白）'}",
+            ""
+        ])
+
+    if len(orders) > 10:
+        lines.append(
+            f"另外還有 {len(orders) - 10} 筆較舊資料。"
+        )
+
+    lines.append(
+        "要更新可以直接說："
+    )
+    lines.append(
+        "「進度改成已訂購」或「備註改成週一送達」"
+        if len(orders) == 1
+        else "「其他訂單編號＋進度/備註」，例如：其他訂單2進度改成已訂購"
+    )
+
+    return "\n".join(lines)
+
+
+def make_other_order_update_confirmation(
+    order,
+    field,
+    value
+):
+
+    field_name = (
+        "進度"
+        if field == "progress"
+        else "備註"
+    )
+
+    old_value = (
+        order.get("progress", "")
+        if field == "progress"
+        else order.get("note", "")
+    )
+
+    return (
+        "🔄 其他訂單修改確認\n\n"
+        f"🧾 其他訂單 #{order['row_number']}\n"
+        f"老師：{order['teacher']}\n"
+        f"項目：{order['item']}\n\n"
+        f"{field_name}：{old_value or '（空白）'} → {value}\n\n"
+        "如果正確，請回覆「確認修改」或「確認」\n"
+        "不要修改請回覆「取消修改」"
+    )
 
 
 # =========================================================
