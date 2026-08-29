@@ -53,7 +53,7 @@ def callback():
 def handle_message(user_id, user_text):
 
     # =========================
-    # 確認訂單
+    # 1. 確認訂單
     # =========================
     if user_text == "確認":
 
@@ -81,7 +81,72 @@ def handle_message(user_id, user_text):
 
 
     # =========================
-    # 一句話訂書
+    # 2. 問老師教幾個班 / 哪幾班
+    # =========================
+    if (
+        "老師" in user_text
+        and (
+            "教幾個班" in user_text
+            or "教幾班" in user_text
+            or "教哪幾班" in user_text
+            or "教哪些班" in user_text
+            or "幾個班" in user_text
+        )
+        and "訂" not in user_text
+    ):
+
+        teacher_match = re.search(
+            r"(.+?老師)",
+            user_text
+        )
+
+        if not teacher_match:
+            return "⚠️ 找不到老師姓名"
+
+        teacher = teacher_match.group(1).strip()
+
+        # 目前先固定天母國中
+        school = "天母國中"
+
+        classes = get_teacher_classes(
+            school,
+            teacher
+        )
+
+        if not classes:
+
+            return (
+                "⚠️ 查不到老師資料\n\n"
+                f"學校：{school}\n"
+                f"老師：{teacher}"
+            )
+
+        total = sum(
+            item["students"]
+            for item in classes
+        )
+
+        class_lines = []
+
+        for item in classes:
+
+            class_lines.append(
+                f"{item['class_name']}："
+                f"{item['students']}人"
+            )
+
+        return (
+            "👨‍🏫 老師班級資料\n\n"
+            f"學校：{school}\n"
+            f"老師：{teacher}\n"
+            f"共教 {len(classes)} 個班\n\n"
+            + "\n".join(class_lines)
+            + f"\n\n總人數：{total}人"
+        )
+
+
+    # =========================
+    # 3. 一句話訂書
     # =========================
     if "訂" in user_text and "老師" in user_text:
 
@@ -92,7 +157,7 @@ def handle_message(user_id, user_text):
 
 
     # =========================
-    # 查老師
+    # 4. 原本查老師格式
     # =========================
     if user_text.startswith("查老師"):
 
@@ -157,7 +222,8 @@ def handle_message(user_id, user_text):
         return (
             "👨‍🏫 老師班級資料\n\n"
             f"學校：{school}\n"
-            f"老師：{teacher}\n\n"
+            f"老師：{teacher}\n"
+            f"共教 {len(classes)} 個班\n\n"
             + "\n".join(class_lines)
             + f"\n\n總人數：{total}人"
         )
@@ -166,7 +232,9 @@ def handle_message(user_id, user_text):
     return (
         "📚 請輸入訂購內容\n\n"
         "例如：\n"
-        "王老師訂國一數學講義三個班"
+        "王老師訂國一數學講義三個班\n\n"
+        "也可以問：\n"
+        "王老師教哪幾班？"
     )
 
 
@@ -204,7 +272,7 @@ def create_order_from_sentence(user_id, text):
     if not book:
         return "⚠️ 找不到書名"
 
-    # 目前測試學校
+    # 目前先固定天母國中
     school = "天母國中"
 
     # 查老師班級
@@ -424,14 +492,10 @@ def write_to_google_sheet(order):
         "book": order["book"],
         "quantity": order["quantity"],
         "publisher": order["publisher"],
-
-        # 重要：
-        # 把每個班級一起傳給 Apps Script
         "classes": order.get(
             "classes",
             []
         ),
-
         "status": "已確認"
     }
 
@@ -482,17 +546,12 @@ def reply_to_line(reply_token, message):
         return
 
     headers = {
-        "Content-Type":
-            "application/json",
-
-        "Authorization":
-            "Bearer " +
-            CHANNEL_ACCESS_TOKEN
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
     }
 
     data = {
         "replyToken": reply_token,
-
         "messages": [
             {
                 "type": "text",
