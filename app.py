@@ -25,6 +25,7 @@ historical_order_context = {}
 
 # 等待確認的歷史訂單修改
 pending_history_updates = {}
+order_draft_context = {}
 
 # 一般 AI 問答的短期對話紀錄（Render 重啟後會清除）
 ai_conversation_context = {}
@@ -319,7 +320,12 @@ def handle_message(user_id, user_text):
             return change_book(user_id, text)
 
     # -----------------------------------------------------
-    # 11. AI 草擬／整理訊息
+    # 11. 對話式訂書：先說班級＋書名，再補老師
+    conversational_reply = handle_conversational_order(user_id, text)
+    if conversational_reply is not None:
+        return conversational_reply
+
+    # 12. AI 草擬／整理訊息
     # 這類句子即使出現「王老師」「訂書」，也不要誤判成下單。
     # 若句子有訂單編號，例如「依照訂單001幫我寫一段話」，
     # 會先讀 Google 的真實訂單資料，再交給 AI 草擬。
@@ -722,6 +728,115 @@ def normalize_text(text):
 
 
 # =========================================================
+# =========================================================
+# 對話式訂書
+# =========================================================
+def handle_conversational_order(user_id, text):
+    clean_text = text.strip()
+
+    if clean_text in ["全部重來", "全部重設", "重新開始"]:
+        pending_orders.pop(user_id, None)
+        conversation_context.pop(user_id, None)
+        historical_order_context.pop(user_id, None)
+        pending_history_updates.pop(user_id, None)
+        order_draft_context.pop(user_id, None)
+        return (
+            "👑 LeBron James：好，全部重新開始。😊\n\n"
+            "你直接跟我說要訂哪些班、哪本書，缺什麼我再問你。"
+        )
+
+    # 先說：訂701跟705，國一數學講義
+    m = re.search(
+        r"^(?:訂|要訂)\s*((?:\d{2,4}\s*(?:跟|和|、|,|，)?\s*)+)[，,、\s]*(.+)$",
+        clean_text
+    )
+    if m and "老師" not in clean_text:
+        class_names = re.findall(r"\d{2,4}", m.group(1))
+        book = clean_book_name(m.group(2))
+        if class_names and book:
+            order_draft_context[user_id] = {
+                "class_names": class_names,
+                "book": book
+            }
+            return (
+                "👑 LeBron James：班級跟書名我記下來了。📚\n\n"
+                f"班級：{'、'.join(class_names)}\n"
+                f"書名：{book}\n\n"
+                "請問是哪一位老師？例如：天母王老師"
+            )
+
+    draft = order_draft_context.get(user_id)
+    if not draft:
+        return None
+
+    # 補老師：天母王老師 / 天母國中王老師
+    school = ""
+    teacher = ""
+
+    m_full = re.fullmatch(
+        r"(.+?)(國中|高中|國小)\s*([\u4e00-\u9fff]{1,4})老師",
+        clean_text
+    )
+    if m_full:
+        school = m_full.group(1) + m_full.group(2)
+        teacher = m_full.group(3) + "老師"
+    else:
+        # 簡稱目前依 Google 常用的「XX國中」補全，例如天母→天母國中
+        m_short = re.fullmatch(
+            r"([\u4e00-\u9fff]{2,8})([\u4e00-\u9fff])老師",
+            clean_text
+        )
+        if m_short:
+            school = m_short.group(1) + "國中"
+            teacher = m_short.group(2) + "老師"
+
+    if not teacher:
+        return None
+
+    teacher_classes = get_teacher_classes(school, teacher)
+    if not teacher_classes:
+        return (
+            "⚠️ 查不到老師班級資料\n\n"
+            f"學校：{school}\n老師：{teacher}\n\n"
+            "請確認學校或老師名稱。"
+        )
+
+    selected = []
+    for class_name in draft["class_names"]:
+        found = next(
+            (item for item in teacher_classes
+             if str(item["class_name"]) == str(class_name)),
+            None
+        )
+        if not found:
+            return f"⚠️ {teacher} 的資料裡找不到 {class_name} 班。"
+        selected.append({
+            "class_name": str(found["class_name"]),
+            "students": int(found["students"])
+        })
+
+    publisher = get_book_publisher(draft["book"])
+    if not publisher:
+        return f"⚠️ 查不到書籍出版社資料：{draft['book']}"
+
+    order = {
+        "teacher": teacher,
+        "school": school,
+        "book": draft["book"],
+        "publisher": publisher,
+        "classes": selected
+    }
+    refresh_order_total(order)
+    pending_orders[user_id] = order
+    conversation_context[user_id] = {
+        "teacher": teacher,
+        "school": school,
+        "classes": copy_classes(teacher_classes)
+    }
+    order_draft_context.pop(user_id, None)
+    return make_order_confirmation(order)
+
+
 # 查老師
 # =========================================================
 def handle_teacher_lookup(
