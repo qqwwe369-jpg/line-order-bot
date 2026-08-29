@@ -100,7 +100,29 @@ def handle_message(user_id, user_text):
 
 
     # =========================
-    # 2. 查老師教哪幾班
+    # 2. 修改尚未確認的訂單
+    #
+    # 例如：
+    # 701改28人
+    # 701改28本
+    # 701少2本
+    # 705多1本
+    # =========================
+    if user_id in pending_orders:
+
+        if re.search(
+            r"\d+\s*(改成|改為|改|多|少)\s*\d+",
+            user_text
+        ):
+
+            return adjust_pending_order(
+                user_id,
+                user_text
+            )
+
+
+    # =========================
+    # 3. 查老師教哪幾班
     # =========================
     if (
         "老師" in user_text
@@ -121,7 +143,8 @@ def handle_message(user_id, user_text):
 
 
     # =========================
-    # 3. 延續上一位老師直接訂
+    # 4. 延續上一位老師直接訂
+    #
     # 例如：
     # 訂701跟705，國一數學講義
     # =========================
@@ -144,7 +167,10 @@ def handle_message(user_id, user_text):
 
 
     # =========================
-    # 4. 完整一句話訂書
+    # 5. 完整一句話訂書
+    #
+    # 例如：
+    # 王老師訂國一數學講義三個班
     # =========================
     if (
         "訂" in user_text
@@ -158,7 +184,7 @@ def handle_message(user_id, user_text):
 
 
     # =========================
-    # 5. 原本查老師格式
+    # 6. 原本查老師格式
     # =========================
     if user_text.startswith("查老師"):
 
@@ -237,6 +263,218 @@ def handle_message(user_id, user_text):
     )
 
 
+# =========================
+# 修改尚未確認的訂單
+# =========================
+def adjust_pending_order(
+    user_id,
+    text
+):
+
+    order = pending_orders.get(user_id)
+
+    if not order:
+
+        return (
+            "⚠️ 目前沒有尚未確認的訂單。"
+        )
+
+    classes = order.get(
+        "classes",
+        []
+    )
+
+    if not classes:
+
+        return (
+            "⚠️ 這筆訂單沒有班級資料，"
+            "無法調整。"
+        )
+
+    # 支援：
+    # 701改28
+    # 701改成28
+    # 701改為28
+    # 701少2
+    # 701多1
+    #
+    # 也支援一次修改多班：
+    # 701改28，705改30
+
+    pattern = re.compile(
+        r"(?<!\d)"
+        r"(\d{2,4})"
+        r"(?!\d)"
+        r"\s*"
+        r"(改成|改為|改|多|少)"
+        r"\s*"
+        r"(\d+)"
+        r"\s*"
+        r"(?:人|本)?"
+    )
+
+    matches = list(
+        pattern.finditer(text)
+    )
+
+    if not matches:
+
+        return (
+            "⚠️ 我看不懂要怎麼修改。\n\n"
+            "例如可以說：\n"
+            "701改28人\n"
+            "或\n"
+            "701少2本"
+        )
+
+    changed = []
+    errors = []
+
+    for match in matches:
+
+        class_name = match.group(1)
+        action = match.group(2)
+        value = int(match.group(3))
+
+        target_class = None
+
+        for item in classes:
+
+            if (
+                str(item["class_name"])
+                == class_name
+            ):
+
+                target_class = item
+                break
+
+        if not target_class:
+
+            errors.append(
+                f"{class_name} 不在這筆訂單裡"
+            )
+
+            continue
+
+        old_quantity = int(
+            target_class.get(
+                "students",
+                0
+            )
+        )
+
+        # -------------------------
+        # 改成指定數量
+        # -------------------------
+        if action in [
+            "改",
+            "改成",
+            "改為"
+        ]:
+
+            new_quantity = value
+
+
+        # -------------------------
+        # 多幾本
+        # -------------------------
+        elif action == "多":
+
+            new_quantity = (
+                old_quantity + value
+            )
+
+
+        # -------------------------
+        # 少幾本
+        # -------------------------
+        elif action == "少":
+
+            new_quantity = (
+                old_quantity - value
+            )
+
+
+        else:
+
+            continue
+
+
+        # 不允許負數
+        if new_quantity < 0:
+
+            errors.append(
+                f"{class_name} 調整後不能小於 0"
+            )
+
+            continue
+
+
+        target_class["students"] = (
+            new_quantity
+        )
+
+        changed.append(
+            f"{class_name}："
+            f"{old_quantity} → "
+            f"{new_quantity}本"
+        )
+
+
+    if not changed:
+
+        if errors:
+
+            return (
+                "⚠️ 無法修改訂單\n\n"
+                + "\n".join(errors)
+            )
+
+        return (
+            "⚠️ 沒有找到可以修改的班級。"
+        )
+
+
+    # =========================
+    # 重新計算總數
+    # =========================
+    total = sum(
+        int(item["students"])
+        for item in classes
+    )
+
+    order["quantity"] = total
+    order["classes"] = classes
+
+    pending_orders[user_id] = order
+
+
+    # =========================
+    # 回傳新的確認畫面
+    # =========================
+    message = (
+        "✅ 已調整訂單\n\n"
+        + "\n".join(changed)
+    )
+
+    if errors:
+
+        message += (
+            "\n\n⚠️ "
+            + "\n".join(errors)
+        )
+
+    message += (
+        "\n\n"
+        + make_order_confirmation(order)
+    )
+
+    return message
+
+
+# =========================
+# 查老師
+# =========================
 def handle_teacher_lookup(
     user_id,
     text
@@ -268,7 +506,6 @@ def handle_teacher_lookup(
             f"老師：{teacher}"
         )
 
-    # 記住這位老師
     conversation_context[user_id] = {
         "school": school,
         "teacher": teacher,
@@ -282,6 +519,9 @@ def handle_teacher_lookup(
     )
 
 
+# =========================
+# 老師班級資料回覆
+# =========================
 def make_teacher_reply(
     school,
     teacher,
@@ -313,6 +553,9 @@ def make_teacher_reply(
     )
 
 
+# =========================
+# 延續剛剛查詢的老師訂書
+# =========================
 def create_order_from_context(
     user_id,
     text,
@@ -354,6 +597,9 @@ def create_order_from_context(
     )
 
 
+# =========================
+# 完整一句話訂書
+# =========================
 def create_order_from_sentence(
     user_id,
     text
@@ -393,7 +639,6 @@ def create_order_from_sentence(
             f"老師：{teacher}"
         )
 
-    # 同時更新最近老師
     conversation_context[user_id] = {
         "school": school,
         "teacher": teacher,
@@ -410,6 +655,9 @@ def create_order_from_sentence(
     )
 
 
+# =========================
+# 建立訂單
+# =========================
 def build_order(
     user_id,
     teacher,
@@ -419,9 +667,6 @@ def build_order(
     original_text
 ):
 
-    # =========================
-    # 找指定班級
-    # =========================
     available_class_names = [
         str(item["class_name"])
         for item in all_classes
@@ -429,6 +674,9 @@ def build_order(
 
     selected_class_names = []
 
+    # =========================
+    # 找指定班級
+    # =========================
     for class_name in available_class_names:
 
         pattern = (
@@ -461,11 +709,19 @@ def build_order(
                 in selected_class_names
             ):
 
-                classes.append(item)
+                # 建立新的 dict
+                # 避免修改到 conversation_context
+                classes.append({
+                    "class_name":
+                        str(item["class_name"]),
 
-        # 把班級號碼從內容移除
+                    "students":
+                        int(item["students"])
+                })
+
         book = order_part
 
+        # 移除班級號碼
         for class_name in selected_class_names:
 
             book = re.sub(
@@ -476,14 +732,14 @@ def build_order(
                 book
             )
 
-        # 清掉標點
+        # 清除標點
         book = re.sub(
             r"[、,，/]+",
             " ",
             book
         )
 
-        # 清掉連接詞
+        # 清除前面的跟、和、與
         book = re.sub(
             r"^[跟和與]+",
             "",
@@ -502,7 +758,18 @@ def build_order(
     # =========================
     else:
 
-        classes = all_classes
+        # 建立新的班級資料
+        classes = []
+
+        for item in all_classes:
+
+            classes.append({
+                "class_name":
+                    str(item["class_name"]),
+
+                "students":
+                    int(item["students"])
+            })
 
         book = re.sub(
             r"[一二三四五六七八九十\d]+個班.*$",
@@ -602,9 +869,19 @@ def build_order(
     # =========================
     # 產生確認畫面
     # =========================
+    return make_order_confirmation(
+        order
+    )
+
+
+# =========================
+# 統一產生訂購確認
+# =========================
+def make_order_confirmation(order):
+
     class_lines = []
 
-    for item in classes:
+    for item in order["classes"]:
 
         class_lines.append(
             f"{item['class_name']}："
@@ -613,35 +890,36 @@ def build_order(
 
     return (
         "📚 訂購確認\n\n"
-        f"老師：{teacher}\n"
-        f"學校：{school}\n"
-        f"書名：{book}\n"
-        f"出版社：{publisher}\n\n"
+        f"老師：{order['teacher']}\n"
+        f"學校：{order['school']}\n"
+        f"書名：{order['book']}\n"
+        f"出版社：{order['publisher']}\n\n"
         + "\n".join(class_lines)
-        + f"\n\n總數量：{total}本\n\n"
+        + f"\n\n總數量："
+        f"{order['quantity']}本\n\n"
         "如果正確，請回覆「確認」"
     )
 
 
+# =========================
+# 清理書名
+# =========================
 def clean_book_name(book):
 
     book = book.strip()
 
-    # 清除最前面的標點
     book = re.sub(
         r"^[、,，。:：\s]+",
         "",
         book
     )
 
-    # 清除最前面的連接詞
     book = re.sub(
         r"^[跟和與]+",
         "",
         book
     )
 
-    # 清除最後標點
     book = re.sub(
         r"[、,，。:：\s]+$",
         "",
@@ -651,6 +929,9 @@ def clean_book_name(book):
     return book.strip()
 
 
+# =========================
+# 找「幾個班」
+# =========================
 def extract_class_count(text):
 
     number_map = {
@@ -682,6 +963,9 @@ def extract_class_count(text):
     return number_map.get(value)
 
 
+# =========================
+# 查老師班級
+# =========================
 def get_teacher_classes(
     school,
     teacher
@@ -722,6 +1006,7 @@ def get_teacher_classes(
                         ""
                     )
                 ),
+
                 "students": int(
                     item.get(
                         "students",
@@ -742,6 +1027,9 @@ def get_teacher_classes(
         return None
 
 
+# =========================
+# 查出版社
+# =========================
 def get_book_publisher(book):
 
     if not GOOGLE_SCRIPT_URL:
@@ -781,6 +1069,9 @@ def get_book_publisher(book):
         return None
 
 
+# =========================
+# 寫入 Google 試算表
+# =========================
 def write_to_google_sheet(order):
 
     if not GOOGLE_SCRIPT_URL:
@@ -792,10 +1083,12 @@ def write_to_google_sheet(order):
         "book": order["book"],
         "quantity": order["quantity"],
         "publisher": order["publisher"],
+
         "classes": order.get(
             "classes",
             []
         ),
+
         "status": "已確認"
     }
 
@@ -832,6 +1125,9 @@ def write_to_google_sheet(order):
         return False
 
 
+# =========================
+# LINE 回覆
+# =========================
 def reply_to_line(
     reply_token,
     message
