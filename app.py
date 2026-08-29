@@ -50,6 +50,44 @@ def callback():
 
 def handle_message(user_id, user_text):
 
+    # ===== 測試查老師班級 =====
+    if user_text.startswith("查老師"):
+
+        lines = user_text.splitlines()
+
+        school = ""
+        teacher = ""
+
+        for line in lines:
+            line = line.strip()
+
+            if "：" in line:
+                key, value = line.split("：", 1)
+            elif ":" in line:
+                key, value = line.split(":", 1)
+            else:
+                continue
+
+            key = key.strip()
+            value = value.strip()
+
+            if key == "學校":
+                school = value
+
+            elif key in ["老師", "老師姓名"]:
+                teacher = value
+
+        if not school or not teacher:
+            return (
+                "⚠️ 請用以下格式：\n\n"
+                "查老師\n"
+                "學校：天母國中\n"
+                "老師姓名：王老師"
+            )
+
+        return lookup_teacher(school, teacher)
+
+    # ===== 訂單確認 =====
     if user_text == "確認":
 
         order = pending_orders.get(user_id)
@@ -67,11 +105,9 @@ def handle_message(user_id, user_text):
                 "已成功寫入 Google 試算表。"
             )
 
-        return (
-            "❌ 訂單寫入失敗\n\n"
-            "請稍後再試。"
-        )
+        return "❌ 訂單寫入失敗，請稍後再試。"
 
+    # ===== 一般訂單 =====
     order = parse_order(user_text)
 
     missing = []
@@ -116,6 +152,61 @@ def handle_message(user_id, user_text):
     )
 
 
+def lookup_teacher(school, teacher):
+
+    if not GOOGLE_SCRIPT_URL:
+        return "❌ GOOGLE_SCRIPT_URL 沒有設定"
+
+    data = {
+        "action": "lookup_teacher",
+        "school": school,
+        "teacher": teacher
+    }
+
+    try:
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=data,
+            timeout=15
+        )
+
+        result = response.json()
+
+        classes = result.get("classes", [])
+
+        if not classes:
+            return (
+                "⚠️ 查不到老師資料\n\n"
+                f"學校：{school}\n"
+                f"老師：{teacher}"
+            )
+
+        total = 0
+        class_lines = []
+
+        for item in classes:
+            class_name = item.get("class_name", "")
+            students = int(item.get("students", 0))
+
+            total += students
+
+            class_lines.append(
+                f"{class_name}：{students}人"
+            )
+
+        return (
+            "👨‍🏫 老師班級資料\n\n"
+            f"學校：{school}\n"
+            f"老師：{teacher}\n\n"
+            + "\n".join(class_lines)
+            + f"\n\n總人數：{total}人"
+        )
+
+    except Exception as error:
+        print("Teacher lookup error:", error)
+        return "❌ 老師資料查詢失敗"
+
+
 def parse_order(user_text):
 
     order = {
@@ -133,8 +224,10 @@ def parse_order(user_text):
 
         if "：" in line:
             key, value = line.split("：", 1)
+
         elif ":" in line:
             key, value = line.split(":", 1)
+
         else:
             continue
 
@@ -162,7 +255,6 @@ def parse_order(user_text):
 def write_to_google_sheet(order):
 
     if not GOOGLE_SCRIPT_URL:
-        print("❌ GOOGLE_SCRIPT_URL 沒有讀到")
         return False
 
     data = {
@@ -226,6 +318,7 @@ def reply_to_line(reply_token, message):
 
 
 if __name__ == "__main__":
+
     port = int(os.environ.get("PORT", 5000))
 
     app.run(
