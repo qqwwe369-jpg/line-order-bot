@@ -268,6 +268,7 @@ def handle_message(user_id, user_text):
             pending_orders.pop(user_id, None)
 
             return (
+                "👑 LeBron James：這張我幫你收好了。\n\n"
                 "✅ 訂單已確認\n\n"
                 f"訂單編號：{order_number}\n"
                 "已成功寫入 Google 試算表。\n\n"
@@ -854,6 +855,7 @@ def make_teacher_reply(
         )
 
     return (
+        "👑 LeBron James 幫你看了一下老師的班級資料：\n\n"
         "👨‍🏫 老師班級資料\n\n"
         f"學校：{school}\n"
         f"老師：{teacher}\n"
@@ -1941,6 +1943,7 @@ def make_order_confirmation(order):
         )
 
     return (
+        "👑 LeBron James 幫你把這張單整理好了：\n\n"
         "📚 訂購確認\n\n"
         f"老師：{order['teacher']}\n"
         f"學校：{order['school']}\n"
