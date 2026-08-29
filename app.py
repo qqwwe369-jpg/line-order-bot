@@ -27,6 +27,7 @@ historical_order_context = {}
 pending_history_updates = {}
 order_draft_context = {}
 proposed_teacher_context = {}
+teacher_lookup_context = {}
 
 # 一般 AI 問答的短期對話紀錄（Render 重啟後會清除）
 ai_conversation_context = {}
@@ -93,6 +94,9 @@ def handle_message(user_id, user_text):
         historical_order_context.pop(user_id, None)
         pending_history_updates.pop(user_id, None)
         ai_conversation_context.pop(user_id, None)
+        order_draft_context.pop(user_id, None)
+        proposed_teacher_context.pop(user_id, None)
+        teacher_lookup_context.pop(user_id, None)
 
         return (
             "🔄 已重新開始\n\n"
@@ -362,21 +366,68 @@ def handle_message(user_id, user_text):
         return ask_ai(user_id, user_text)
 
     # -----------------------------------------------------
-    # 12. 查老師教哪幾班
+    # 老師資料庫查詢
+    # 只要是在問老師的班級／人數，就一律重新讀 Google。
+    # 不可拿目前訂單或歷史訂單的班級來回答。
     # -----------------------------------------------------
+    teacher_db_words = [
+        "教幾個班",
+        "教幾班",
+        "教哪幾班",
+        "教哪些班",
+        "總共教幾個班",
+        "有幾個班",
+        "有哪些班",
+        "哪幾個班",
+        "哪幾班",
+        "班級資料",
+        "班級人數",
+        "每班幾人",
+        "每班人數",
+        "學生人數",
+        "總人數",
+        "幾個學生",
+        "多少學生"
+    ]
+
     if (
         "老師" in text
-        and (
-            "教幾個班" in text
-            or "教幾班" in text
-            or "教哪幾班" in text
-            or "教哪些班" in text
-            or "總共教幾個班" in text
-        )
-        and "訂" not in text
+        and any(word in text for word in teacher_db_words)
+        and "訂單" not in text
+        and not is_ai_writing_request(text)
     ):
+        return handle_teacher_lookup(
+            user_id,
+            text
+        )
 
-        return handle_teacher_lookup(user_id, text)
+    # 剛查完老師後的自然追問：
+    # 「總共幾個班」「總人數多少」「每班幾人」
+    # 仍然重新查 Google，並回完整明細。
+    teacher_followup_words = [
+        "總共幾個班",
+        "幾個班",
+        "總人數多少",
+        "總人數",
+        "總共幾人",
+        "總共多少人",
+        "每班幾人",
+        "每班人數",
+        "班級人數",
+        "有哪些班",
+        "哪幾班"
+    ]
+
+    if (
+        any(word in text for word in teacher_followup_words)
+        and "訂單" not in text
+        and user_id in teacher_lookup_context
+        and not is_ai_writing_request(text)
+    ):
+        return handle_teacher_followup(
+            user_id,
+            text
+        )
 
     # -----------------------------------------------------
     # 13. 延續剛剛老師直接訂
@@ -742,6 +793,7 @@ def handle_conversational_order(user_id, text):
         pending_history_updates.pop(user_id, None)
         order_draft_context.pop(user_id, None)
         proposed_teacher_context.pop(user_id, None)
+        teacher_lookup_context.pop(user_id, None)
         return (
             "👑 LeBron James：好，全部重新開始。😊\n\n"
             "你直接跟我說要訂哪些班、哪本書，缺什麼我再問你。"
@@ -915,9 +967,10 @@ def handle_teacher_lookup(
 
     teacher = teacher_match.group(1).strip()
 
-    # 目前測試階段固定天母國中
+    # 目前資料表測試使用天母國中。
     school = "天母國中"
 
+    # 老師資料問題一律重新讀 Google，不使用訂單班級。
     classes = get_teacher_classes(
         school,
         teacher
@@ -931,6 +984,62 @@ def handle_teacher_lookup(
             f"老師：{teacher}"
         )
 
+    fresh_context = {
+        "school": school,
+        "teacher": teacher,
+        "classes": copy_classes(classes)
+    }
+
+    # 訂書上下文與「老師資料庫查詢上下文」分開保存。
+    conversation_context[user_id] = {
+        "school": school,
+        "teacher": teacher,
+        "classes": copy_classes(classes)
+    }
+
+    teacher_lookup_context[user_id] = fresh_context
+
+    return make_teacher_reply(
+        school,
+        teacher,
+        classes
+    )
+
+
+def handle_teacher_followup(
+    user_id,
+    text
+):
+
+    context = teacher_lookup_context.get(
+        user_id
+    )
+
+    if not context:
+        return None
+
+    school = context["school"]
+    teacher = context["teacher"]
+
+    # 追問也重新讀 Google，避免使用舊快取或訂單內容。
+    classes = get_teacher_classes(
+        school,
+        teacher
+    )
+
+    if not classes:
+        return (
+            "⚠️ 查不到老師資料\n\n"
+            f"學校：{school}\n"
+            f"老師：{teacher}"
+        )
+
+    teacher_lookup_context[user_id] = {
+        "school": school,
+        "teacher": teacher,
+        "classes": copy_classes(classes)
+    }
+
     conversation_context[user_id] = {
         "school": school,
         "teacher": teacher,
@@ -942,7 +1051,6 @@ def handle_teacher_lookup(
         teacher,
         classes
     )
-
 
 def handle_form_teacher_lookup(
     user_id,
@@ -1003,6 +1111,12 @@ def handle_form_teacher_lookup(
         "classes": copy_classes(classes)
     }
 
+    teacher_lookup_context[user_id] = {
+        "school": school,
+        "teacher": teacher,
+        "classes": copy_classes(classes)
+    }
+
     return make_teacher_reply(
         school,
         teacher,
@@ -1026,19 +1140,20 @@ def make_teacher_reply(
     for item in classes:
 
         class_lines.append(
-            f"{item['class_name']}："
-            f"{item['students']}人"
+            f"• {item['class_name']}班："
+            f"{int(item['students'])}人"
         )
 
     return (
-        "👑 LeBron James 幫你看了一下老師的班級資料：\n\n"
-        "👨‍🏫 老師班級資料\n\n"
+        "👑 LeBron James 幫你重新查了 Google 老師班級資料：\n\n"
+        "👨‍🏫 老師資料庫\n"
         f"學校：{school}\n"
-        f"老師：{teacher}\n"
-        f"共教 {len(classes)} 個班\n\n"
+        f"老師：{teacher}\n\n"
+        f"📚 班級總數：{len(classes)}個班\n\n"
+        "各班人數：\n"
         + "\n".join(class_lines)
-        + f"\n\n總人數：{total}人\n\n"
-        "你希望我幫你訂哪幾個班？"
+        + f"\n\n👥 總學生人數：{total}人\n\n"
+        "以上是目前 Google「老師班級資料」中的完整資料。"
     )
 
 
@@ -1313,6 +1428,8 @@ def adjust_pending_order(
     text
 ):
 
+    order = pending_orders[user_id]
+
     # -----------------------------------------------------
     # 自然語句：只取消／移除某一個班級
     # 701取消 / 取消701 / 不要701 / 701不要
@@ -1356,8 +1473,6 @@ def adjust_pending_order(
             refresh_order_total(order)
 
             return make_order_confirmation(order)
-
-    order = pending_orders[user_id]
 
     pattern = re.compile(
         r"(?<!\d)"
@@ -1734,10 +1849,15 @@ def extract_order_lookup_number(text):
 
     patterns = [
         r"^查\s*(\d{1,})$",
+        r"^查詢\s*(\d{1,})$",
         r"^查\s*訂單\s*(\d{1,})$",
+        r"^查詢\s*訂單\s*(\d{1,})$",
+        r"^查訂單\s*(\d{1,})$",
+        r"^查詢訂單\s*(\d{1,})$",
         r"^訂單\s*(\d{1,})$",
         r"^(\d{1,})\s*訂單(?:內容)?(?:是什麼|內容是什麼|呢|？|\?)?$",
-        r"^查\s*(\d{1,})\s*訂單(?:內容)?$"
+        r"^查\s*(\d{1,})\s*訂單(?:內容)?$",
+        r"^查詢\s*(\d{1,})\s*訂單(?:內容)?$"
     ]
 
     for pattern in patterns:
