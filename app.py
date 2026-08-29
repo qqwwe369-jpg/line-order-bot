@@ -9,6 +9,11 @@ CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
+# OpenAI 一般問答
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
+AI_FALLBACK_MESSAGE = "👑 LeBron James 正在幫你處理中，請稍後再試一次。"
+
 # 尚未確認的訂單
 pending_orders = {}
 
@@ -20,6 +25,9 @@ historical_order_context = {}
 
 # 等待確認的歷史訂單修改
 pending_history_updates = {}
+
+# 一般 AI 問答的短期對話紀錄（Render 重啟後會清除）
+ai_conversation_context = {}
 
 
 @app.route("/", methods=["GET"])
@@ -82,6 +90,7 @@ def handle_message(user_id, user_text):
         conversation_context.pop(user_id, None)
         historical_order_context.pop(user_id, None)
         pending_history_updates.pop(user_id, None)
+        ai_conversation_context.pop(user_id, None)
 
         return (
             "🔄 已重新開始\n\n"
@@ -359,15 +368,154 @@ def handle_message(user_id, user_text):
             user_text
         )
 
-    return (
-        "📚 請輸入訂購內容\n\n"
-        "你可以先問：\n"
-        "王老師教哪幾班？\n\n"
-        "也可以直接說：\n"
-        "王老師訂國一數學講義三個班\n\n"
-        "查歷史訂單可以說：\n"
-        "查001"
+    # -----------------------------------------------------
+    # 15. 不是訂書指令 → 交給 AI 一般問答
+    # AI 只負責回答文字，不直接修改 Google 訂單。
+    # -----------------------------------------------------
+    return ask_ai(user_id, user_text)
+
+
+# =========================================================
+# 一般 AI 問答
+# =========================================================
+def ask_ai(user_id, user_text):
+
+    if not OPENAI_API_KEY:
+        print("OpenAI API key missing")
+        return AI_FALLBACK_MESSAGE
+
+    history = ai_conversation_context.get(
+        user_id,
+        []
     )
+
+    # 只保留最近幾輪，避免每次傳太多文字。
+    recent_history = history[-8:]
+
+    conversation_text = ""
+
+    for item in recent_history:
+        role_name = (
+            "使用者"
+            if item["role"] == "user"
+            else "助理"
+        )
+        conversation_text += (
+            f"{role_name}：{item['text']}\n"
+        )
+
+    conversation_text += (
+        f"使用者：{user_text}\n助理："
+    )
+
+    instructions = (
+        "你是『大漢訂書小幫手』的工作助理。"
+        "請使用繁體中文回答，口吻自然、簡潔、實用。"
+        "你可以回答一般問題、整理文字、草擬訊息、"
+        "計算與提供工作上的建議。"
+        "你不能聲稱自己已經修改、建立或取消任何訂單，"
+        "也不能聲稱已經修改 Google 試算表。"
+        "訂單查詢、建立、修改與確認都由外層固定程式處理。"
+        "如果使用者要求你直接更動訂單資料，"
+        "請提醒他使用明確的訂書指令。"
+        "回答適合直接顯示在 LINE，不要使用 Markdown 表格。"
+    )
+
+    url = "https://api.openai.com/v1/responses"
+
+    headers = {
+        "Authorization":
+            "Bearer " + OPENAI_API_KEY,
+        "Content-Type":
+            "application/json"
+    }
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": instructions,
+        "input": conversation_text,
+        "max_output_tokens": 600
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        print(
+            "OpenAI status:",
+            response.status_code
+        )
+
+        if response.status_code != 200:
+            print(
+                "OpenAI error:",
+                response.text
+            )
+            return AI_FALLBACK_MESSAGE
+
+        data = response.json()
+        answer = extract_openai_text(data)
+
+        if not answer:
+            print("OpenAI returned empty answer")
+            return AI_FALLBACK_MESSAGE
+
+        # LINE 單則文字訊息上限很高，
+        # 這裡仍限制長度，避免回答過長。
+        answer = answer.strip()[:4500]
+
+        history.append({
+            "role": "user",
+            "text": user_text
+        })
+        history.append({
+            "role": "assistant",
+            "text": answer
+        })
+
+        ai_conversation_context[user_id] = (
+            history[-10:]
+        )
+
+        return answer
+
+    except Exception as error:
+        print(
+            "OpenAI request error:",
+            error
+        )
+        return AI_FALLBACK_MESSAGE
+
+
+def extract_openai_text(data):
+
+    # Responses API 的文字通常位於：
+    # output[] -> content[] -> output_text -> text
+    texts = []
+
+    for item in data.get("output", []):
+        for content in item.get("content", []):
+            if (
+                content.get("type")
+                == "output_text"
+                and content.get("text")
+            ):
+                texts.append(
+                    content.get("text")
+                )
+
+    if texts:
+        return "\n".join(texts)
+
+    # 保留相容性：若 API 回傳頂層 output_text。
+    if data.get("output_text"):
+        return str(data.get("output_text"))
+
+    return ""
 
 
 # =========================================================
