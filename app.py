@@ -545,6 +545,34 @@ def handle_message(user_id, user_text):
         return ask_ai(user_id, user_text)
 
     # -----------------------------------------------------
+    # 訂書進度查詢：老師名稱 + 訂書進度
+    # 例如：查王老師訂書進度 / 查詢王老師訂書訂單
+    # 這裡查的是「訂書進度」，不是老師班級資料庫。
+    # -----------------------------------------------------
+    teacher_book_query = parse_teacher_book_order_query(text)
+
+    if teacher_book_query:
+        orders = lookup_book_orders_by_teacher(
+            teacher_book_query["teacher"]
+        )
+
+        if not orders:
+            return (
+                "⚠️ 查不到這位老師的訂書紀錄。\n\n"
+                f"老師：{teacher_book_query['teacher']}"
+            )
+
+        if len(orders) == 1:
+            historical_order_context[user_id] = orders[0]
+        else:
+            historical_order_context.pop(user_id, None)
+
+        return make_teacher_book_orders_reply(
+            teacher_book_query["teacher"],
+            orders
+        )
+
+    # -----------------------------------------------------
     # 老師資料庫查詢
     # 只要是在問老師的班級／人數，就一律重新讀 Google。
     # 不可拿目前訂單或歷史訂單的班級來回答。
@@ -2454,6 +2482,142 @@ def change_book(
         f"{old_book}\n"
         f"→ {new_book}\n\n"
         + make_order_confirmation(order)
+    )
+
+
+# =========================================================
+# 依老師查「訂書進度」
+# =========================================================
+def parse_teacher_book_order_query(text):
+
+    patterns = [
+        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書進度$",
+        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書訂單$",
+        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書紀錄$",
+        r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書進度$",
+        r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書訂單$",
+        r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書紀錄$"
+    ]
+
+    for pattern in patterns:
+        match = re.fullmatch(
+            pattern,
+            text.strip()
+        )
+
+        if match:
+            return {
+                "teacher": match.group(1).strip()
+            }
+
+    return None
+
+
+def lookup_book_orders_by_teacher(teacher):
+
+    if not GOOGLE_SCRIPT_URL:
+        return []
+
+    payload = {
+        "action": "lookup_orders_by_teacher",
+        "teacher": teacher
+    }
+
+    try:
+        response = requests.post(
+            GOOGLE_SCRIPT_URL,
+            json=payload,
+            timeout=15
+        )
+
+        print(
+            "Lookup teacher book orders response:",
+            response.status_code,
+            response.text
+        )
+
+        if response.status_code != 200:
+            return []
+
+        data = response.json()
+
+        if not data.get("success"):
+            return []
+
+        orders = data.get("orders", [])
+
+        for order in orders:
+            order["order_number"] = normalize_order_number(
+                order.get("order_number", "")
+            )
+            order["classes"] = copy_classes(
+                order.get("classes", [])
+            )
+            order["quantity"] = calculate_total(
+                order["classes"]
+            )
+
+        return orders
+
+    except Exception as error:
+        print(
+            "Lookup teacher book orders error:",
+            error
+        )
+        return []
+
+
+def make_teacher_book_orders_reply(
+    teacher,
+    orders
+):
+
+    lines = [
+        "👑 LeBron James 幫你查了「訂書進度」：📚",
+        "",
+        f"老師：{teacher}",
+        f"共找到 {len(orders)} 張訂書訂單",
+        ""
+    ]
+
+    for order in orders[:10]:
+        lines.extend([
+            f"📘 訂單 {order['order_number']}",
+            f"學校：{order.get('school', '')}",
+            f"書名：{order.get('book', '')}",
+            f"出版社：{order.get('publisher', '')}"
+        ])
+
+        for item in order.get("classes", []):
+            lines.append(
+                f"• {item['class_name']}班："
+                f"{int(item['students'])}本"
+            )
+
+        lines.extend([
+            f"總數量：{int(order.get('quantity', 0))}本",
+            f"狀態：{order.get('status', '')}",
+            (
+                f"訂購時間：{order.get('order_time', '')}"
+                if order.get("order_time")
+                else ""
+            ),
+            ""
+        ])
+
+    if len(orders) > 10:
+        lines.append(
+            f"另外還有 {len(orders) - 10} 張較舊訂單。"
+        )
+
+    lines.append(
+        "要看某一張詳細內容，可以直接說「查002」。"
+    )
+
+    return "\n".join(
+        line for line in lines
+        if line != ""
+        or True
     )
 
 
