@@ -2,6 +2,7 @@ from flask import Flask, request
 import os
 import requests
 import re
+import time
 
 app = Flask(__name__)
 
@@ -1451,11 +1452,21 @@ def handle_conversational_order(user_id, text):
             "你直接跟我說要訂哪些班、哪本書，缺什麼我再問你。"
         )
 
-    # 先說：訂701跟705，國一數學講義
+    # 先說班級＋書名。支援：
+    # 訂701跟705，國一數學講義
+    # 701 705訂國一數學講義
+    # 701訂國一數學講義
     m = re.search(
-        r"^(?:訂|要訂)\s*((?:\d{2,4}\s*(?:跟|和|、|,|，)?\s*)+)[，,、\s]*(.+)$",
+        r"^(?:訂|要訂)\s*((?:\d{2,4}\s*(?:跟|和|、|,|，|\s)?\s*)+)[，,、\s]*(.+)$",
         clean_text
     )
+
+    if not m:
+        m = re.search(
+            r"^((?:\d{2,4}\s*(?:跟|和|、|,|，|\s)?\s*)+)\s*(?:訂|要訂)\s*(.+)$",
+            clean_text
+        )
+
     if m and "老師" not in clean_text:
         class_names = re.findall(r"\d{2,4}", m.group(1))
         book = clean_book_name(m.group(2))
@@ -1533,26 +1544,63 @@ def handle_conversational_order(user_id, text):
             + candidate["teacher"]
         )
 
-    # 補老師：天母王老師 / 天母國中王老師
+    # 補老師：天母王老師 / 天母國中王老師 / 王老師 / 對就是王老師
     school = ""
     teacher = ""
 
-    m_full = re.fullmatch(
-        r"(.+?)(國中|高中|國小)\s*([\u4e00-\u9fff]{1,4})老師",
+    # 先移除自然口語前後綴，保留真正的老師名稱。
+    teacher_reply = re.sub(
+        r"[，,。.!！?？\s]+",
+        "",
         clean_text
+    )
+    teacher_reply = re.sub(
+        r"^(?:對|對的|沒錯|是|就是|就|嗯|恩)+",
+        "",
+        teacher_reply
+    )
+    teacher_reply = re.sub(
+        r"(?:沒錯|對的|就是他|就是她)$",
+        "",
+        teacher_reply
+    )
+
+    m_full = re.fullmatch(
+        r"(.+?)(國中|高中|國小)([\u4e00-\u9fff]{1,4})老師",
+        teacher_reply
     )
     if m_full:
         school = m_full.group(1) + m_full.group(2)
         teacher = m_full.group(3) + "老師"
     else:
-        # 簡稱目前依 Google 常用的「XX國中」補全，例如天母→天母國中
+        # 學校簡稱，例如：天母王老師 → 天母國中王老師
         m_short = re.fullmatch(
             r"([\u4e00-\u9fff]{2,8})([\u4e00-\u9fff])老師",
-            clean_text
+            teacher_reply
         )
         if m_short:
             school = m_short.group(1) + "國中"
             teacher = m_short.group(2) + "老師"
+        else:
+            # 只回答「王老師」「是王老師」「對就是王老師」時：
+            # 先沿用候選/最近老師的學校；都沒有時，依目前老師資料庫預設天母國中。
+            m_teacher_only = re.fullmatch(
+                r"([\u4e00-\u9fff]{1,4})老師",
+                teacher_reply
+            )
+            if m_teacher_only:
+                teacher = m_teacher_only.group(1) + "老師"
+
+                candidate = proposed_teacher_context.get(user_id, {})
+                recent = teacher_lookup_context.get(user_id, {})
+                previous = conversation_context.get(user_id, {})
+
+                school = (
+                    candidate.get("school", "")
+                    or recent.get("school", "")
+                    or previous.get("school", "")
+                    or "天母國中"
+                )
 
     if not teacher:
         return None
@@ -3024,43 +3072,83 @@ def lookup_google_order(order_number):
         "order_number": normalize_order_number(order_number)
     }
 
-    try:
+    # Google Apps Script 偶爾會短暫逾時或回傳異常。
+    # 查詢採最多 3 次短重試，避免把暫時性錯誤誤報成「查不到訂單」。
+    for attempt in range(3):
+        try:
+            response = requests.post(
+                GOOGLE_SCRIPT_URL,
+                json=data,
+                timeout=15
+            )
 
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=data,
-            timeout=15
-        )
+            print(
+                "Lookup order status:",
+                response.status_code,
+                "attempt:",
+                attempt + 1
+            )
+            print("Lookup order response:", response.text)
 
-        result = response.json()
+            if response.status_code != 200:
+                if attempt < 2:
+                    time.sleep(0.35 * (attempt + 1))
+                    continue
+                return None
 
-        if not result.get("success"):
-            print("Lookup order error:", result)
+            try:
+                result = response.json()
+            except Exception as json_error:
+                print("Lookup order JSON error:", json_error)
+                if attempt < 2:
+                    time.sleep(0.35 * (attempt + 1))
+                    continue
+                return None
+
+            if not result.get("success"):
+                print("Lookup order error:", result)
+                if attempt < 2:
+                    time.sleep(0.35 * (attempt + 1))
+                    continue
+                return None
+
+            if not result.get("found"):
+                # 偶發情況下 Google 端第一次會回 found=false，
+                # 再查一次卻能找到，因此也允許短暫重試。
+                if attempt < 2:
+                    time.sleep(0.35 * (attempt + 1))
+                    continue
+                return None
+
+            order = result.get("order", {})
+
+            order["order_number"] = normalize_order_number(
+                order.get("order_number", order_number)
+            )
+
+            order["classes"] = copy_classes(
+                order.get("classes", [])
+            )
+
+            order["quantity"] = calculate_total(
+                order["classes"]
+            )
+
+            return order
+
+        except Exception as error:
+            print(
+                "Lookup order error:",
+                error,
+                "attempt:",
+                attempt + 1
+            )
+            if attempt < 2:
+                time.sleep(0.35 * (attempt + 1))
+                continue
             return None
 
-        if not result.get("found"):
-            return None
-
-        order = result.get("order", {})
-
-        order["order_number"] = normalize_order_number(
-            order.get("order_number", order_number)
-        )
-
-        order["classes"] = copy_classes(
-            order.get("classes", [])
-        )
-
-        order["quantity"] = calculate_total(
-            order["classes"]
-        )
-
-        return order
-
-    except Exception as error:
-
-        print("Lookup order error:", error)
-        return None
+    return None
 
 
 # =========================================================
@@ -3084,28 +3172,85 @@ def update_google_order(
     }
 
     try:
-
         response = requests.post(
             GOOGLE_SCRIPT_URL,
             json=data,
             timeout=15
         )
 
-        result = response.json()
-
         print("Update order status:", response.status_code)
         print("Update order response:", response.text)
 
-        return (
+        result = {}
+        try:
+            result = response.json()
+        except Exception as json_error:
+            print("Update order JSON error:", json_error)
+
+        if (
             response.status_code == 200
-            and result.get("success") is True,
-            result
-        )
+            and result.get("success") is True
+        ):
+            return True, result
+
+        # 有些情況 Google 已經完成修改，但 Apps Script 最後回傳異常，
+        # 會造成 LINE 誤判「修改失敗」。因此在回報失敗前，
+        # 重新讀一次 Google，以實際資料是否已更新為最後判斷。
+        time.sleep(0.4)
+        verified = lookup_google_order(order["order_number"])
+
+        if verified and orders_have_same_core_data(verified, order):
+            print(
+                "Update order verified from Google despite response issue:",
+                order["order_number"]
+            )
+            if not isinstance(result, dict):
+                result = {}
+            result["success"] = True
+            result["verified_after_write"] = True
+            return True, result
+
+        return False, result
 
     except Exception as error:
-
         print("Update order error:", error)
+
+        # 即使 request 端看到例外，也可能是 Google 寫入後回應逾時。
+        # 最後再查一次真實資料，避免成功卻向使用者報失敗。
+        time.sleep(0.4)
+        verified = lookup_google_order(order["order_number"])
+
+        if verified and orders_have_same_core_data(verified, order):
+            return True, {
+                "success": True,
+                "verified_after_exception": True
+            }
+
         return False, None
+
+
+def orders_have_same_core_data(actual_order, expected_order):
+
+    if not actual_order or not expected_order:
+        return False
+
+    if str(actual_order.get("book", "")) != str(expected_order.get("book", "")):
+        return False
+
+    if str(actual_order.get("publisher", "")) != str(expected_order.get("publisher", "")):
+        return False
+
+    actual_classes = {
+        str(item.get("class_name")): int(item.get("students", 0))
+        for item in actual_order.get("classes", [])
+    }
+
+    expected_classes = {
+        str(item.get("class_name")): int(item.get("students", 0))
+        for item in expected_order.get("classes", [])
+    }
+
+    return actual_classes == expected_classes
 
 
 def normalize_order_number(value):
