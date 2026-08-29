@@ -26,6 +26,7 @@ historical_order_context = {}
 # 等待確認的歷史訂單修改
 pending_history_updates = {}
 order_draft_context = {}
+proposed_teacher_context = {}
 
 # 一般 AI 問答的短期對話紀錄（Render 重啟後會清除）
 ai_conversation_context = {}
@@ -740,6 +741,7 @@ def handle_conversational_order(user_id, text):
         historical_order_context.pop(user_id, None)
         pending_history_updates.pop(user_id, None)
         order_draft_context.pop(user_id, None)
+        proposed_teacher_context.pop(user_id, None)
         return (
             "👑 LeBron James：好，全部重新開始。😊\n\n"
             "你直接跟我說要訂哪些班、哪本書，缺什麼我再問你。"
@@ -758,6 +760,26 @@ def handle_conversational_order(user_id, text):
                 "class_names": class_names,
                 "book": book
             }
+            previous = conversation_context.get(user_id, {})
+            previous_teacher = previous.get("teacher", "")
+            previous_school = previous.get("school", "")
+
+            if previous_teacher and previous_school:
+                proposed_teacher_context[user_id] = {
+                    "teacher": previous_teacher,
+                    "school": previous_school
+                }
+
+                return (
+                    "👑 LeBron James：班級跟書名我記下來了。📚\n\n"
+                    f"班級：{'、'.join(class_names)}\n"
+                    f"書名：{book}\n\n"
+                    f"是 {previous_school} 的 {previous_teacher} 嗎？\n"
+                    "如果是，回我「對」或「就是他」就可以。"
+                )
+
+            proposed_teacher_context.pop(user_id, None)
+
             return (
                 "👑 LeBron James：班級跟書名我記下來了。📚\n\n"
                 f"班級：{'、'.join(class_names)}\n"
@@ -768,6 +790,44 @@ def handle_conversational_order(user_id, text):
     draft = order_draft_context.get(user_id)
     if not draft:
         return None
+
+    # -----------------------------------------------------
+    # 承接上一句：對 / 沒錯 / 就是他 / 對就是他...
+    # 只有真的存在「候選老師」時才採用，不能把單純範例當答案。
+    # -----------------------------------------------------
+    affirmative_words = {
+        "對", "對啊", "對阿", "對的", "沒錯",
+        "就是他", "就是她", "沒錯就是他", "沒錯就是她",
+        "對就是他", "對就是她", "是他", "是她",
+        "嗯就是他", "嗯就是她", "恩就是他", "恩就是她",
+        "對 沒錯", "沒錯 就是他", "沒錯 就是她"
+    }
+
+    normalized_reply = re.sub(
+        r"[，,。.!！?？\s]+",
+        "",
+        clean_text
+    )
+
+    normalized_affirmatives = {
+        re.sub(r"[，,。.!！?？\s]+", "", item)
+        for item in affirmative_words
+    }
+
+    if normalized_reply in normalized_affirmatives:
+        candidate = proposed_teacher_context.get(user_id)
+
+        if not candidate:
+            return (
+                "👑 LeBron James：我知道你是在確認老師 😊\n\n"
+                "但我目前還沒有一位確定的候選老師，"
+                "請直接告訴我老師名稱，例如：天母王老師。"
+            )
+
+        clean_text = (
+            candidate["school"]
+            + candidate["teacher"]
+        )
 
     # 補老師：天母王老師 / 天母國中王老師
     school = ""
@@ -834,6 +894,7 @@ def handle_conversational_order(user_id, text):
         "classes": copy_classes(teacher_classes)
     }
     order_draft_context.pop(user_id, None)
+    proposed_teacher_context.pop(user_id, None)
     return make_order_confirmation(order)
 
 
