@@ -1542,12 +1542,16 @@ def parse_direct_history_adjustment(text):
 
 
 def looks_like_history_edit(text):
+    class_pattern = (
+        r"(?:\d{3}|國[一二三][甲乙丙丁戊己庚辛壬癸]|"
+        r"[七八九]年級[甲乙丙丁戊己庚辛壬癸])(?:班)?"
+    )
     quantity = re.search(
-        r"\d{3}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
+        class_pattern + r"\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
         text
     )
     remove = re.search(
-        r"\d{3}\s*(?:取消|不要|移除|刪除|拿掉)",
+        class_pattern + r"\s*(?:取消|不要|移除|刪除|拿掉)",
         text
     )
     return bool(quantity or remove)
@@ -1564,16 +1568,21 @@ def prepare_history_adjustment(user_id, original_order, text):
     order = copy_order(original_order)
     changes = []
 
+    class_pattern = (
+        r"(\d{3}|國[一二三][甲乙丙丁戊己庚辛壬癸]|"
+        r"[七八九]年級[甲乙丙丁戊己庚辛壬癸])(?:班)?"
+    )
+
     quantity_matches = list(re.finditer(
-        r"(?<!\d)(\d{3})(?!\d)\s*"
-        r"(改成|改為|改|多|少)\s*"
+        class_pattern
+        + r"\s*(改成|改為|改|多|少)\s*"
         r"(\d+)\s*(?:人|本)?",
         text
     ))
 
     remove_matches = list(re.finditer(
-        r"(?<!\d)(\d{3})(?!\d)\s*"
-        r"(?:取消|不要|移除|刪除|拿掉)",
+        class_pattern
+        + r"\s*(?:取消|不要|移除|刪除|拿掉)",
         text
     ))
 
@@ -1613,9 +1622,12 @@ def prepare_history_adjustment(user_id, original_order, text):
         old_value = int(target["students"])
         order["classes"] = [
             item for item in order["classes"]
-            if str(item["class_name"]) != class_name
+            if normalize_order_class_name(item["class_name"])
+            != normalize_order_class_name(class_name)
         ]
-        changes.append(f"{class_name}：{old_value}本→取消")
+        changes.append(
+            f"{normalize_order_class_name(class_name)}：{old_value}本→取消"
+        )
 
     refresh_order_total(order)
     modification_text = "；".join(changes)
@@ -1718,7 +1730,8 @@ def make_historical_order_reply(order):
 
     message += (
         "\n\n如果要調整，可以直接說：\n"
-        "701改28本\n"
+        "國二甲取消\n"
+        "國二乙改35本\n"
         "如果整張不要，可以說：取消這張"
     )
     return message
@@ -3092,9 +3105,19 @@ def refresh_order_total(order):
     order["quantity"] = calculate_total(order.get("classes", []))
 
 
+def normalize_order_class_name(value):
+    text = re.sub(r"\s+", "", str(value or "").strip())
+    text = re.sub(r"班$", "", text)
+    text = text.replace("七年級", "國一")
+    text = text.replace("八年級", "國二")
+    text = text.replace("九年級", "國三")
+    return text
+
+
 def find_order_class(order, class_name):
+    target_name = normalize_order_class_name(class_name)
     for item in order.get("classes", []):
-        if str(item.get("class_name")) == str(class_name):
+        if normalize_order_class_name(item.get("class_name")) == target_name:
             return item
     return None
 
