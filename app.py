@@ -100,7 +100,10 @@ def handle_message(user_id, user_text):
     text = normalize_text(user_text)
 
     # 0. 重來：一定最優先
-    if text in ["重來", "重新開始", "全部重來", "全部重設"]:
+    if (
+        text in ["重來", "重新開始", "全部重來", "全部重設"]
+        or re.fullmatch(r"(?:重來|重新開始|全部重來|全部重設)[喔哦唷啦吧啊呀]*[！!。.]?", text)
+    ):
         clear_all_user_state(user_id)
         return (
             "🔄 已重新開始\n\n"
@@ -1274,16 +1277,39 @@ def handle_teacher_followup(user_id):
 
 def make_teacher_reply(school, teacher, classes):
     total = calculate_total(classes)
+
+    subjects = []
+    for item in classes or []:
+        item_subjects = item.get("subjects", [])
+        if isinstance(item_subjects, str):
+            item_subjects = [item_subjects]
+
+        single_subject = str(item.get("subject", "") or "").strip()
+        if single_subject:
+            item_subjects = list(item_subjects or []) + [single_subject]
+
+        for subject in item_subjects or []:
+            subject = str(subject or "").strip()
+            if subject and subject not in subjects:
+                subjects.append(subject)
+
     lines = [
         f"• {item['class_name']}班：{int(item['students'])}人"
         for item in classes
     ]
 
+    subject_line = (
+        f"科目：{'、'.join(subjects)}\n"
+        if subjects else ""
+    )
+
     return (
         ""
         "👨‍🏫 老師資料庫\n"
         f"學校：{school}\n"
-        f"老師：{teacher}\n\n"
+        f"老師：{teacher}\n"
+        + subject_line
+        + "\n"
         f"📚 班級總數：{len(classes)}個班\n\n"
         "各班人數：\n"
         + "\n".join(lines)
@@ -1842,10 +1868,13 @@ def handle_school_version_query(query):
             prefix = f"{item['grade']} "
         lines.append(f"• {prefix}{item['subject']}：{item['version']}")
 
+    period = str(result.get("latest_period", "") or "").strip()
+
     return (
         ""
         f"📚 {query['school']}"
         + (f" {query['grade']}" if query.get("grade") else "")
+        + (f"\n學年度：{period}" if period else "")
         + "\n\n"
         + "\n".join(lines)
     )
@@ -2508,6 +2537,7 @@ def lookup_teacher_matches(teacher, school=""):
         matches.append({
             "school": str(item.get("school", "")).strip(),
             "teacher": str(item.get("teacher", "")).strip(),
+            "subjects": unique_list(item.get("subjects", [])),
             "classes": classes
         })
 
@@ -2527,9 +2557,16 @@ def get_teacher_classes(school, teacher):
     classes = []
     for item in result.get("classes", []):
         try:
+            subjects = item.get("subjects", [])
+            if isinstance(subjects, str):
+                subjects = [subjects]
+
             classes.append({
                 "class_name": str(item.get("class_name", "")),
-                "students": int(item.get("students", 0) or 0)
+                "students": int(item.get("students", 0) or 0),
+                "subjects": unique_list(
+                    [str(s or "").strip() for s in subjects if str(s or "").strip()]
+                )
             })
         except Exception:
             continue
@@ -2796,9 +2833,20 @@ def copy_classes(classes):
     result = []
     for item in classes or []:
         try:
+            subjects = item.get("subjects", [])
+            if isinstance(subjects, str):
+                subjects = [subjects]
+
+            single_subject = str(item.get("subject", "") or "").strip()
+            if single_subject:
+                subjects = list(subjects or []) + [single_subject]
+
             result.append({
                 "class_name": str(item.get("class_name", "")),
-                "students": int(item.get("students", 0) or 0)
+                "students": int(item.get("students", 0) or 0),
+                "subjects": unique_list(
+                    [str(s or "").strip() for s in subjects if str(s or "").strip()]
+                )
             })
         except Exception:
             continue
