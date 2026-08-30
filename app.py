@@ -579,6 +579,52 @@ def extract_book_candidate(text, teacher="", classes=None):
 def merge_followup_into_parsed(clean, parsed, draft):
     result = dict(parsed)
 
+    # -----------------------------------------------------
+    # 對話狀態優先：上一輪正在等老師，這一輪就先當老師處理。
+    # 例如：
+    #   使用者：我要訂書
+    #   機器人：請告訴我是哪一位老師？
+    #   使用者：蔡志強
+    # 這時必須得到「蔡志強老師」，不能誤判成書名。
+    # -----------------------------------------------------
+    if not draft.get("teacher"):
+        teacher, school = extract_teacher_and_school(clean)
+
+        # 支援使用者只輸入姓名、不加「老師」。
+        # 僅在「目前確定正在等老師」時啟用，避免一般訊息被亂抓成老師。
+        if not teacher:
+            bare_name = re.sub(r"[，,。.!！?？\s]+", "", str(clean or ""))
+            obvious_non_teacher_words = [
+                "講義", "評量", "教材", "複習", "測驗", "題本",
+                "自修", "課本", "習作", "學習單",
+                "國文", "英文", "數學", "自然", "社會",
+                "國一", "國二", "國三", "七年級", "八年級", "九年級"
+            ]
+
+            if (
+                re.fullmatch(r"[\u4e00-\u9fff]{2,4}", bare_name)
+                and not any(word in bare_name for word in obvious_non_teacher_words)
+            ):
+                teacher = bare_name + "老師"
+
+        if teacher:
+            result["teacher"] = teacher
+            if school:
+                result["school"] = school
+
+            # 這一輪的目標欄位就是老師。
+            # 即使通用解析器先猜到 book，也要清掉，避免「蔡志強」變成書名。
+            result["book"] = ""
+            result["has_order_intent"] = True
+            return result
+
+        # 目前還在等老師，而且這句又不像老師姓名。
+        # 不把它硬塞進書名，維持原狀並繼續詢問老師。
+        result["book"] = ""
+        result["has_order_intent"] = True
+        return result
+
+    # 已經有老師後，才處理班級與書名。
     if not result.get("teacher"):
         teacher, school = extract_teacher_and_school(clean)
         if teacher:
@@ -589,8 +635,9 @@ def merge_followup_into_parsed(clean, parsed, draft):
     if classes and not result.get("classes"):
         result["classes"] = classes
 
-    # 對話進行中，只要書名還缺，就允許直接口語補書名
-    if not draft.get("book") and not result.get("book"):
+    # 對話進行中，只要書名還缺，就允許直接口語補書名。
+    # 但只有「老師已經確定」後，才允許這段邏輯。
+    if draft.get("teacher") and not draft.get("book") and not result.get("book"):
         teacher_in_text = result.get("teacher", "")
         classes_in_text = result.get("classes", [])
         candidate = extract_book_candidate(
@@ -599,7 +646,7 @@ def merge_followup_into_parsed(clean, parsed, draft):
             classes_in_text
         )
 
-        # 單獨回「王老師」或只有班級號碼時，不誤判成書名
+        # 單獨回「王老師」或只有班級號碼時，不誤判成書名。
         if candidate and "老師" not in candidate and not re.fullmatch(
             r"[\d、,，跟和與\s]+", candidate
         ):
