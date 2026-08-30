@@ -130,6 +130,12 @@ def handle_message(user_id, user_text):
     if correction_reply is not None:
         return correction_reply
 
+    # 1.6 單獨輸入正確老師姓名，也能直接查。
+    # 僅做 Google exact 唯一命中，不做模糊猜測，避免誤判一般短句。
+    bare_teacher_reply = handle_bare_teacher_exact_lookup(user_id, text)
+    if bare_teacher_reply is not None:
+        return bare_teacher_reply
+
     # 2. 固定功能選單
     if is_help_request(text):
         return get_help_reply()
@@ -1168,6 +1174,44 @@ def looks_like_teacher_lookup(text):
     return any(word in text for word in words)
 
 
+def handle_bare_teacher_exact_lookup(user_id, text):
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(text or ""))
+
+    if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}", clean):
+        return None
+
+    blocked_words = {
+        "重來", "取消", "確認", "修改", "查詢", "訂書",
+        "數學", "英文", "國文", "自然", "社會", "理化",
+        "生物", "歷史", "地理", "公民", "版本", "人數"
+    }
+    if clean in blocked_words:
+        return None
+
+    # 只查 exact；若唯一命中才把它視為老師。
+    matches = lookup_teacher_matches(clean + "老師", school="")
+
+    if len(matches) != 1:
+        return None
+
+    item = matches[0]
+    context = {
+        "school": item["school"],
+        "teacher": item["teacher"],
+        "classes": copy_classes(item["classes"])
+    }
+
+    pending_teacher_corrections.pop(user_id, None)
+    teacher_lookup_context[user_id] = context
+    conversation_context[user_id] = context
+
+    return make_teacher_reply(
+        context["school"],
+        context["teacher"],
+        context["classes"]
+    )
+
+
 def handle_teacher_name_correction(user_id, text):
     pending = pending_teacher_corrections.get(user_id)
     if not pending:
@@ -1287,18 +1331,23 @@ def looks_like_teacher_followup(text):
 
 def handle_teacher_lookup(user_id, text):
     teacher, parsed_school = extract_teacher_and_school(text)
-    school = (
-        parsed_school
-        or extract_school_name(text)
-        or get_context_school(user_id)
-    )
+    explicit_school = parsed_school or extract_school_name(text)
+    context_school = get_context_school(user_id)
+    school = explicit_school or context_school
 
     if not teacher:
         return "⚠️ 找不到老師姓名。"
 
-    # 老師查詢不再預設只查天母。
-    # 沒有指定學校時，直接跨整個「老師班級資料」找老師。
+    # 先依使用者明確指定的學校／目前上下文查。
     matches = lookup_teacher_matches(teacher, school=school)
+
+    # 如果學校只是上一輪上下文帶進來，而這次沒有明確指定學校，
+    # 校內精確查不到時就自動跨全部學校再查一次。
+    # 避免前一題查華興，下一題查別校老師時被錯誤鎖在華興。
+    if not matches and context_school and not explicit_school:
+        matches = lookup_teacher_matches(teacher, school="")
+        if len(matches) == 1:
+            school = matches[0].get("school", "")
 
     if len(matches) == 1:
         item = matches[0]
@@ -1320,6 +1369,15 @@ def handle_teacher_lookup(user_id, text):
     else:
         # 精確找不到，再做錯字／同音近似比對。
         match = resolve_fuzzy_name("teacher", teacher, school=school)
+
+        # 若學校只是舊上下文、不是這次明確指定，
+        # 校內近似也找不到時再跨校做一次。
+        if (
+            match.get("status") == "none"
+            and context_school
+            and not explicit_school
+        ):
+            match = resolve_fuzzy_name("teacher", teacher, school="")
 
         if match.get("status") == "auto":
             teacher = match["value"]
@@ -1407,6 +1465,7 @@ def handle_teacher_followup(user_id):
 
 def make_teacher_reply(school, teacher, classes):
     total = calculate_total(classes)
+    display_teacher = re.sub(r"老師$", "", str(teacher or "").strip())
 
     subjects = []
     for item in classes or []:
@@ -1437,7 +1496,7 @@ def make_teacher_reply(school, teacher, classes):
         ""
         "👨‍🏫 老師資料庫\n"
         f"學校：{school}\n"
-        f"老師：{teacher}\n"
+        f"老師：{display_teacher}\n"
         + subject_line
         + "\n"
         f"📚 班級總數：{len(classes)}個班\n\n"
@@ -2006,6 +2065,16 @@ def handle_school_version_query(query):
         lines.append(f"• {prefix}{item['subject']}：{item['version']}")
 
     period = str(result.get("latest_period", "") or "").strip()
+    if not period:
+        periods = unique_list(
+            [
+                str(item.get("academic_period", "") or "").strip()
+                for item in versions
+                if str(item.get("academic_period", "") or "").strip()
+            ]
+        )
+        if len(periods) == 1:
+            period = periods[0]
 
     return (
         ""
@@ -2508,9 +2577,12 @@ def resolve_fuzzy_name(kind, query, school=""):
         confirm_threshold = 0.58
         required_gap = 0.10
     else:  # book
-        auto_threshold = 0.88
-        confirm_threshold = 0.68
-        required_gap = 0.06
+        # 書名允許使用者省略出版社、系列名、括號與符號。
+        # Apps Script 會把「核心關鍵字完整包含」拉到高分；
+        # 若只有一個明顯候選就直接採用，多個相近候選才確認。
+        auto_threshold = 0.90
+        confirm_threshold = 0.66
+        required_gap = 0.04
 
     result = {
         "value": str(first.get("value", "")),
