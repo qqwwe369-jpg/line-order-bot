@@ -22,7 +22,7 @@ GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
-AI_FALLBACK_MESSAGE = "⚠️ 目前無法處理這段訊息，請換個說法再試一次。"
+AI_FALLBACK_MESSAGE = "👑 LeBron James 正在幫你處理中，請稍後再試一次。"
 
 DEFAULT_SCHOOL = os.environ.get("DEFAULT_SCHOOL", "天母國中")
 
@@ -74,10 +74,10 @@ def callback():
         user_id = source.get("userId", "unknown")
 
         try:
-            reply_message = add_lebron_flavor(handle_message(user_id, user_text))
+            reply_message = handle_message(user_id, user_text)
         except Exception as error:
             print("handle_message error:", error)
-            reply_message = add_lebron_flavor("⚠️ 系統剛剛處理失敗，請再傳一次。")
+            reply_message = "⚠️ 系統剛剛處理失敗，請再傳一次。"
 
         reply_to_line(reply_token, reply_message)
 
@@ -381,18 +381,32 @@ def is_help_request(text):
 
 def get_help_reply():
     return (
-        "📚 大漢訂書小幫手\n\n"
-        "我可以幫你：\n"
-        "📚 訂書\n"
-        "📅 查詢單日訂單\n"
-        "👨‍🏫 查老師歷史訂單\n"
-        "✏️ 修改歷史訂單\n"
-        "❌ 取消歷史訂單\n"
-        "👥 查老師／班級人數\n"
-        "📖 查學校教科書版本\n"
-        "📦 其他訂單\n"
-        "✍️ 整理／草擬 LINE 訊息\n\n"
-        "💡 直接用平常講話告訴我就可以。"
+        "👑 大漢訂書小幫手功能\n\n"
+        "📚 1. 訂書\n"
+        "例：王老師701、703訂國一數學講義\n"
+        "例：701訂國一數學講義\n\n"
+        "📅 2. 查詢單日訂單\n"
+        "例：查今天訂單\n"
+        "例：查8/30訂單\n\n"
+        "👨‍🏫 3. 查各別老師歷史訂單\n"
+        "例：查王老師訂書進度\n\n"
+        "✏️ 4. 調整歷史訂單人數\n"
+        "例：查005 → 701改30本\n"
+        "例：005的701改30本\n\n"
+        "❌ 5. 取消歷史訂單\n"
+        "例：取消訂單005\n"
+        "例：查005 → 取消這張\n\n"
+        "👨‍🏫 6. 查老師／班級資料\n"
+        "例：王老師有幾個班\n\n"
+        "🏫 7. 查班級學生人數\n"
+        "例：天母國中701幾個人\n"
+        "例：天母國中七年級多少人\n\n"
+        "📖 8. 查學校教科書版本\n"
+        "例：天母國中七年級數學什麼版本\n\n"
+        "📦 9. 其他訂單\n"
+        "可以新增、查詢、修改進度／備註\n\n"
+        "✍️ 10. 幫你整理、草擬 LINE 訊息\n\n"
+        "💡 直接用平常講話就可以。"
     )
 
 
@@ -402,20 +416,18 @@ def get_help_reply():
 def handle_order_flow(user_id, text):
     clean = normalize_order_typo(text)
 
-    start_phrases = [
-        "訂書", "我要訂書", "我訂書", "開始訂書", "幫我訂書",
-        "我要下單", "幫我下單", "要訂書"
-    ]
-
-    # 純粹啟動訂書流程：固定從老師開始引導
-    if clean in start_phrases:
+    if clean in ["訂書", "我要訂書", "我訂書", "開始訂書", "幫我訂書"]:
         order_flow_context[user_id] = {
             "teacher": "",
             "school": "",
             "classes": [],
             "book": ""
         }
-        return make_order_guide_reply(order_flow_context[user_id])
+        return (
+            "📚 好，要訂書。\n\n"
+            "先告訴我是哪一位老師。\n"
+            "例如：王老師"
+        )
 
     draft = order_flow_context.get(user_id, {
         "teacher": "",
@@ -448,7 +460,7 @@ def handle_order_flow(user_id, text):
     if parsed.get("book"):
         draft["book"] = parsed["book"]
 
-    # 查完老師資料後直接沿用老師與學校
+    # 查完老師後直接沿用老師
     if not draft["teacher"]:
         recent = conversation_context.get(user_id, {})
         if recent.get("teacher") and recent.get("school"):
@@ -469,38 +481,35 @@ def handle_order_flow(user_id, text):
 
     order_flow_context[user_id] = draft
 
-    # 老師＋書名已足夠：沒指定班級時，自動帶入該老師全部班級
-    if draft["teacher"] and draft["book"]:
-        result = build_order_from_draft(user_id, draft)
-        if user_id in pending_orders:
-            order_flow_context.pop(user_id, None)
-        return result
+    if not draft["teacher"]:
+        reply = "📚 班級跟書名我記下來了。\n\n"
+        if draft["classes"]:
+            reply += f"班級：{'、'.join(draft['classes'])}\n"
+        if draft["book"]:
+            reply += f"書名：{draft['book']}\n"
+        reply += "\n還差老師。\n例如：王老師"
+        return reply
 
-    # 資料不足時只問缺少的欄位，回答格式固定
-    return make_order_guide_reply(draft)
+    if not draft["classes"]:
+        return (
+            f"收到：{draft['teacher']}\n"
+            + (f"書名：{draft['book']}\n\n" if draft["book"] else "\n")
+            + "還差班級。\n例如：701、703"
+        )
 
+    if not draft["book"]:
+        return (
+            f"老師：{draft['teacher']}\n"
+            f"班級：{'、'.join(draft['classes'])}\n\n"
+            "還差書名。\n例如：國一數學講義"
+        )
 
-def make_order_guide_reply(draft):
-    lines = ["📚 訂書", ""]
+    result = build_order_from_draft(user_id, draft)
 
-    if draft.get("teacher"):
-        lines.append(f"老師：{draft['teacher']}")
-    if draft.get("classes"):
-        lines.append(f"班級：{'、'.join(draft['classes'])}")
-    if draft.get("book"):
-        lines.append(f"書名：{draft['book']}")
+    if user_id in pending_orders:
+        order_flow_context.pop(user_id, None)
 
-    if len(lines) > 2:
-        lines.append("")
-
-    if not draft.get("teacher"):
-        lines.append("請告訴我是哪一位老師？")
-    elif not draft.get("book"):
-        lines.append("請告訴我要訂哪一本書？")
-    else:
-        lines.append("請告訴我要訂哪些班級？")
-
-    return "\n".join(lines)
+    return result
 
 
 def parse_order_message(text):
@@ -508,30 +517,31 @@ def parse_order_message(text):
     teacher, school = extract_teacher_and_school(clean)
     classes = extract_classes(clean)
 
-    order_words = [
-        "訂書", "要訂", "想訂", "幫我訂", "我要訂", "訂講義",
-        "訂評量", "訂教材", "下單", "幫我下單"
-    ]
-    book_words = [
-        "講義", "評量", "教材", "複習", "測驗", "題本",
-        "自修", "課本", "習作", "學習單"
-    ]
-
-    has_order_word = (
-        any(word in clean for word in order_words)
-        or bool(re.search(r"訂(?!單|書進度|書紀錄)", clean))
-    )
-    oral_order = (
-        bool(teacher or classes)
-        and "要" in clean
-        and any(word in clean for word in book_words)
+    has_order_word = bool(
+        re.search(r"(?:訂書|要訂|想訂|幫我訂|訂講義|訂評量|訂教材|訂)", clean)
     )
 
-    has_order_intent = has_order_word or oral_order
-    book = extract_book_candidate(clean, teacher, classes) if has_order_intent else ""
+    book = ""
+    m = re.search(r"(?:幫我訂|我要訂|要訂|想訂|訂)\s*(.+)$", clean)
+    if m:
+        book = clean_book_name(m.group(1))
+
+    if book:
+        for class_name in classes:
+            book = re.sub(
+                r"(?<!\d)" + re.escape(class_name) + r"(?!\d)",
+                " ",
+                book
+            )
+        if teacher:
+            book = book.replace(teacher, " ")
+
+        book = re.sub(r"^[跟和與、,，\s]+", "", book)
+        book = re.sub(r"\s+", " ", book).strip()
+        book = clean_book_name(book)
 
     return {
-        "has_order_intent": has_order_intent,
+        "has_order_intent": has_order_word,
         "teacher": teacher,
         "school": school,
         "classes": classes,
@@ -539,92 +549,9 @@ def parse_order_message(text):
     }
 
 
-def extract_book_candidate(text, teacher="", classes=None):
-    clean = str(text or "").strip()
-    classes = classes or []
-
-    # 「王老師要訂書」中的「書」不是書名
-    if re.fullmatch(
-        r".*(?:老師)?(?:要|想要|準備)?(?:幫我)?(?:訂書|下單)[。！!？?]?",
-        clean
-    ):
-        return ""
-
-    candidate = clean
-
-    if teacher:
-        candidate = candidate.replace(teacher, " ")
-
-    for class_name in classes:
-        candidate = re.sub(
-            r"(?<!\d)" + re.escape(class_name) + r"(?!\d)",
-            " ",
-            candidate
-        )
-
-    # 移除常見口語與訂書動詞，只留下可能的書名
-    candidate = re.sub(
-        r"(?:麻煩|請|幫我|幫忙|我要|我想要|想要|想訂|要訂|訂購|訂|下單|要|需要|那邊|這邊|的)",
-        " ",
-        candidate
-    )
-    candidate = re.sub(r"[跟和與、,，：:。.!！?？\s]+", " ", candidate).strip()
-    candidate = clean_book_name(candidate)
-
-    if candidate in ["", "書", "訂書"]:
-        return ""
-    return candidate
-
-
 def merge_followup_into_parsed(clean, parsed, draft):
     result = dict(parsed)
 
-    # -----------------------------------------------------
-    # 對話狀態優先：上一輪正在等老師，這一輪就先當老師處理。
-    # 例如：
-    #   使用者：我要訂書
-    #   機器人：請告訴我是哪一位老師？
-    #   使用者：蔡志強
-    # 這時必須得到「蔡志強老師」，不能誤判成書名。
-    # -----------------------------------------------------
-    if not draft.get("teacher"):
-        teacher, school = extract_teacher_and_school(clean)
-
-        # 支援使用者只輸入姓名、不加「老師」。
-        # 僅在「目前確定正在等老師」時啟用，避免一般訊息被亂抓成老師。
-        if not teacher:
-            bare_name = re.sub(r"[，,。.!！?？\s]+", "", str(clean or ""))
-            obvious_non_teacher_words = [
-                "講義", "評量", "教材", "複習", "測驗", "題本",
-                "自修", "課本", "習作", "學習單",
-                "國文", "英文", "數學", "自然", "社會",
-                "國一", "國二", "國三", "七年級", "八年級", "九年級"
-            ]
-
-            if (
-                re.fullmatch(r"[\u4e00-\u9fff]{2,4}", bare_name)
-                and not any(word in bare_name for word in obvious_non_teacher_words)
-            ):
-                teacher = bare_name + "老師"
-
-        if teacher:
-            result["teacher"] = teacher
-            if school:
-                result["school"] = school
-
-            # 這一輪的目標欄位就是老師。
-            # 即使通用解析器先猜到 book，也要清掉，避免「蔡志強」變成書名。
-            result["book"] = ""
-            result["has_order_intent"] = True
-            return result
-
-        # 目前還在等老師，而且這句又不像老師姓名。
-        # 不把它硬塞進書名，維持原狀並繼續詢問老師。
-        result["book"] = ""
-        result["has_order_intent"] = True
-        return result
-
-    # 已經有老師後，才處理班級與書名。
     if not result.get("teacher"):
         teacher, school = extract_teacher_and_school(clean)
         if teacher:
@@ -635,22 +562,18 @@ def merge_followup_into_parsed(clean, parsed, draft):
     if classes and not result.get("classes"):
         result["classes"] = classes
 
-    # 對話進行中，只要書名還缺，就允許直接口語補書名。
-    # 但只有「老師已經確定」後，才允許這段邏輯。
-    if draft.get("teacher") and not draft.get("book") and not result.get("book"):
-        teacher_in_text = result.get("teacher", "")
-        classes_in_text = result.get("classes", [])
-        candidate = extract_book_candidate(
-            clean,
-            teacher_in_text,
-            classes_in_text
-        )
+    missing_book_only = (
+        draft.get("teacher")
+        and draft.get("classes")
+        and not draft.get("book")
+    )
 
-        # 單獨回「王老師」或只有班級號碼時，不誤判成書名。
-        if candidate and "老師" not in candidate and not re.fullmatch(
-            r"[\d、,，跟和與\s]+", candidate
+    if missing_book_only and not result.get("book"):
+        if "老師" not in clean and not re.fullmatch(
+            r"[\d、,，跟和與\s]+",
+            clean
         ):
-            result["book"] = candidate
+            result["book"] = clean_book_name(clean)
 
     result["has_order_intent"] = True
     return result
@@ -659,7 +582,7 @@ def merge_followup_into_parsed(clean, parsed, draft):
 def build_order_from_draft(user_id, draft):
     teacher = draft["teacher"]
     school = draft.get("school") or DEFAULT_SCHOOL
-    requested_classes = unique_list(draft.get("classes", []))
+    requested_classes = unique_list(draft["classes"])
     book = clean_book_name(draft["book"])
 
     teacher_classes = get_teacher_classes(school, teacher)
@@ -671,14 +594,6 @@ def build_order_from_draft(user_id, draft):
             f"老師：{teacher}\n\n"
             "請確認學校或老師名稱。"
         )
-
-    # 未指定班級時，預設帶入老師資料庫中的全部班級，先讓使用者確認。
-    if not requested_classes:
-        requested_classes = [
-            str(item.get("class_name", ""))
-            for item in teacher_classes
-            if str(item.get("class_name", ""))
-        ]
 
     selected = []
 
@@ -859,6 +774,7 @@ def make_order_confirmation(order):
     ]
 
     return (
+        "👑 LeBron James 幫你把這張單整理好了：\n\n"
         "📚 訂購確認\n\n"
         f"老師：{order['teacher']}\n"
         f"學校：{order['school']}\n"
@@ -866,8 +782,7 @@ def make_order_confirmation(order):
         f"出版社：{order['publisher']}\n\n"
         + "\n".join(class_lines)
         + f"\n\n總數量：{int(order.get('quantity', 0))}本\n\n"
-        "確認無誤請回覆「確認」。\n"
-        "若班級不對，直接告訴我要保留、增加或取消哪些班級。"
+        "如果正確，請回覆「確認」"
     )
 
 
@@ -883,6 +798,7 @@ def confirm_new_order(user_id):
     pending_orders.pop(user_id, None)
 
     return (
+        "👑 LeBron James：這張我幫你收好了。\n\n"
         "✅ 訂單已確認\n\n"
         f"訂單編號：{order_number}\n"
         "已成功寫入 Google 試算表。\n\n"
@@ -896,32 +812,6 @@ def confirm_new_order(user_id):
 
 def handle_pending_order_edit(user_id, text):
     order = pending_orders[user_id]
-
-    # 「只要701跟703」「保留701、703」：直接縮成指定班級
-    if any(word in text for word in ["只要", "保留", "就要", "只留"]):
-        wanted = extract_classes(text)
-        if wanted:
-            context = conversation_context.get(user_id, {})
-            available = {
-                str(item.get("class_name")): item
-                for item in context.get("classes", [])
-            }
-            missing = [name for name in wanted if name not in available]
-            if missing:
-                return (
-                    "⚠️ 找不到班級資料\n\n"
-                    + "、".join(missing)
-                )
-
-            order["classes"] = [
-                {
-                    "class_name": name,
-                    "students": int(available[name].get("students", 0))
-                }
-                for name in wanted
-            ]
-            refresh_order_total(order)
-            return make_order_confirmation(order)
 
     m = re.fullmatch(r"(?:不要|刪除|刪掉|拿掉|移除)\s*(\d{3})", text)
     if not m:
@@ -1143,7 +1033,7 @@ def make_teacher_reply(school, teacher, classes):
     ]
 
     return (
-        ""
+        "👑 LeBron James 幫你重新查了 Google 老師班級資料：\n\n"
         "👨‍🏫 老師資料庫\n"
         f"學校：{school}\n"
         f"老師：{teacher}\n\n"
@@ -1202,13 +1092,6 @@ def looks_like_history_edit(text):
 
 
 def prepare_history_adjustment(user_id, original_order, text):
-    if str(original_order.get("status", "")).strip() == "已取消":
-        pending_history_updates.pop(user_id, None)
-        return (
-            "⚠️ 此訂單已取消，無法修改。\n\n"
-            f"訂單編號：{original_order.get('order_number', '')}"
-        )
-
     order = copy_order(original_order)
     changes = []
 
@@ -1284,16 +1167,6 @@ def confirm_history_update(user_id):
     update_data = pending_history_updates.get(user_id)
     if not update_data:
         return "⚠️ 找不到等待確認的歷史訂單修改。"
-
-    order_number = update_data["order"].get("order_number", "")
-    latest = lookup_google_order(order_number)
-    if latest and str(latest.get("status", "")).strip() == "已取消":
-        pending_history_updates.pop(user_id, None)
-        historical_order_context[user_id] = latest
-        return (
-            "⚠️ 此訂單已取消，無法修改。\n\n"
-            f"訂單編號：{order_number}"
-        )
 
     success, _ = update_google_order(
         update_data["order"],
@@ -1377,8 +1250,6 @@ def parse_teacher_book_order_query(text):
         r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書進度$",
         r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書訂單$",
         r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書紀錄$",
-        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*歷史訂單$",
-        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*歷史訂書$",
         r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書進度$",
         r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書紀錄$"
     ]
@@ -1392,7 +1263,7 @@ def parse_teacher_book_order_query(text):
 
 def make_teacher_book_orders_reply(teacher, orders):
     lines = [
-        "📚 老師歷史訂單",
+        "👑 LeBron James 幫你查了「訂書進度」：📚",
         "",
         f"老師：{teacher}",
         f"共找到 {len(orders)} 張訂書訂單",
@@ -1426,7 +1297,7 @@ def make_teacher_book_orders_reply(teacher, orders):
 # 查詢單日訂單（新功能）
 # =========================================================
 def parse_daily_order_query(text):
-    clean = re.sub(r"\s+", "", text.strip())
+    clean = text.strip()
 
     if clean in ["查今天訂單", "今天訂單", "查今日訂單", "今日訂單"]:
         return datetime.now().strftime("%Y-%m-%d")
@@ -1435,20 +1306,8 @@ def parse_daily_order_query(text):
         from datetime import timedelta
         return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # 0829訂單 / 查0829訂單
-    m = re.fullmatch(r"(?:查|查詢)?(\d{2})(\d{2})(?:的)?訂單", clean)
-    if m:
-        year = datetime.now().year
-        month = int(m.group(1))
-        day = int(m.group(2))
-        try:
-            return datetime(year, month, day).strftime("%Y-%m-%d")
-        except ValueError:
-            return None
-
-    # 8/29、2026/8/29、8-29
     m = re.fullmatch(
-        r"(?:查|查詢)?(?:(\d{4})[/-])?(\d{1,2})[/-](\d{1,2})(?:的)?訂單",
+        r"(?:查|查詢)?\s*(?:(\d{4})[/-])?(\d{1,2})[/-](\d{1,2})\s*(?:的)?訂單",
         clean
     )
     if not m:
@@ -1470,24 +1329,15 @@ def make_daily_orders_reply(date_text, orders):
     lines = [
         f"📅 {date_text} 訂單",
         "",
-        f"共 {len(orders)} 張｜合計 {total_quantity}本",
+        f"共 {len(orders)} 張",
+        f"總數量：{total_quantity}本",
         ""
     ]
 
     for order in orders[:20]:
         lines.extend([
-            f"📘 訂單 {order.get('order_number', '')}",
-            f"老師：{order.get('teacher', '')}",
-            f"書名：{order.get('book', '')}"
-        ])
-
-        for item in order.get("classes", []):
-            lines.append(
-                f"{item.get('class_name', '')}：{int(item.get('students', 0) or 0)}本"
-            )
-
-        lines.extend([
-            f"小計：{int(order.get('quantity', 0) or 0)}本",
+            f"📘 {order.get('order_number', '')}｜{order.get('teacher', '')}",
+            f"{order.get('book', '')}｜{int(order.get('quantity', 0) or 0)}本",
             f"狀態：{order.get('status', '')}",
             ""
         ])
@@ -1495,7 +1345,7 @@ def make_daily_orders_reply(date_text, orders):
     if len(orders) > 20:
         lines.append(f"另有 {len(orders) - 20} 張未顯示。")
 
-    return "\n".join(lines).rstrip()
+    return "\n".join(lines)
 
 
 # =========================================================
@@ -1605,7 +1455,7 @@ def handle_school_stats_query(query):
     if query.get("class_name"):
         item = classes[0]
         return (
-            ""
+            "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
             "🏫 班級資料\n"
             f"學校：{query['school']}\n"
             f"班級：{item['class_name']}班\n"
@@ -1622,7 +1472,7 @@ def handle_school_stats_query(query):
     ]
 
     return (
-        ""
+        "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
         f"🏫 {title}\n"
         f"班級總數：{result['class_count']}個班\n"
         f"學生總人數：{result['total_students']}人\n\n"
@@ -1686,7 +1536,7 @@ def handle_school_version_query(query):
     if len(versions) == 1:
         item = versions[0]
         return (
-            ""
+            "👑 LeBron James 幫你查了 Google 教科書版本資料：\n\n"
             "📚 教科書版本\n"
             f"學校：{item['school']}\n"
             f"年級：{item['grade']}\n"
@@ -1706,7 +1556,7 @@ def handle_school_version_query(query):
         lines.append(f"• {prefix}{item['subject']}：{item['version']}")
 
     return (
-        ""
+        "👑 LeBron James 幫你查了 Google 教科書版本資料：\n\n"
         f"📚 {query['school']}"
         + (f" {query['grade']}" if query.get("grade") else "")
         + "\n\n"
@@ -2449,89 +2299,6 @@ def orders_have_same_core_data(actual_order, expected_order):
     }
 
     return actual_classes == expected_classes
-
-
-# =========================================================
-# LeBron 固定人設層
-# =========================================================
-def add_lebron_flavor(message):
-    """
-    所有系統回覆統一加上 LeBron James 人設。
-    只改「說話方式」，不改任何訂單、查詢、資料庫或對話流程邏輯。
-    """
-    body = str(message or "").strip()
-    if not body:
-        body = "目前沒有可顯示的內容。"
-
-    # 避免原本已經有 LeBron 開場的訊息重複加兩次。
-    if body.startswith("👑 LeBron James"):
-        return body
-
-    compact = re.sub(r"\s+", "", body)
-
-    # 查不到／錯誤
-    if any(key in compact for key in [
-        "查不到", "找不到", "處理失敗", "查詢失敗", "寫入失敗",
-        "更新失敗", "沒有讀到", "系統剛剛處理失敗"
-    ]):
-        intro = "👑 LeBron James 這球沒找到目標"
-
-    # 還缺資料／需要使用者補充
-    elif any(key in compact for key in [
-        "還差", "請告訴我", "請提供", "請問是哪", "需要哪",
-        "尚未提供", "請選擇", "請直接告訴我"
-    ]):
-        intro = "👑 LeBron James 還差一個助攻"
-
-    # 取消
-    elif any(key in compact for key in [
-        "確認取消", "已取消", "取消這張", "取消這筆", "取消訂單"
-    ]):
-        intro = "👑 LeBron James 幫你把這球撤回來了"
-
-    # 修改
-    elif any(key in compact for key in [
-        "確認修改", "修改確認", "已修改", "調整", "改成", "更新成功"
-    ]):
-        intro = "👑 LeBron James 幫你把陣容調整好了"
-
-    # 訂購確認
-    elif "訂購確認" in compact or "訂書確認" in compact:
-        intro = "👑 LeBron James 幫你把這張單整理好了"
-
-    # 教科書版本
-    elif any(key in compact for key in ["教科書版本", "版本資料", "版本："]):
-        intro = "👑 LeBron James 幫你把版本查好了"
-
-    # 人數／老師班級資料
-    elif any(key in compact for key in [
-        "班級資料", "學生人數", "總學生人數", "班級總數", "幾個班", "多少人"
-    ]):
-        intro = "👑 LeBron James 幫你點完名了"
-
-    # 歷史訂單／單日訂單／進度
-    elif any(key in compact for key in [
-        "歷史訂單", "訂書紀錄", "訂書進度", "單日訂單", "筆訂單", "訂單編號"
-    ]):
-        intro = "👑 LeBron James 幫你把紀錄翻出來了"
-
-    # 功能說明
-    elif any(key in compact for key in [
-        "大漢訂書小幫手", "我可以幫你", "功能", "直接用平常講話"
-    ]):
-        intro = "👑 LeBron James 幫你把戰術板打開了"
-
-    # 成功建立／確認
-    elif any(key in compact for key in [
-        "訂單已確認", "已建立", "成功", "已寫入", "完成"
-    ]):
-        intro = "👑 LeBron James 這球漂亮收尾"
-
-    # 其他一般回覆（包含 AI 問答／草擬文字）
-    else:
-        intro = "👑 LeBron James 幫你處理好了"
-
-    return f"{intro}\n\n{body}"
 
 
 # =========================================================
