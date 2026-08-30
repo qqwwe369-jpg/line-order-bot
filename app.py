@@ -45,6 +45,12 @@ other_order_context = {}
 ai_conversation_context = {}
 pending_name_confirmations = {}
 
+# 老師查詢失敗後，允許使用者下一句直接重打正確姓名。
+# 例如：
+# 王昱鈞教哪幾個班 -> 查不到
+# 王毓君 -> 直接重新查老師資料庫，不掉到一般 AI。
+pending_teacher_corrections = {}
+
 # 學校清單快取：學校名稱直接由 Google 資料庫取得。
 # 未來新增學校，只要新增到「老師班級資料」或「學校版本資料」，
 # 不需要再修改 app.py。
@@ -117,6 +123,12 @@ def handle_message(user_id, user_text):
     fuzzy_reply = handle_name_confirmation(user_id, text)
     if fuzzy_reply is not None:
         return fuzzy_reply
+
+    # 1.5 老師查詢失敗後，下一句若只是 2～4 個中文字姓名，
+    # 直接視為更正老師姓名，重新查 Google 老師資料庫。
+    correction_reply = handle_teacher_name_correction(user_id, text)
+    if correction_reply is not None:
+        return correction_reply
 
     # 2. 固定功能選單
     if is_help_request(text):
@@ -380,6 +392,7 @@ def clear_all_user_state(user_id):
     other_order_context.pop(user_id, None)
     ai_conversation_context.pop(user_id, None)
     pending_name_confirmations.pop(user_id, None)
+    pending_teacher_corrections.pop(user_id, None)
 
 
 # =========================================================
@@ -1155,6 +1168,114 @@ def looks_like_teacher_lookup(text):
     return any(word in text for word in words)
 
 
+def handle_teacher_name_correction(user_id, text):
+    pending = pending_teacher_corrections.get(user_id)
+    if not pending:
+        return None
+
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(text or ""))
+
+    # 只有單純 2～4 個中文字才當成「重新輸入老師姓名」，
+    # 避免把書名、訂單內容或一般句子誤判成老師。
+    if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}", clean):
+        return None
+
+    school = str(pending.get("school", "") or "").strip()
+
+    # 先做精確資料庫查詢，不做 AI 猜測。
+    matches = lookup_teacher_matches(clean + "老師", school=school)
+
+    # 若前一次帶到的學校上下文不正確，精確校內查不到時，
+    # 再跨所有學校查一次正確姓名。
+    if not matches and school:
+        matches = lookup_teacher_matches(clean + "老師", school="")
+
+    if len(matches) == 1:
+        item = matches[0]
+        context = {
+            "school": item["school"],
+            "teacher": item["teacher"],
+            "classes": copy_classes(item["classes"])
+        }
+
+        pending_teacher_corrections.pop(user_id, None)
+        teacher_lookup_context[user_id] = context
+        conversation_context[user_id] = context
+
+        return make_teacher_reply(
+            context["school"],
+            context["teacher"],
+            context["classes"]
+        )
+
+    if len(matches) > 1:
+        school_names = unique_list(
+            [item.get("school", "") for item in matches if item.get("school")]
+        )
+        return (
+            "🔎 找到同名老師。\n\n"
+            f"老師：{clean}\n"
+            f"學校：{'、'.join(school_names)}\n\n"
+            "請再告訴我是哪一間學校。"
+        )
+
+    # 精確姓名仍找不到，才做既有的錯字／近似比對。
+    fuzzy = resolve_fuzzy_name("teacher", clean + "老師", school=school)
+
+    if fuzzy.get("status") == "auto":
+        candidate = str(fuzzy.get("value", "") or "").strip()
+        candidate_school = str(fuzzy.get("school", "") or school).strip()
+        matches = lookup_teacher_matches(candidate, school=candidate_school)
+
+        if len(matches) == 1:
+            item = matches[0]
+            context = {
+                "school": item["school"],
+                "teacher": item["teacher"],
+                "classes": copy_classes(item["classes"])
+            }
+
+            pending_teacher_corrections.pop(user_id, None)
+            teacher_lookup_context[user_id] = context
+            conversation_context[user_id] = context
+
+            return make_teacher_reply(
+                context["school"],
+                context["teacher"],
+                context["classes"]
+            )
+
+    if fuzzy.get("status") == "confirm":
+        pending_name_confirmations[user_id] = {
+            "field": "teacher",
+            "purpose": "teacher_lookup",
+            "value": fuzzy.get("value", ""),
+            "school": fuzzy.get("school", ""),
+            "original": clean
+        }
+        pending_teacher_corrections.pop(user_id, None)
+
+        return (
+            "🔎 我猜你可能打到同音字或錯字。\n\n"
+            f"你輸入：{clean}\n"
+            f"你是指：{fuzzy.get('value', '')}"
+            + (
+                f"（{fuzzy.get('school')}）"
+                if fuzzy.get("school")
+                else ""
+            )
+            + " 嗎？\n\n"
+            "請回覆「是」或「不是」。"
+        )
+
+    # 保留 correction 狀態，讓使用者可以再重打一次。
+    return (
+        "⚠️ 還是查不到這位老師。\n\n"
+        f"你輸入：{clean}\n"
+        "請再確認姓名；你可以直接重新打正確姓名。"
+    )
+
+
 def looks_like_teacher_followup(text):
     words = [
         "總共幾個班", "幾個班", "總人數多少", "總人數",
@@ -1233,11 +1354,17 @@ def handle_teacher_lookup(user_id, text):
             classes = []
 
     if not classes:
+        pending_teacher_corrections[user_id] = {
+            "school": school or "",
+            "original_teacher": teacher
+        }
+
         return (
             "⚠️ 查不到老師資料\n\n"
             + (f"學校：{school}\n" if school else "")
             + f"老師：{teacher}\n\n"
-            "目前 Google「老師班級資料」沒有找到符合資料。"
+            "目前 Google「老師班級資料」沒有找到符合資料。\n"
+            "你可以直接重打正確老師姓名，我會立刻重新查詢。"
         )
 
     context = {
@@ -1248,6 +1375,7 @@ def handle_teacher_lookup(user_id, text):
 
     teacher_lookup_context[user_id] = context
     conversation_context[user_id] = context
+    pending_teacher_corrections.pop(user_id, None)
 
     return make_teacher_reply(school, teacher, classes)
 
@@ -2428,6 +2556,7 @@ def handle_name_confirmation(user_id, text):
                 }
                 teacher_lookup_context[user_id] = context
                 conversation_context[user_id] = context
+                pending_teacher_corrections.pop(user_id, None)
                 return make_teacher_reply(
                     context["school"],
                     context["teacher"],
