@@ -291,22 +291,23 @@ def handle_message(user_id, user_text):
 
         return ask_ai(user_id, user_text)
 
-    # 15. 學校教科書版本
-    version_query = parse_school_version_query(user_id, text)
-    if version_query:
-        return handle_school_version_query(version_query)
-
-    # 16. 學校／年級／班級學生人數
-    stats_query = parse_school_stats_query(user_id, text)
-    if stats_query:
-        return handle_school_stats_query(stats_query)
-
-    # 17. 老師資料庫
+    # 15. 老師資料庫：優先於學校統計
+    # 例如「造德芳教哪幾個班」不能被誤判成「華興有哪些班」。
     if looks_like_teacher_lookup(text):
         return handle_teacher_lookup(user_id, text)
 
     if user_id in teacher_lookup_context and looks_like_teacher_followup(text):
         return handle_teacher_followup(user_id)
+
+    # 16. 學校教科書版本
+    version_query = parse_school_version_query(user_id, text)
+    if version_query:
+        return handle_school_version_query(version_query)
+
+    # 17. 學校／年級／班級學生人數
+    stats_query = parse_school_stats_query(user_id, text)
+    if stats_query:
+        return handle_school_stats_query(stats_query)
 
     # 18. 其他訂單
     other_query = parse_other_order_query(text)
@@ -890,19 +891,12 @@ def extract_teacher_and_school(text):
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(text or ""))
 
     m = re.search(
-        r"([\u4e00-\u9fff]{2,16}(?:國中|高中|國小))"
+        r"([\u4e00-\u9fff]{2,16}(?:國中|高中|國小|中學))"
         r"([\u4e00-\u9fff]{1,4})老師",
         clean
     )
     if m:
         return m.group(2) + "老師", m.group(1)
-
-    m = re.fullmatch(
-        r"([\u4e00-\u9fff]{2,8})([\u4e00-\u9fff])老師",
-        clean
-    )
-    if m:
-        return m.group(2) + "老師", m.group(1) + "國中"
 
     m = re.search(r"([\u4e00-\u9fff]{1,4})老師", clean)
     if m:
@@ -910,6 +904,15 @@ def extract_teacher_and_school(text):
         if name in ["哪位", "這位", "那位", "一位", "我的", "我們"]:
             return "", ""
         return name + "老師", ""
+
+    # 口語：趙德芳教哪幾個班 / 造德芳教哪些班 / 王小明教什麼科
+    m = re.match(
+        r"^([\u4e00-\u9fff]{2,4})"
+        r"(?=教(?:哪幾個班|哪幾班|哪些班|幾個班|幾班|什麼科|哪一科|哪科|哪些科))",
+        clean
+    )
+    if m:
+        return m.group(1) + "老師", ""
 
     return "", ""
 
@@ -1135,8 +1138,6 @@ def handle_pending_order_edit(user_id, text):
 # 老師資料庫
 # =========================================================
 def looks_like_teacher_lookup(text):
-    if "老師" not in text:
-        return False
     if "訂單" in text or "訂書進度" in text or is_ai_writing_request(text):
         return False
 
@@ -1145,10 +1146,11 @@ def looks_like_teacher_lookup(text):
         return False
 
     words = [
-        "教幾個班", "教幾班", "教哪幾班", "教哪些班",
+        "教幾個班", "教幾班", "教哪幾班", "教哪幾個班", "教哪些班",
         "有幾個班", "有哪些班", "哪幾班", "哪幾個班",
         "班級資料", "班級人數", "每班幾人", "每班人數",
-        "學生人數", "總人數", "幾個學生", "多少學生"
+        "學生人數", "總人數", "幾個學生", "多少學生",
+        "教什麼科", "教哪一科", "教哪科", "教哪些科"
     ]
     return any(word in text for word in words)
 
@@ -1725,6 +1727,13 @@ def parse_school_stats_query(user_id, text):
     if not any(word in clean for word in query_words):
         return None
     if "老師" in clean:
+        return None
+
+    # 「造德芳教哪幾個班」是老師查詢，不是學校班級查詢。
+    if re.match(
+        r"^[\u4e00-\u9fff]{2,4}教(?:哪幾個班|哪幾班|哪些班|幾個班|幾班)",
+        clean
+    ):
         return None
 
     school = extract_school_name(clean) or get_context_school(user_id)
@@ -2361,9 +2370,11 @@ def resolve_fuzzy_name(kind, query, school=""):
 
     # 短名稱（老師／學校）一個字打錯，相似度仍可能只有 0.7~0.8。
     if kind == "teacher":
-        auto_threshold = 0.78
-        confirm_threshold = 0.58
-        required_gap = 0.10
+        # 三字中文姓名打錯一字時，SequenceMatcher 約 0.67。
+        # 只有候選明顯唯一才自動修正；若有接近的第二名仍會要求確認。
+        auto_threshold = 0.64
+        confirm_threshold = 0.52
+        required_gap = 0.16
     elif kind == "school":
         auto_threshold = 0.78
         confirm_threshold = 0.58
@@ -2736,16 +2747,32 @@ def lookup_school_versions(
     subject="",
     academic_period=""
 ):
-    result = google_post({
-        "action": "lookup_versions",
-        "school": school,
-        "grade": grade,
-        "subject": subject,
-        "academic_period": academic_period
-    }, timeout=20, retries=3)
+    def do_lookup(school_name):
+        return google_post({
+            "action": "lookup_versions",
+            "school": school_name,
+            "grade": grade,
+            "subject": subject,
+            "academic_period": academic_period
+        }, timeout=20, retries=3)
+
+    result = do_lookup(school)
 
     if not result or not result.get("success"):
         return None
+
+    # 有些工作表存「華興」，老師表存「華興中學」。
+    # 第一次如果查不到，直接用去掉校種後的簡稱再查一次。
+    if not result.get("versions"):
+        short_school = re.sub(
+            r"(?:國民中學|國中|高中|國小|中學)$",
+            "",
+            str(school or "").strip()
+        )
+        if short_school and short_school != school:
+            retry = do_lookup(short_school)
+            if retry and retry.get("success") and retry.get("versions"):
+                result = retry
 
     versions = []
     for item in result.get("versions", []):
