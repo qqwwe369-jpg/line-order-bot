@@ -74,10 +74,10 @@ def callback():
         user_id = source.get("userId", "unknown")
 
         try:
-            reply_message = handle_message(user_id, user_text)
+            reply_message = add_lebron_flavor(handle_message(user_id, user_text))
         except Exception as error:
             print("handle_message error:", error)
-            reply_message = "⚠️ 系統剛剛處理失敗，請再傳一次。"
+            reply_message = add_lebron_flavor("⚠️ 系統剛剛處理失敗，請再傳一次。")
 
         reply_to_line(reply_token, reply_message)
 
@@ -2402,6 +2402,89 @@ def orders_have_same_core_data(actual_order, expected_order):
     }
 
     return actual_classes == expected_classes
+
+
+# =========================================================
+# LeBron 固定人設層
+# =========================================================
+def add_lebron_flavor(message):
+    """
+    所有系統回覆統一加上 LeBron James 人設。
+    只改「說話方式」，不改任何訂單、查詢、資料庫或對話流程邏輯。
+    """
+    body = str(message or "").strip()
+    if not body:
+        body = "目前沒有可顯示的內容。"
+
+    # 避免原本已經有 LeBron 開場的訊息重複加兩次。
+    if body.startswith("👑 LeBron James"):
+        return body
+
+    compact = re.sub(r"\s+", "", body)
+
+    # 查不到／錯誤
+    if any(key in compact for key in [
+        "查不到", "找不到", "處理失敗", "查詢失敗", "寫入失敗",
+        "更新失敗", "沒有讀到", "系統剛剛處理失敗"
+    ]):
+        intro = "👑 LeBron James 這球沒找到目標"
+
+    # 還缺資料／需要使用者補充
+    elif any(key in compact for key in [
+        "還差", "請告訴我", "請提供", "請問是哪", "需要哪",
+        "尚未提供", "請選擇", "請直接告訴我"
+    ]):
+        intro = "👑 LeBron James 還差一個助攻"
+
+    # 取消
+    elif any(key in compact for key in [
+        "確認取消", "已取消", "取消這張", "取消這筆", "取消訂單"
+    ]):
+        intro = "👑 LeBron James 幫你把這球撤回來了"
+
+    # 修改
+    elif any(key in compact for key in [
+        "確認修改", "修改確認", "已修改", "調整", "改成", "更新成功"
+    ]):
+        intro = "👑 LeBron James 幫你把陣容調整好了"
+
+    # 訂購確認
+    elif "訂購確認" in compact or "訂書確認" in compact:
+        intro = "👑 LeBron James 幫你把這張單整理好了"
+
+    # 教科書版本
+    elif any(key in compact for key in ["教科書版本", "版本資料", "版本："]):
+        intro = "👑 LeBron James 幫你把版本查好了"
+
+    # 人數／老師班級資料
+    elif any(key in compact for key in [
+        "班級資料", "學生人數", "總學生人數", "班級總數", "幾個班", "多少人"
+    ]):
+        intro = "👑 LeBron James 幫你點完名了"
+
+    # 歷史訂單／單日訂單／進度
+    elif any(key in compact for key in [
+        "歷史訂單", "訂書紀錄", "訂書進度", "單日訂單", "筆訂單", "訂單編號"
+    ]):
+        intro = "👑 LeBron James 幫你把紀錄翻出來了"
+
+    # 功能說明
+    elif any(key in compact for key in [
+        "大漢訂書小幫手", "我可以幫你", "功能", "直接用平常講話"
+    ]):
+        intro = "👑 LeBron James 幫你把戰術板打開了"
+
+    # 成功建立／確認
+    elif any(key in compact for key in [
+        "訂單已確認", "已建立", "成功", "已寫入", "完成"
+    ]):
+        intro = "👑 LeBron James 這球漂亮收尾"
+
+    # 其他一般回覆（包含 AI 問答／草擬文字）
+    else:
+        intro = "👑 LeBron James 幫你處理好了"
+
+    return f"{intro}\n\n{body}"
 
 
 # =========================================================
