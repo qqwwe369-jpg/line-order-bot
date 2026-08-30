@@ -1,42 +1,60 @@
 from flask import Flask, request
 import os
-import requests
 import re
 import time
+import requests
 
 app = Flask(__name__)
 
+# =========================================================
+# 環境變數
+# =========================================================
 CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
-# OpenAI 一般問答
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.6-luna")
 AI_FALLBACK_MESSAGE = "👑 LeBron James 正在幫你處理中，請稍後再試一次。"
 
-# 尚未確認的訂單
-pending_orders = {}
-pending_other_orders = {}
-pending_other_updates = {}
-other_order_context = {}
+DEFAULT_SCHOOL = os.environ.get("DEFAULT_SCHOOL", "天母國中")
 
-# 最近查詢的老師
+
+# =========================================================
+# 對話狀態
+# 每一種功能分開保存，避免互相污染
+# =========================================================
+
+# 尚未確認的新訂單
+pending_orders = {}
+
+# 訂書草稿：缺老師／班級／書名時使用
+order_flow_context = {}
+
+# 最近查過、可延續訂書的老師
 conversation_context = {}
 
-# 最近查詢的歷史訂單
+# 最近的老師資料庫查詢
+teacher_lookup_context = {}
+
+# 最近查到的歷史訂單
 historical_order_context = {}
 
 # 等待確認的歷史訂單修改
 pending_history_updates = {}
-order_draft_context = {}
-proposed_teacher_context = {}
-teacher_lookup_context = {}
 
-# 一般 AI 問答的短期對話紀錄（Render 重啟後會清除）
+# 其他訂單
+pending_other_orders = {}
+pending_other_updates = {}
+other_order_context = {}
+
+# 一般 AI 短期記憶
 ai_conversation_context = {}
 
 
+# =========================================================
+# Flask
+# =========================================================
 @app.route("/", methods=["GET"])
 def home():
     return "LINE Order Bot is running!"
@@ -44,815 +62,198 @@ def home():
 
 @app.route("/callback", methods=["POST"])
 def callback():
-
     body = request.get_json(silent=True) or {}
 
     print("Webhook received")
     print(body)
 
-    events = body.get("events", [])
-
-    for event in events:
-
+    for event in body.get("events", []):
         if event.get("type") != "message":
             continue
 
         message = event.get("message", {})
-
         if message.get("type") != "text":
             continue
 
-        user_text = message.get("text", "").strip()
+        user_text = str(message.get("text", "")).strip()
         reply_token = event.get("replyToken")
 
         source = event.get("source", {})
         user_id = source.get("userId", "unknown")
 
-        reply_message = handle_message(
-            user_id,
-            user_text
-        )
+        try:
+            reply_message = handle_message(user_id, user_text)
+        except Exception as error:
+            print("handle_message error:", error)
+            reply_message = "⚠️ 系統剛剛處理失敗，請再傳一次。"
 
-        reply_to_line(
-            reply_token,
-            reply_message
-        )
+        reply_to_line(reply_token, reply_message)
 
     return "OK", 200
 
 
 # =========================================================
-# 功能介紹 / 簡易使用說明
-# =========================================================
-def get_help_reply(text):
-
-    compact = str(text or "").strip().lower()
-
-    # 訂書說明：只回最必要的操作方式
-    order_help_phrases = [
-        "怎麼訂書",
-        "如何訂書",
-        "我要怎麼訂書",
-        "訂書怎麼用",
-        "訂書教學",
-        "怎麼下訂單",
-        "如何下訂單"
-    ]
-
-    if compact in order_help_phrases:
-        return (
-            "📚 訂書很簡單\n\n"
-            "直接告訴我「老師＋班級＋書名」即可。\n\n"
-            "例如：\n"
-            "王老師701、703訂國一數學講義\n\n"
-            "我會整理成訂單給你確認。"
-        )
-
-    # 查老師 / 班級
-    teacher_help_phrases = [
-        "怎麼查老師",
-        "如何查老師",
-        "怎麼查班級",
-        "如何查班級",
-        "怎麼查學生人數"
-    ]
-
-    if compact in teacher_help_phrases:
-        return (
-            "👨‍🏫 查老師／班級\n\n"
-            "直接問就可以。\n\n"
-            "例如：\n"
-            "王老師有幾個班\n"
-            "天母國中七年級多少人"
-        )
-
-    # 查版本
-    version_help_phrases = [
-        "怎麼查版本",
-        "如何查版本",
-        "怎麼查教科書版本",
-        "如何查教科書版本"
-    ]
-
-    if compact in version_help_phrases:
-        return (
-            "📖 查教科書版本\n\n"
-            "直接說「學校＋年級＋科目」。\n\n"
-            "例如：\n"
-            "天母國中七年級數學什麼版本\n"
-            "天母國中七年級各科版本"
-        )
-
-    # 查 / 修改歷史訂單
-    history_help_phrases = [
-        "怎麼查訂單",
-        "如何查訂單",
-        "怎麼修改訂單",
-        "如何修改訂單",
-        "怎麼改訂單"
-    ]
-
-    if compact in history_help_phrases:
-        return (
-            "🔎 查詢／修改訂單\n\n"
-            "例如：\n"
-            "查005訂單\n"
-            "005的701改30本\n\n"
-            "修改後我會先給你確認。"
-        )
-
-    # 其他訂單
-    other_help_phrases = [
-        "其他訂單怎麼用",
-        "怎麼用其他訂單",
-        "怎麼新增其他訂單"
-    ]
-
-    if compact in other_help_phrases:
-        return (
-            "📦 其他訂單\n\n"
-            "可以新增、查詢，也可以修改進度。\n"
-            "直接告訴我你要處理的其他訂單即可。"
-        )
-
-    general_help_phrases = [
-        "功能",
-        "功能介紹",
-        "使用說明",
-        "說明",
-        "幫助",
-        "help",
-        "怎麼用",
-        "如何使用",
-        "你會什麼",
-        "你可以幹嘛",
-        "你可以做什麼",
-        "你能幹嘛",
-        "你能做什麼",
-        "你能幫我做什麼",
-        "可以幫我做什麼"
-    ]
-
-    if compact in general_help_phrases:
-        return (
-            "👑 我可以幫你：\n\n"
-            "📚 訂書\n"
-            "例：王老師701、703訂國一數學講義\n\n"
-            "👨‍🏫 查老師／班級\n"
-            "例：王老師有幾個班\n"
-            "例：天母國中七年級多少人\n\n"
-            "📖 查教科書版本\n"
-            "例：天母國中七年級數學什麼版本\n\n"
-            "🔎 查詢／修改訂單\n"
-            "例：查005訂單\n"
-            "例：005的701改30本\n\n"
-            "📦 其他訂單\n"
-            "可以新增、查詢、修改進度\n\n"
-            "✍️ 幫你整理／寫訊息\n"
-            "直接告訴我想寫什麼就可以\n\n"
-            "💡 不知道怎麼說也沒關係，直接用平常講話告訴我。"
-        )
-
-    return None
-
-
-# =========================================================
-# 新手歡迎 / 訂書逐步引導
-# =========================================================
-
-guided_order_context = {}
-
-
-def get_welcome_reply():
-    return (
-        "👑 歡迎使用訂書小幫手\n\n"
-        "直接用平常講話就可以。\n\n"
-        "常用功能：\n"
-        "📚 訂書\n"
-        "👨‍🏫 查老師／班級\n"
-        "🏫 查學生人數\n"
-        "📖 查教科書版本\n"
-        "🔎 查詢／修改訂單\n\n"
-        "輸入「功能」可以看簡單範例。"
-    )
-
-
-def extract_guided_classes(text):
-    matches = re.findall(
-        r"(?<!\d)([789]\d{2})(?!\d)",
-        str(text or "")
-    )
-
-    result = []
-
-    for item in matches:
-        if item not in result:
-            result.append(item)
-
-    return result
-
-
-def start_guided_order(user_id):
-    guided_order_context[user_id] = {
-        "active": True,
-        "teacher": "",
-        "classes": [],
-        "book": ""
-    }
-
-    return (
-        "📚 好，我帶你一步一步訂書。\n\n"
-        "先告訴我「老師」。\n"
-        "例如：王老師"
-    )
-
-
-def handle_guided_order(user_id, text):
-    ctx = guided_order_context.get(user_id)
-
-    if not ctx or not ctx.get("active"):
-        return None
-
-    clean_text = str(text or "").strip()
-
-    if clean_text in [
-        "取消",
-        "取消訂書",
-        "不要了",
-        "重來",
-        "重新開始"
-    ]:
-        guided_order_context.pop(user_id, None)
-        return "已取消這次訂書。"
-
-    if not ctx.get("teacher"):
-        teacher_match = re.search(
-            r"([\u4e00-\u9fff]{1,4})老師",
-            clean_text
-        )
-
-        if not teacher_match:
-            return (
-                "還差老師姓名。\n"
-                "例如：王老師"
-            )
-
-        teacher = teacher_match.group(1) + "老師"
-        ctx["teacher"] = teacher
-
-        classes = extract_guided_classes(clean_text)
-
-        if classes:
-            ctx["classes"] = classes
-            return (
-                f"收到：{teacher}\n"
-                f"班級：{'、'.join(classes)}\n\n"
-                "最後告訴我「書名」。\n"
-                "例如：國一數學講義"
-            )
-
-        return (
-            f"收到：{teacher}\n\n"
-            "接著告訴我「班級」。\n"
-            "例如：701、703"
-        )
-
-    if not ctx.get("classes"):
-        classes = extract_guided_classes(clean_text)
-
-        if not classes:
-            return (
-                "還差班級。\n"
-                "例如：701、703"
-            )
-
-        ctx["classes"] = classes
-
-        return (
-            f"班級收到：{'、'.join(classes)}\n\n"
-            "最後告訴我「書名」。\n"
-            "例如：國一數學講義"
-        )
-
-    if not ctx.get("book"):
-        if len(clean_text) < 2:
-            return (
-                "還差書名。\n"
-                "例如：國一數學講義"
-            )
-
-        ctx["book"] = clean_text
-
-        teacher = ctx["teacher"]
-        classes = ctx["classes"]
-        book = ctx["book"]
-
-        guided_order_context.pop(user_id, None)
-
-        combined_text = (
-            f"{teacher}"
-            f"{'、'.join(classes)}"
-            f"訂{book}"
-        )
-
-        return handle_message(
-            user_id,
-            combined_text
-        )
-
-    return None
-
-
-# =========================================================
-# 主對話處理
+# 主流程
 # =========================================================
 def handle_message(user_id, user_text):
-
     text = normalize_text(user_text)
 
     # -----------------------------------------------------
-    # 新手歡迎 / 訂書逐步引導
+    # 0. 重來一定要最優先
+    # 避免被「訂書引導狀態」攔截，只清到一半
     # -----------------------------------------------------
-    if text in [
-        "開始",
-        "新手",
-        "第一次使用",
-        "歡迎"
-    ]:
-        return get_welcome_reply()
-
-    if text in [
-        "訂書",
-        "我要訂書",
-        "開始訂書"
-    ]:
-        return start_guided_order(user_id)
-
-    guided_reply = handle_guided_order(
-        user_id,
-        text
-    )
-
-    if guided_reply is not None:
-        return guided_reply
-
-    # -----------------------------------------------------
-    # 1. 重來
-    # -----------------------------------------------------
-    if text in ["重來", "重新開始", "全部重來"]:
-
-        pending_orders.pop(user_id, None)
-        pending_other_orders.pop(user_id, None)
-        pending_other_updates.pop(user_id, None)
-        other_order_context.pop(user_id, None)
-        conversation_context.pop(user_id, None)
-        historical_order_context.pop(user_id, None)
-        pending_history_updates.pop(user_id, None)
-        ai_conversation_context.pop(user_id, None)
-        order_draft_context.pop(user_id, None)
-        proposed_teacher_context.pop(user_id, None)
-        teacher_lookup_context.pop(user_id, None)
-        guided_order_context.pop(user_id, None)
-
+    if text in ["重來", "重新開始", "全部重來", "全部重設"]:
+        clear_all_user_state(user_id)
         return (
             "🔄 已重新開始\n\n"
-            "目前的老師、尚未確認訂單與歷史訂單修改狀態都已清除。\n\n"
-            "請告訴我你要查哪位老師。"
+            "目前的老師、訂書草稿、待確認訂單、歷史訂單修改狀態都已清除。\n\n"
+            "你可以直接重新輸入，例如：\n"
+            "701訂國一數學講義\n\n"
+            "我會記住班級＋書名，再問你是哪一位老師。"
         )
 
     # -----------------------------------------------------
-    # 2. 功能介紹 / 簡易使用說明
+    # 1. 固定功能選單
     # -----------------------------------------------------
-    help_reply = get_help_reply(text)
-
-    if help_reply:
-        return help_reply
+    if is_help_request(text):
+        return get_help_reply()
 
     # -----------------------------------------------------
-    # 2. 取消「其他訂單」修改
-    # -----------------------------------------------------
-    if (
-        text in ["取消修改", "不要修改"]
-        and user_id in pending_other_updates
-    ):
-        pending_other_updates.pop(user_id, None)
-        return "❌ 已取消這次「其他訂單」修改，Google 資料沒有變動。"
-
-    # -----------------------------------------------------
-    # 3. 確認「其他訂單」修改
-    # -----------------------------------------------------
-    if (
-        text in ["確認修改", "確認"]
-        and user_id in pending_other_updates
-    ):
-        update_data = pending_other_updates.get(user_id)
-
-        success, result = update_other_order_in_google_sheet(
-            update_data["row_number"],
-            update_data["field"],
-            update_data["value"]
-        )
-
-        if not success:
-            return "❌ 其他訂單修改失敗，Google 資料沒有變動。"
-
-        pending_other_updates.pop(user_id, None)
-
-        refreshed = lookup_other_orders(
-            teacher=update_data.get("teacher", ""),
-            row_number=update_data["row_number"]
-        )
-
-        if refreshed:
-            other_order_context[user_id] = refreshed[0]
-
-        field_name = (
-            "進度"
-            if update_data["field"] == "progress"
-            else "備註"
-        )
-
-        return (
-            "👑 LeBron James：其他訂單已更新。📦\n\n"
-            f"✅ 其他訂單 #{update_data['row_number']}\n"
-            f"{field_name}：{update_data['value']}\n\n"
-            "Google「其他訂單」已同步更新。"
-        )
-
-    # -----------------------------------------------------
-    # 4. 取消歷史訂單修改
+    # 2. 取消／確認各種待辦
+    # 優先順序：其他訂單修改 → 歷史修改 → 其他訂單 → 新訂單
     # -----------------------------------------------------
     if text in ["取消修改", "不要修改"]:
+        if user_id in pending_other_updates:
+            pending_other_updates.pop(user_id, None)
+            return "❌ 已取消這次「其他訂單」修改，Google 資料沒有變動。"
 
-        if user_id not in pending_history_updates:
-            return "目前沒有等待確認的歷史訂單修改。"
+        if user_id in pending_history_updates:
+            pending_history_updates.pop(user_id, None)
+            return "❌ 已取消這次歷史訂單修改，Google 原訂單沒有變動。"
 
-        pending_history_updates.pop(user_id, None)
+        return "目前沒有等待確認的修改。"
 
-        return "❌ 已取消這次歷史訂單修改，Google 原訂單沒有變動。"
+    if text in ["確認修改", "確認"] and user_id in pending_other_updates:
+        return confirm_other_order_update(user_id)
 
-    # -----------------------------------------------------
-    # 3. 確認歷史訂單修改
-    # 支援「確認修改」與直接「確認」
-    # -----------------------------------------------------
-    if (
-        text in ["確認修改", "確認"]
-        and user_id in pending_history_updates
-    ):
+    if text in ["確認修改", "確認"] and user_id in pending_history_updates:
+        return confirm_history_update(user_id)
 
-        update_data = pending_history_updates.get(user_id)
+    if text == "確認" and user_id in pending_other_orders:
+        return confirm_other_order(user_id)
 
-        if not update_data:
-            return "⚠️ 找不到等待確認的歷史訂單修改。"
-
-        success, result = update_google_order(
-            update_data["order"],
-            update_data["modification_text"]
-        )
-
-        if not success:
-            return "❌ 歷史訂單修改失敗，Google 原訂單沒有變動。"
-
-        order_number = update_data["order"]["order_number"]
-
-        refreshed = lookup_google_order(order_number)
-
-        if refreshed:
-            historical_order_context[user_id] = refreshed
-
-        pending_history_updates.pop(user_id, None)
-
-        return (
-            "✅ 訂單修改完成\n\n"
-            f"訂單編號：{order_number}\n"
-            "Google 試算表已更新。\n"
-            "狀態：已修改\n"
-            "修改紀錄：已保存"
-        )
+    if text == "確認" and user_id in pending_orders:
+        return confirm_new_order(user_id)
 
     # -----------------------------------------------------
-    # 4. 查歷史訂單
-    # 支援：查001 / 001訂單內容是什麼 / 訂單001
+    # 3. 取消目前新訂單／其他訂單
+    # -----------------------------------------------------
+    if text in ["取消", "取消訂單", "不要了", "這筆不要"]:
+        if user_id in pending_other_orders:
+            pending_other_orders.pop(user_id, None)
+            return "❌ 已取消這筆「其他訂單」，Google 沒有寫入。"
+
+        if user_id in pending_orders:
+            pending_orders.pop(user_id, None)
+            return (
+                "❌ 已取消這筆訂單。\n\n"
+                "老師資料仍保留，你可以直接重新輸入班級＋書名。"
+            )
+
+        if user_id in order_flow_context:
+            order_flow_context.pop(user_id, None)
+            return "❌ 已取消這次訂書草稿。"
+
+        return "目前沒有尚未確認的訂單。"
+
+    # -----------------------------------------------------
+    # 4. 顯示目前訂單
+    # -----------------------------------------------------
+    if text in ["目前訂單", "看訂單", "訂單內容", "現在訂單"]:
+        order = pending_orders.get(user_id)
+        if not order:
+            return "目前沒有尚未確認的新訂單。"
+        return make_order_confirmation(order)
+
+    # -----------------------------------------------------
+    # 5. 有待確認的新訂單時，先處理修改
+    # -----------------------------------------------------
+    if user_id in pending_orders:
+        pending_reply = handle_pending_order_edit(user_id, text)
+        if pending_reply is not None:
+            return pending_reply
+
+    # -----------------------------------------------------
+    # 6. 歷史訂單
     # -----------------------------------------------------
     order_number = extract_order_lookup_number(text)
-
     if order_number:
-
         order = lookup_google_order(order_number)
-
         if not order:
             return f"⚠️ 查不到訂單 {order_number}。"
 
         historical_order_context[user_id] = order
         pending_history_updates.pop(user_id, None)
-
         return make_historical_order_reply(order)
 
-    # -----------------------------------------------------
-    # 5. 查過歷史訂單後，可直接說 701改28
-    # 這段一定要放在「直接指定訂單」之前，
-    # 避免把 705改35 誤判成訂單 007。
-    # -----------------------------------------------------
+    # 直接指定歷史訂單修改：005的701改30
+    direct_history = parse_direct_history_adjustment(text)
+    if direct_history:
+        order = lookup_google_order(direct_history["order_number"])
+        if not order:
+            return f"⚠️ 查不到訂單 {direct_history['order_number']}。"
+
+        historical_order_context[user_id] = order
+        return prepare_history_adjustment(
+            user_id,
+            order,
+            direct_history["edit_text"]
+        )
+
+    # 已查過歷史訂單後：701改28 / 703取消
     if (
         user_id in historical_order_context
         and looks_like_history_edit(text)
         and user_id not in pending_orders
     ):
-
         return prepare_history_adjustment(
             user_id,
             historical_order_context[user_id],
             text
         )
 
-    # -----------------------------------------------------
-    # 6. 直接指定歷史訂單修改
-    # 例如：001的701改28本
-    # 或：訂單001的701改28本
-    # -----------------------------------------------------
-    direct_history = parse_direct_history_adjustment(text)
-
-    if direct_history:
-
-        order_number = direct_history["order_number"]
-        edit_text = direct_history["edit_text"]
-
-        order = lookup_google_order(order_number)
-
-        if not order:
-            return f"⚠️ 查不到訂單 {order_number}。"
-
-        historical_order_context[user_id] = order
-
-        return prepare_history_adjustment(
-            user_id,
-            order,
-            edit_text
-        )
-
-    # -----------------------------------------------------
-    # 7. 查詢「其他訂單」
-    # 支援：
-    # 查王老師其他訂單 / 查詢王老師其他訂單
-    # 王老師其他訂單 / 查其他訂單 王老師
-    # -----------------------------------------------------
-    other_query = parse_other_order_query(text)
-
-    if other_query:
-        orders = lookup_other_orders(
-            teacher=other_query.get("teacher", ""),
-            item_keyword=other_query.get("item_keyword", "")
-        )
+    # 老師訂書歷史／進度
+    teacher_order_query = parse_teacher_book_order_query(text)
+    if teacher_order_query:
+        teacher = teacher_order_query["teacher"]
+        orders = lookup_book_orders_by_teacher(teacher)
 
         if not orders:
-            teacher_text = other_query.get("teacher", "")
             return (
-                "⚠️ 查不到符合條件的其他訂單。"
-                + (
-                    f"\n老師：{teacher_text}"
-                    if teacher_text else ""
-                )
+                "⚠️ 查不到這位老師的訂書紀錄。\n\n"
+                f"老師：{teacher}"
             )
 
-        # 只有一筆時，後續可直接說「進度改成已訂購」
         if len(orders) == 1:
-            other_order_context[user_id] = orders[0]
-        else:
-            other_order_context.pop(user_id, None)
+            historical_order_context[user_id] = orders[0]
 
-        return make_other_orders_reply(orders)
+        return make_teacher_book_orders_reply(teacher, orders)
 
     # -----------------------------------------------------
-    # 8. 修改「其他訂單」進度 / 備註
-    # 支援：
-    # 王老師書面紙進度改成已訂購
-    # 王老師書面紙備註改成週一送達
-    # 其他訂單2進度改成已訂購
-    # 查到單筆後：進度改成已訂購 / 備註改成週一送達
-    # -----------------------------------------------------
-    other_update = parse_other_order_update(
-        user_id,
-        text
-    )
-
-    if other_update:
-
-        target = resolve_other_order_target(
-            user_id,
-            other_update
-        )
-
-        if isinstance(target, str):
-            return target
-
-        if not target:
-            return "⚠️ 找不到要修改的其他訂單。"
-
-        field = other_update["field"]
-        value = other_update["value"]
-
-        pending_other_updates[user_id] = {
-            "row_number": target["row_number"],
-            "teacher": target["teacher"],
-            "field": field,
-            "value": value
-        }
-
-        return make_other_order_update_confirmation(
-            target,
-            field,
-            value
-        )
-
-    # -----------------------------------------------------
-    # 9. 其他訂單：確認 / 取消 / 建立
-    # 例如：天母王老師 買書面紙20張
-    # -----------------------------------------------------
-    if text == "確認" and user_id in pending_other_orders:
-
-        other_order = pending_other_orders[user_id]
-
-        success, result = write_other_order_to_google_sheet(
-            other_order
-        )
-
-        if not success:
-            return "❌ 其他訂單寫入失敗，請稍後再試。"
-
-        pending_other_orders.pop(user_id, None)
-
-        return (
-            "👑 LeBron James：其他訂單我幫你收好了。📦\n\n"
-            "✅ 已寫入 Google「其他訂單」\n\n"
-            f"日期：{result.get('date', '今天')}\n"
-            f"學校：{other_order['school']}\n"
-            f"老師：{other_order['teacher']}\n"
-            f"項目：{other_order['item']}\n\n"
-            "進度、備註目前保持空白。"
-        )
-
-    if (
-        text in ["取消", "取消訂單", "不要了", "這筆不要"]
-        and user_id in pending_other_orders
-    ):
-        pending_other_orders.pop(user_id, None)
-
-        return "❌ 已取消這筆「其他訂單」，Google 沒有寫入。"
-
-    parsed_other_order = parse_other_order(
-        user_id,
-        text
-    )
-
-    if parsed_other_order:
-
-        pending_other_orders[user_id] = parsed_other_order
-
-        return make_other_order_confirmation(
-            parsed_other_order
-        )
-
-    # -----------------------------------------------------
-    # 8. 取消目前新訂單
-    # -----------------------------------------------------
-    if text in [
-        "取消",
-        "取消訂單",
-        "不要了",
-        "這筆不要"
-    ]:
-
-        if user_id not in pending_orders:
-            return "目前沒有尚未確認的新訂單。"
-
-        pending_orders.pop(user_id, None)
-
-        return (
-            "❌ 已取消這筆訂單。\n\n"
-            "老師資料仍然保留，"
-            "你可以繼續重新選班級訂書。"
-        )
-
-    # -----------------------------------------------------
-    # 9. 顯示目前新訂單
-    # -----------------------------------------------------
-    if text in [
-        "目前訂單",
-        "看訂單",
-        "訂單內容",
-        "現在訂單"
-    ]:
-
-        order = pending_orders.get(user_id)
-
-        if not order:
-            return "目前沒有尚未確認的新訂單。"
-
-        return make_order_confirmation(order)
-
-    # -----------------------------------------------------
-    # 10. 確認新訂單
-    # Google 端此時正式產生 001 / 002 / 003...
-    # -----------------------------------------------------
-    if text == "確認":
-
-        order = pending_orders.get(user_id)
-
-        if not order:
-            return (
-                "⚠️ 找不到尚未確認的訂單，"
-                "請重新輸入。"
-            )
-
-        success, order_number = write_to_google_sheet(order)
-
-        if success:
-
-            pending_orders.pop(user_id, None)
-
-            return (
-                "👑 LeBron James：這張我幫你收好了。\n\n"
-                "✅ 訂單已確認\n\n"
-                f"訂單編號：{order_number}\n"
-                "已成功寫入 Google 試算表。\n\n"
-                f"老師：{order['teacher']}\n"
-                f"書名：{order['book']}\n"
-                f"出版社：{order['publisher']}\n"
-                f"總數量：{order['quantity']}本\n\n"
-                f"之後可以直接問「查{order_number}」"
-            )
-
-        return "❌ 訂單寫入失敗，請稍後再試。"
-
-    # -----------------------------------------------------
-    # 11. 已有待確認新訂單時，優先判斷修改指令
-    # -----------------------------------------------------
-    if user_id in pending_orders:
-
-        if re.search(
-            r"(不要|刪除|拿掉|移除)\s*\d{2,4}",
-            text
-        ):
-            return remove_class_from_order(user_id, text)
-
-        if re.search(
-            r"(加|加入|增加)\s*\d{2,4}",
-            text
-        ):
-            return add_class_to_order(user_id, text)
-
-        if re.search(
-            r"\d{2,4}\s*(?:改成|換成|改為)\s*\d{2,4}",
-            text
-        ):
-            return replace_class_in_order(user_id, text)
-
-        if re.search(
-            r"\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+",
-            text
-        ):
-            return adjust_pending_order(user_id, text)
-
-        if (
-            text.startswith("改成")
-            or text.startswith("書名改成")
-            or text.startswith("換成")
-            or text.startswith("書改成")
-        ):
-            return change_book(user_id, text)
-
-    # -----------------------------------------------------
-    # 11. 對話式訂書：先說班級＋書名，再補老師
-    conversational_reply = handle_conversational_order(user_id, text)
-    if conversational_reply is not None:
-        return conversational_reply
-
-    # 12. AI 草擬／整理訊息
-    # 這類句子即使出現「王老師」「訂書」，也不要誤判成下單。
-    # 若句子有訂單編號，例如「依照訂單001幫我寫一段話」，
-    # 會先讀 Google 的真實訂單資料，再交給 AI 草擬。
+    # 7. AI 寫訊息
+    # 一定放在資料查詢之後，但放在一般 AI 之前
     # -----------------------------------------------------
     if is_ai_writing_request(text):
+        ref_number = extract_referenced_order_number(text)
 
-        referenced_order_number = extract_referenced_order_number(text)
-
-        if referenced_order_number:
-            order = lookup_google_order(referenced_order_number)
-
+        if ref_number:
+            order = lookup_google_order(ref_number)
             if not order:
-                return f"⚠️ 查不到訂單 {referenced_order_number}。"
+                return f"⚠️ 查不到訂單 {ref_number}。"
 
             historical_order_context[user_id] = order
+            return ask_ai_with_order(user_id, user_text, order)
 
-            return ask_ai_with_order(
-                user_id,
-                user_text,
-                order
-            )
-
-        # 如果剛剛才查過／引用過某張歷史訂單，
-        # 後續像「幫我修飾一下」「我要跟老師回報進度」
-        # 就沿用那張訂單，不必每次重打 001。
         if user_id in historical_order_context:
             return ask_ai_with_order(
                 user_id,
@@ -863,1403 +264,892 @@ def handle_message(user_id, user_text):
         return ask_ai(user_id, user_text)
 
     # -----------------------------------------------------
-    # 訂書進度查詢：老師名稱 + 訂書進度
-    # 例如：查王老師訂書進度 / 查詢王老師訂書訂單
-    # 這裡查的是「訂書進度」，不是老師班級資料庫。
+    # 8. 學校教科書版本
     # -----------------------------------------------------
-    teacher_book_query = parse_teacher_book_order_query(text)
+    version_query = parse_school_version_query(user_id, text)
+    if version_query:
+        return handle_school_version_query(version_query)
 
-    if teacher_book_query:
-        orders = lookup_book_orders_by_teacher(
-            teacher_book_query["teacher"]
+    # -----------------------------------------------------
+    # 9. 學校／年級／班級學生人數
+    # -----------------------------------------------------
+    stats_query = parse_school_stats_query(user_id, text)
+    if stats_query:
+        return handle_school_stats_query(stats_query)
+
+    # -----------------------------------------------------
+    # 10. 老師資料庫查詢
+    # 「我」不能被當成老師；一定要明確出現「X老師」
+    # -----------------------------------------------------
+    if looks_like_teacher_lookup(text):
+        return handle_teacher_lookup(user_id, text)
+
+    # 剛查完老師後的追問
+    if user_id in teacher_lookup_context and looks_like_teacher_followup(text):
+        return handle_teacher_followup(user_id)
+
+    # -----------------------------------------------------
+    # 11. 其他訂單：查詢／修改／建立
+    # -----------------------------------------------------
+    other_query = parse_other_order_query(text)
+    if other_query:
+        orders = lookup_other_orders(
+            teacher=other_query.get("teacher", ""),
+            item_keyword=other_query.get("item_keyword", "")
         )
 
         if not orders:
-            return (
-                "⚠️ 查不到這位老師的訂書紀錄。\n\n"
-                f"老師：{teacher_book_query['teacher']}"
-            )
+            return "⚠️ 查不到符合條件的其他訂單。"
 
         if len(orders) == 1:
-            historical_order_context[user_id] = orders[0]
+            other_order_context[user_id] = orders[0]
         else:
-            historical_order_context.pop(user_id, None)
+            other_order_context.pop(user_id, None)
 
-        return make_teacher_book_orders_reply(
-            teacher_book_query["teacher"],
-            orders
-        )
+        return make_other_orders_reply(orders)
 
-    # -----------------------------------------------------
-    # 學校教科書版本資料庫查詢
-    # 例如：
-    # 天母國中七年級數學什麼版本
-    # 天母國中國一各科版本
-    # 天母國中教科書版本
-    # -----------------------------------------------------
-    version_query = parse_school_version_query(
-        user_id,
-        text
-    )
+    other_update = parse_other_order_update(user_id, text)
+    if other_update:
+        target = resolve_other_order_target(user_id, other_update)
 
-    if version_query:
-        return handle_school_version_query(
-            version_query
-        )
+        if isinstance(target, str):
+            return target
 
-    # -----------------------------------------------------
-    # 學校／年級／班級學生資料查詢
-    # 例如：
-    # 天母國中七年級多少人
-    # 天母國中七年級幾個班
-    # 天母國中七年級有哪些班
-    # 天母國中701幾個人
-    # -----------------------------------------------------
-    school_stats_query = parse_school_stats_query(
-        user_id,
-        text
-    )
+        if not target:
+            return "⚠️ 找不到要修改的其他訂單。"
 
-    if school_stats_query:
-        return handle_school_stats_query(
-            school_stats_query
-        )
-
-    # -----------------------------------------------------
-    # 老師資料庫查詢
-    # 只要是在問老師的班級／人數，就一律重新讀 Google。
-    # 不可拿目前訂單或歷史訂單的班級來回答。
-    # -----------------------------------------------------
-    teacher_db_words = [
-        "教幾個班",
-        "教幾班",
-        "教哪幾班",
-        "教哪些班",
-        "總共教幾個班",
-        "有幾個班",
-        "有哪些班",
-        "哪幾個班",
-        "哪幾班",
-        "班級資料",
-        "班級人數",
-        "每班幾人",
-        "每班人數",
-        "學生人數",
-        "總人數",
-        "幾個學生",
-        "多少學生"
-    ]
-
-    if (
-        "老師" in text
-        and any(word in text for word in teacher_db_words)
-        and "訂單" not in text
-        and not is_ai_writing_request(text)
-    ):
-        return handle_teacher_lookup(
-            user_id,
-            text
-        )
-
-    # 剛查完老師後的自然追問：
-    # 「總共幾個班」「總人數多少」「每班幾人」
-    # 仍然重新查 Google，並回完整明細。
-    teacher_followup_words = [
-        "總共幾個班",
-        "幾個班",
-        "總人數多少",
-        "總人數",
-        "總共幾人",
-        "總共多少人",
-        "每班幾人",
-        "每班人數",
-        "班級人數",
-        "有哪些班",
-        "哪幾班"
-    ]
-
-    if (
-        any(word in text for word in teacher_followup_words)
-        and "訂單" not in text
-        and user_id in teacher_lookup_context
-        and not is_ai_writing_request(text)
-    ):
-        return handle_teacher_followup(
-            user_id,
-            text
-        )
-
-    # -----------------------------------------------------
-    # 13. 延續剛剛老師直接訂
-    # 支援自然講法：
-    # 701 703定國一數學講義
-    # 701跟703訂國一數學講義
-    # 701、703 國一數學講義
-    # -----------------------------------------------------
-    context = conversation_context.get(user_id)
-
-    if context and "老師" not in text:
-
-        contextual_order_text = normalize_contextual_order_request(
-            text,
-            context
-        )
-
-        if contextual_order_text:
-            return create_order_from_context(
-                user_id,
-                contextual_order_text,
-                context
-            )
-
-    # -----------------------------------------------------
-    # 14. 完整一句話訂書
-    # -----------------------------------------------------
-    if "訂" in text and "老師" in text:
-
-        return create_order_from_sentence(
-            user_id,
-            text
-        )
-
-    # -----------------------------------------------------
-    # 15. 原本的查老師格式
-    # -----------------------------------------------------
-    if text.startswith("查老師"):
-
-        return handle_form_teacher_lookup(
-            user_id,
-            user_text
-        )
-
-    # -----------------------------------------------------
-    # 16. 訂書資訊不完整時，改成一步一步帶著填
-    # -----------------------------------------------------
-    order_intent_words = [
-        "訂書",
-        "要訂",
-        "想訂",
-        "幫我訂",
-        "訂講義",
-        "訂評量",
-        "訂教材"
-    ]
-
-    if any(word in text for word in order_intent_words):
-        guided_order_context[user_id] = {
-            "active": True,
-            "teacher": "",
-            "classes": [],
-            "book": ""
+        pending_other_updates[user_id] = {
+            "row_number": target["row_number"],
+            "teacher": target.get("teacher", ""),
+            "field": other_update["field"],
+            "value": other_update["value"]
         }
 
-        teacher_match = re.search(
-            r"([\u4e00-\u9fff]{1,4})老師",
-            text
+        return make_other_order_update_confirmation(
+            target,
+            other_update["field"],
+            other_update["value"]
         )
-        classes = extract_guided_classes(text)
 
-        if teacher_match:
-            guided_order_context[user_id]["teacher"] = (
-                teacher_match.group(1) + "老師"
-            )
-
-        if classes:
-            guided_order_context[user_id]["classes"] = classes
-
-        if (
-            guided_order_context[user_id]["teacher"]
-            and guided_order_context[user_id]["classes"]
-        ):
-            return (
-                "老師和班級我先記下來了。\n\n"
-                "還差書名。\n"
-                "例如：國一數學講義"
-            )
-
-        if guided_order_context[user_id]["teacher"]:
-            return (
-                f"收到：{guided_order_context[user_id]['teacher']}\n\n"
-                "還差班級。\n"
-                "例如：701、703"
-            )
-
-        if guided_order_context[user_id]["classes"]:
-            return (
-                f"班級收到：{'、'.join(guided_order_context[user_id]['classes'])}\n\n"
-                "還差老師。\n"
-                "例如：王老師"
-            )
-
-        return (
-            "📚 看起來你要訂書，我帶你一步一步完成。\n\n"
-            "先告訴我「老師」。\n"
-            "例如：王老師"
-        )
+    parsed_other = parse_other_order(user_id, text)
+    if parsed_other:
+        pending_other_orders[user_id] = parsed_other
+        return make_other_order_confirmation(parsed_other)
 
     # -----------------------------------------------------
-    # 17. 其他內容 → 交給 AI 一般問答
-    # AI 只負責回答文字，不直接修改 Google 訂單。
+    # 12. 訂書流程（最重要）
+    #
+    # 修正重點：
+    # A. 查完王老師 → 701 703定國一數學講義
+    #    直接沿用王老師並產生確認單
+    #
+    # B. 重來 → 701訂國一數學講義
+    #    記住701＋書名，只追問老師
+    #
+    # C. 完整資料已齊，不再問「數量」
+    #    數量一律由 Google 老師班級資料帶入
+    #
+    # D. 缺什麼只問什麼，草稿不可丟掉
+    # -----------------------------------------------------
+    order_reply = handle_order_flow(user_id, text)
+    if order_reply is not None:
+        return order_reply
+
+    # -----------------------------------------------------
+    # 13. 其他內容 → 一般 AI
     # -----------------------------------------------------
     return ask_ai(user_id, user_text)
 
 
 # =========================================================
-# 其他訂單
+# 清除狀態
 # =========================================================
-def parse_other_order(user_id, text):
+def clear_all_user_state(user_id):
+    pending_orders.pop(user_id, None)
+    order_flow_context.pop(user_id, None)
+    conversation_context.pop(user_id, None)
+    teacher_lookup_context.pop(user_id, None)
+    historical_order_context.pop(user_id, None)
+    pending_history_updates.pop(user_id, None)
+    pending_other_orders.pop(user_id, None)
+    pending_other_updates.pop(user_id, None)
+    other_order_context.pop(user_id, None)
+    ai_conversation_context.pop(user_id, None)
 
-    clean_text = text.strip()
 
-    # 完整學校名稱：天母國中王老師 買書面紙20張
-    match = re.fullmatch(
-        r"(.+?(?:國中|高中|國小))"
-        r"([\u4e00-\u9fff]{1,4})老師"
-        r"\s*(?:買|購買|要買)\s*(.+)",
-        clean_text
-    )
+# =========================================================
+# 固定功能選單
+# =========================================================
+def is_help_request(text):
+    compact = re.sub(r"\s+", "", str(text or "").lower())
 
-    school = ""
-    teacher = ""
-    item = ""
-
-    if match:
-        school = match.group(1).strip()
-        teacher = match.group(2).strip() + "老師"
-        item = match.group(3).strip()
-
-    else:
-        # 學校簡稱：天母王老師 買書面紙20張
-        match = re.fullmatch(
-            r"([\u4e00-\u9fff]{2,8})"
-            r"([\u4e00-\u9fff])老師"
-            r"\s*(?:買|購買|要買)\s*(.+)",
-            clean_text
-        )
-
-        if match:
-            school = match.group(1).strip() + "國中"
-            teacher = match.group(2).strip() + "老師"
-            item = match.group(3).strip()
-
-    # 若只說「王老師 買書面紙20張」，
-    # 就沿用最近查過的老師學校。
-    if not teacher:
-        match = re.fullmatch(
-            r"([\u4e00-\u9fff]{1,4})老師"
-            r"\s*(?:買|購買|要買)\s*(.+)",
-            clean_text
-        )
-
-        if match:
-            teacher = match.group(1).strip() + "老師"
-            item = match.group(2).strip()
-
-            context = teacher_lookup_context.get(
-                user_id
-            ) or conversation_context.get(
-                user_id,
-                {}
-            )
-
-            if context.get("teacher") == teacher:
-                school = context.get("school", "")
-
-    if not school or not teacher or not item:
-        return None
-
-    # 老師資料仍以 Google 資料庫為準，避免打錯人名。
-    classes = get_teacher_classes(
-        school,
-        teacher
-    )
-
-    if not classes:
-        return None
-
-    return {
-        "school": school,
-        "teacher": teacher,
-        "item": item
+    phrases = {
+        "功能", "功能介紹", "使用說明", "說明", "幫助", "help",
+        "怎麼用", "如何使用", "你會什麼", "你可以幹嘛",
+        "你可以做什麼", "你能幹嘛", "你能做什麼",
+        "你能幫我做什麼", "可以幫我做什麼",
+        "有什麼功能", "有哪些功能", "你有什麼功能",
+        "你有哪些功能"
     }
 
+    return compact in phrases
 
-def make_other_order_confirmation(order):
 
+def get_help_reply():
     return (
-        "👑 LeBron James 幫你把「其他訂單」整理好了：📦\n\n"
-        "🧾 其他訂單確認\n\n"
-        f"學校：{order['school']}\n"
-        f"老師：{order['teacher']}\n"
-        f"項目：{order['item']}\n"
-        "進度：（空白）\n"
-        "備註：（空白）\n\n"
-        "如果正確，請回覆「確認」\n"
-        "不要這筆請回覆「取消」"
+        "👑 大漢訂書小幫手功能\n\n"
+        "📚 1. 訂書\n"
+        "例：王老師701、703訂國一數學講義\n"
+        "例：701訂國一數學講義\n\n"
+        "🔎 2. 查單筆歷史訂單\n"
+        "例：查005\n\n"
+        "👨‍🏫 3. 查老師訂書紀錄／進度\n"
+        "例：查王老師訂書進度\n\n"
+        "✏️ 4. 修改歷史訂單數量\n"
+        "例：查005 → 701改30本\n"
+        "例：005的701改30本\n\n"
+        "👨‍🏫 5. 查老師／班級資料\n"
+        "例：王老師有幾個班\n\n"
+        "🏫 6. 查班級／年級學生人數\n"
+        "例：天母國中701幾個人\n"
+        "例：天母國中七年級多少人\n\n"
+        "📖 7. 查教科書版本\n"
+        "例：天母國中七年級數學什麼版本\n\n"
+        "📦 8. 其他訂單\n"
+        "可以新增、查詢、修改進度／備註\n\n"
+        "✍️ 9. 幫你整理、草擬 LINE 訊息\n\n"
+        "💡 直接用平常講話就可以。"
     )
-
-
-def write_other_order_to_google_sheet(order):
-
-    if not GOOGLE_SCRIPT_URL:
-        print("GOOGLE_SCRIPT_URL not found")
-        return False, {}
-
-    payload = {
-        "action": "create_other_order",
-        "school": order["school"],
-        "teacher": order["teacher"],
-        "item": order["item"]
-    }
-
-    try:
-
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=payload,
-            timeout=15
-        )
-
-        print(
-            "Other order Google response:",
-            response.status_code,
-            response.text
-        )
-
-        if response.status_code != 200:
-            return False, {}
-
-        data = response.json()
-
-        if not data.get("success"):
-            return False, data
-
-        return True, data
-
-    except Exception as error:
-
-        print(
-            "Other order write error:",
-            error
-        )
-
-        return False, {}
 
 
 # =========================================================
-# 查詢 / 修改「其他訂單」
+# 訂書流程
 # =========================================================
-def parse_other_order_query(text):
+def handle_order_flow(user_id, text):
+    clean = normalize_order_typo(text)
 
-    patterns = [
-        r"^(?:查|查詢)?\s*([\u4e00-\u9fff]{1,4}老師)\s*其他訂單$",
-        r"^(?:查|查詢)\s*其他訂單\s*([\u4e00-\u9fff]{1,4}老師)$",
-        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*(.+?)\s*其他訂單$"
-    ]
-
-    for index, pattern in enumerate(patterns):
-        match = re.fullmatch(pattern, text.strip())
-
-        if not match:
-            continue
-
-        teacher = match.group(1).strip()
-
-        item_keyword = ""
-        if index == 2 and match.lastindex and match.lastindex >= 2:
-            item_keyword = match.group(2).strip()
-
-        return {
-            "teacher": teacher,
-            "item_keyword": item_keyword
+    # 「我要訂書／我訂書」只代表開始，不代表「我」是老師
+    if clean in ["訂書", "我要訂書", "我訂書", "開始訂書", "幫我訂書"]:
+        order_flow_context[user_id] = {
+            "teacher": "",
+            "school": "",
+            "classes": [],
+            "book": ""
         }
-
-    return None
-
-
-def parse_other_order_update(user_id, text):
-
-    clean_text = text.strip()
-
-    # 直接指定列號：其他訂單2進度改成已訂購
-    match = re.fullmatch(
-        r"(?:其他訂單|其他單)\s*#?\s*(\d+)\s*"
-        r"(進度|備註)\s*(?:改成|改為|改|設成|設為)\s*(.+)",
-        clean_text
-    )
-
-    if match:
-        return {
-            "row_number": int(match.group(1)),
-            "field": (
-                "progress"
-                if match.group(2) == "進度"
-                else "note"
-            ),
-            "value": match.group(3).strip()
-        }
-
-    # 老師＋品項關鍵字：王老師書面紙進度改成已訂購
-    match = re.fullmatch(
-        r"(?:把)?\s*([\u4e00-\u9fff]{1,4}老師)\s*"
-        r"(.+?)\s*(進度|備註)\s*"
-        r"(?:改成|改為|改|設成|設為)\s*(.+)",
-        clean_text
-    )
-
-    if match:
-        return {
-            "teacher": match.group(1).strip(),
-            "item_keyword": match.group(2).strip(),
-            "field": (
-                "progress"
-                if match.group(3) == "進度"
-                else "note"
-            ),
-            "value": match.group(4).strip()
-        }
-
-    # 查到單筆後：進度改成已訂購 / 備註改成週一送達
-    match = re.fullmatch(
-        r"(進度|備註)\s*(?:改成|改為|改|設成|設為)\s*(.+)",
-        clean_text
-    )
-
-    if match and user_id in other_order_context:
-        return {
-            "use_context": True,
-            "field": (
-                "progress"
-                if match.group(1) == "進度"
-                else "note"
-            ),
-            "value": match.group(2).strip()
-        }
-
-    return None
-
-
-def resolve_other_order_target(
-    user_id,
-    update_data
-):
-
-    if update_data.get("use_context"):
-        return other_order_context.get(user_id)
-
-    if update_data.get("row_number"):
-        orders = lookup_other_orders(
-            row_number=update_data["row_number"]
+        return (
+            "📚 好，要訂書。\n\n"
+            "先告訴我是哪一位老師。\n"
+            "例如：王老師"
         )
 
-        if not orders:
+    draft = order_flow_context.get(user_id, {
+        "teacher": "",
+        "school": "",
+        "classes": [],
+        "book": ""
+    })
+
+    parsed = parse_order_message(clean)
+
+    # 完全不像訂書，也沒有訂書草稿 → 不攔截
+    if not parsed["has_order_intent"] and user_id not in order_flow_context:
+        # 查完老師後，允許「701 703 國一數學講義」省略「訂」
+        recent = conversation_context.get(user_id)
+        if recent and looks_like_contextual_class_book(clean, recent):
+            parsed = parse_contextual_class_book(clean, recent)
+        else:
             return None
 
-        return orders[0]
+    # 如果已經有訂書草稿，但這句是補老師／補班級／補書名
+    if user_id in order_flow_context:
+        parsed = merge_followup_into_parsed(clean, parsed, draft)
 
-    orders = lookup_other_orders(
-        teacher=update_data.get("teacher", ""),
-        item_keyword=update_data.get("item_keyword", "")
-    )
+    # 更新草稿
+    if parsed.get("teacher"):
+        draft["teacher"] = parsed["teacher"]
 
-    if not orders:
-        return None
+    if parsed.get("school"):
+        draft["school"] = parsed["school"]
 
-    if len(orders) > 1:
-        lines = [
-            "⚠️ 找到多筆符合的其他訂單，為了避免改錯，請指定編號：\n"
+    if parsed.get("classes"):
+        draft["classes"] = unique_list(parsed["classes"])
+
+    if parsed.get("book"):
+        draft["book"] = parsed["book"]
+
+    # 如果句子沒老師，但剛剛查過老師，直接沿用
+    # 這就是「王老師有幾個班 → 701 703訂...」的修正
+    if not draft["teacher"]:
+        recent = conversation_context.get(user_id, {})
+        if recent.get("teacher") and recent.get("school"):
+            draft["teacher"] = recent["teacher"]
+            draft["school"] = recent["school"]
+
+    # 有老師但沒有學校，優先沿用同一位老師的最近學校
+    if draft["teacher"] and not draft["school"]:
+        recent_candidates = [
+            teacher_lookup_context.get(user_id, {}),
+            conversation_context.get(user_id, {})
         ]
 
-        for order in orders[:10]:
-            lines.append(
-                f"#{order['row_number']} "
-                f"{order['date']}｜"
-                f"{order['item']}｜"
-                f"進度：{order['progress'] or '空白'}"
-            )
+        for recent in recent_candidates:
+            if recent.get("teacher") == draft["teacher"] and recent.get("school"):
+                draft["school"] = recent["school"]
+                break
 
-        lines.append(
-            "\n例如：其他訂單2進度改成已訂購"
-        )
+        if not draft["school"]:
+            draft["school"] = DEFAULT_SCHOOL
 
-        return "\n".join(lines)
+    order_flow_context[user_id] = draft
 
-    return orders[0]
-
-
-def lookup_other_orders(
-    teacher="",
-    item_keyword="",
-    row_number=None
-):
-
-    if not GOOGLE_SCRIPT_URL:
-        print("GOOGLE_SCRIPT_URL not found")
-        return []
-
-    payload = {
-        "action": "lookup_other_orders",
-        "teacher": teacher,
-        "item_keyword": item_keyword
-    }
-
-    if row_number is not None:
-        payload["row_number"] = int(row_number)
-
-    try:
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=payload,
-            timeout=15
-        )
-
-        print(
-            "Lookup other orders response:",
-            response.status_code,
-            response.text
-        )
-
-        if response.status_code != 200:
-            return []
-
-        data = response.json()
-
-        if not data.get("success"):
-            return []
-
-        return data.get("orders", [])
-
-    except Exception as error:
-        print("Lookup other orders error:", error)
-        return []
-
-
-def update_other_order_in_google_sheet(
-    row_number,
-    field,
-    value
-):
-
-    if not GOOGLE_SCRIPT_URL:
-        return False, {}
-
-    payload = {
-        "action": "update_other_order",
-        "row_number": int(row_number),
-        "field": field,
-        "value": value
-    }
-
-    try:
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=payload,
-            timeout=15
-        )
-
-        print(
-            "Update other order response:",
-            response.status_code,
-            response.text
-        )
-
-        if response.status_code != 200:
-            return False, {}
-
-        data = response.json()
-
-        return bool(data.get("success")), data
-
-    except Exception as error:
-        print("Update other order error:", error)
-        return False, {}
-
-
-def make_other_orders_reply(orders):
-
-    lines = [
-        "👑 LeBron James 幫你查了「其他訂單」：📦",
-        ""
-    ]
-
-    for order in orders[:10]:
-        lines.extend([
-            f"🧾 其他訂單 #{order['row_number']}",
-            f"日期：{order['date']}",
-            f"學校：{order['school']}",
-            f"老師：{order['teacher']}",
-            f"項目：{order['item']}",
-            f"進度：{order['progress'] or '（空白）'}",
-            f"備註：{order['note'] or '（空白）'}",
-            ""
-        ])
-
-    if len(orders) > 10:
-        lines.append(
-            f"另外還有 {len(orders) - 10} 筆較舊資料。"
-        )
-
-    lines.append(
-        "要更新可以直接說："
-    )
-    lines.append(
-        "「進度改成已訂購」或「備註改成週一送達」"
-        if len(orders) == 1
-        else "「其他訂單編號＋進度/備註」，例如：其他訂單2進度改成已訂購"
-    )
-
-    return "\n".join(lines)
-
-
-def make_other_order_update_confirmation(
-    order,
-    field,
-    value
-):
-
-    field_name = (
-        "進度"
-        if field == "progress"
-        else "備註"
-    )
-
-    old_value = (
-        order.get("progress", "")
-        if field == "progress"
-        else order.get("note", "")
-    )
-
-    return (
-        "🔄 其他訂單修改確認\n\n"
-        f"🧾 其他訂單 #{order['row_number']}\n"
-        f"老師：{order['teacher']}\n"
-        f"項目：{order['item']}\n\n"
-        f"{field_name}：{old_value or '（空白）'} → {value}\n\n"
-        "如果正確，請回覆「確認修改」或「確認」\n"
-        "不要修改請回覆「取消修改」"
-    )
-
-
-# =========================================================
-# 判斷是不是「請 AI 幫忙寫／改／整理文字」
-# =========================================================
-def is_ai_writing_request(text):
-
-    writing_words = [
-        "幫我寫",
-        "幫我擬",
-        "幫我打",
-        "幫我整理",
-        "幫我改寫",
-        "幫我潤飾",
-        "幫我回覆",
-        "幫我回",
-        "寫一段",
-        "寫訊息",
-        "寫給",
-        "傳給",
-        "怎麼跟",
-        "怎麼回",
-        "口氣",
-        "正式一點",
-        "輕鬆一點",
-        "簡短一點",
-        "修飾一下",
-        "修飾",
-        "潤飾",
-        "排版",
-        "排列一下",
-        "加個表情",
-        "加表情",
-        "emoji",
-        "有禮貌一點",
-        "親切一點",
-        "活潑一點",
-        "愉快一點",
-        "我要跟老師說",
-        "跟老師說",
-        "告訴老師",
-        "通知老師",
-        "回報進度",
-        "回報老師",
-        "回報老師一下",
-        "給老師一個回報",
-        "給老師回報",
-        "給老師一個進度",
-        "跟老師回報",
-        "老師一個回報",
-        "讓老師知道",
-        "回老師",
-        "寫給老師"
-    ]
-
-    return any(
-        word in text
-        for word in writing_words
-    )
-
-
-# =========================================================
-# 從一般句子抓「被引用的訂單編號」
-# 例如：
-# 依照訂單001幫我寫...
-# 001幫我寫得簡短一點
-# 根據001訂單...
-# =========================================================
-def extract_referenced_order_number(text):
-
-    patterns = [
-        r"訂單\s*(\d{1,})",
-        r"依照\s*(\d{1,})\s*訂單",
-        r"根據\s*(\d{1,})\s*訂單",
-        r"依照\s*(\d{1,})",
-        r"根據\s*(\d{1,})",
-        r"^(\d{1,})\s*(?:訂單)?\s*(?:幫我|請幫我|寫|改|整理|回報|給老師|跟老師)"
-    ]
-
-    for pattern in patterns:
-        match = re.search(pattern, text)
-
-        if match:
-            return normalize_order_number(
-                match.group(1)
-            )
-
-    return None
-
-
-# =========================================================
-# 用 Google 真實訂單資料協助 AI 草擬訊息
-# 只讀資料，不修改訂單。
-# =========================================================
-def ask_ai_with_order(
-    user_id,
-    user_text,
-    order
-):
-
-    class_lines = []
-
-    for item in order.get("classes", []):
-        class_lines.append(
-            f"{item['class_name']}："
-            f"{int(item['students'])}本"
-        )
-
-    order_context = (
-        "以下是 Google 試算表查到的真實訂單資料：\\n"
-        f"訂單編號：{order.get('order_number', '')}\\n"
-        f"老師：{order.get('teacher', '')}\\n"
-        f"學校：{order.get('school', '')}\\n"
-        f"書名：{order.get('book', '')}\\n"
-        f"出版社：{order.get('publisher', '')}\\n"
-        + "\\n".join(class_lines)
-        + f"\\n總數量：{order.get('quantity', 0)}本\\n"
-        f"狀態：{order.get('status', '')}"
-    )
-
-    return ask_ai(
-        user_id,
-        user_text,
-        extra_context=order_context
-    )
-
-
-# =========================================================
-# 一般 AI 問答
-# =========================================================
-def ask_ai(
-    user_id,
-    user_text,
-    extra_context=""
-):
-
-    if not OPENAI_API_KEY:
-        print("OpenAI API key missing")
-        return AI_FALLBACK_MESSAGE
-
-    history = ai_conversation_context.get(
-        user_id,
-        []
-    )
-
-    # 只保留最近幾輪，避免每次傳太多文字。
-    recent_history = history[-8:]
-
-    conversation_text = ""
-
-    for item in recent_history:
-        role_name = (
-            "使用者"
-            if item["role"] == "user"
-            else "助理"
-        )
-        conversation_text += (
-            f"{role_name}：{item['text']}\n"
-        )
-
-    if extra_context:
-        conversation_text += (
-            "\n【系統提供的訂單資料】\n"
-            + extra_context
-            + "\n【訂單資料結束】\n"
-        )
-
-    conversation_text += (
-        f"使用者：{user_text}\n助理："
-    )
-
-    instructions = (
-        "你是『大漢訂書小幫手』的工作助理。"
-        "請使用繁體中文回答，口吻自然、簡潔、實用。"
-        "你可以回答一般問題、整理文字、草擬訊息、"
-        "計算與提供工作上的建議。"
-        "你不能聲稱自己已經修改、建立或取消任何訂單，"
-        "也不能聲稱已經修改 Google 試算表。"
-        "如果系統提供了真實訂單資料，你可以引用那些資料，"
-        "協助使用者草擬要傳給老師的 LINE 訊息、摘要或通知。"
-        "當使用者是在請你寫給老師的訊息時，請直接產出可複製貼上的完整成品，"
-        "不要先解釋你要怎麼寫，也不要要求使用者補充『親切、排版、表情』等要求。"
-        "即使使用者只說『001幫我回報老師一下』、"
-        "『幫我依照001訂單給老師一個回報訊息』這種很短的指令，"
-        "也要自動利用系統提供的訂單資料，完成一則可直接轉傳給老師的訊息。"
-        "訊息預設包含合適稱呼、目前進度、必要的訂單重點、禮貌收尾；"
-        "但不要為了完整而捏造不存在的進度。"
-        "訊息風格要自然、親切、有禮貌、帶一點輕鬆感，"
-        "用適合 LINE 閱讀的短段落與換行整理。"
-        "可以加入 1 到 3 個適合情境的表情符號，例如 🙏、😊、📚、✅、📌，"
-        "但不要塞太多，也不要顯得幼稚或過度熱情。"
-        "除非使用者特別要求，避免把『訂單001』這種內部編號硬塞進給老師的訊息；"
-        "優先用老師看得懂的書名、班級、數量與進度來表達。"
-        "不要自行捏造訂單中沒有的班級、數量、書名或處理進度。"
-        "若使用者只說『正在處理中』，可以照此語意草擬，"
-        "但不要擅自改成『已完成』『已出貨』或『已到貨』。"
-        "訂單查詢、建立、修改與確認都由外層固定程式處理。"
-        "如果使用者要求你直接更動訂單資料，"
-        "請提醒他使用明確的訂書指令。"
-        "回答適合直接顯示在 LINE，不要使用 Markdown 表格。"
-    )
-
-    url = "https://api.openai.com/v1/responses"
-
-    headers = {
-        "Authorization":
-            "Bearer " + OPENAI_API_KEY,
-        "Content-Type":
-            "application/json"
-    }
-
-    payload = {
-        "model": OPENAI_MODEL,
-        "instructions": instructions,
-        "input": conversation_text,
-        "max_output_tokens": 600
-    }
-
-    try:
-        response = requests.post(
-            url,
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-
-        print(
-            "OpenAI status:",
-            response.status_code
-        )
-
-        if response.status_code != 200:
-            print(
-                "OpenAI error:",
-                response.text
-            )
-            return AI_FALLBACK_MESSAGE
-
-        data = response.json()
-        answer = extract_openai_text(data)
-
-        if not answer:
-            print("OpenAI returned empty answer")
-            return AI_FALLBACK_MESSAGE
-
-        # LINE 單則文字訊息上限很高，
-        # 這裡仍限制長度，避免回答過長。
-        answer = answer.strip()[:4500]
-
-        history.append({
-            "role": "user",
-            "text": user_text
-        })
-        history.append({
-            "role": "assistant",
-            "text": answer
-        })
-
-        ai_conversation_context[user_id] = (
-            history[-10:]
-        )
-
-        return answer
-
-    except Exception as error:
-        print(
-            "OpenAI request error:",
-            error
-        )
-        return AI_FALLBACK_MESSAGE
-
-
-def extract_openai_text(data):
-
-    # Responses API 的文字通常位於：
-    # output[] -> content[] -> output_text -> text
-    texts = []
-
-    for item in data.get("output", []):
-        for content in item.get("content", []):
-            if (
-                content.get("type")
-                == "output_text"
-                and content.get("text")
-            ):
-                texts.append(
-                    content.get("text")
-                )
-
-    if texts:
-        return "\n".join(texts)
-
-    # 保留相容性：若 API 回傳頂層 output_text。
-    if data.get("output_text"):
-        return str(data.get("output_text"))
-
-    return ""
-
-
-# =========================================================
-# 文字標準化
-# =========================================================
-def normalize_text(text):
-
-    text = text.strip()
-
-    text = text.replace("　", " ")
-
-    return text
-
-
-# =========================================================
-# =========================================================
-# 對話式訂書
-# =========================================================
-def handle_conversational_order(user_id, text):
-    clean_text = text.strip()
-
-    if clean_text in ["全部重來", "全部重設", "重新開始"]:
-        pending_orders.pop(user_id, None)
-        conversation_context.pop(user_id, None)
-        historical_order_context.pop(user_id, None)
-        pending_history_updates.pop(user_id, None)
-        order_draft_context.pop(user_id, None)
-        proposed_teacher_context.pop(user_id, None)
-        teacher_lookup_context.pop(user_id, None)
+    # 缺什麼只問什麼
+    if not draft["teacher"]:
         return (
-            "👑 LeBron James：好，全部重新開始。😊\n\n"
-            "你直接跟我說要訂哪些班、哪本書，缺什麼我再問你。"
+            "📚 班級跟書名我記下來了。\n\n"
+            + (
+                f"班級：{'、'.join(draft['classes'])}\n"
+                if draft["classes"] else ""
+            )
+            + (
+                f"書名：{draft['book']}\n\n"
+                if draft["book"] else "\n"
+            )
+            + "還差老師。\n"
+            "例如：王老師"
         )
 
-    # 先說班級＋書名。支援：
-    # 訂701跟705，國一數學講義
-    # 701 705訂國一數學講義
-    # 701訂國一數學講義
-    m = re.search(
-        r"^(?:訂|要訂)\s*((?:\d{2,4}\s*(?:跟|和|、|,|，|\s)?\s*)+)[，,、\s]*(.+)$",
-        clean_text
+    if not draft["classes"]:
+        return (
+            f"收到：{draft['teacher']}\n"
+            + (f"書名：{draft['book']}\n\n" if draft["book"] else "\n")
+            + "還差班級。\n"
+            "例如：701、703"
+        )
+
+    if not draft["book"]:
+        return (
+            f"老師：{draft['teacher']}\n"
+            f"班級：{'、'.join(draft['classes'])}\n\n"
+            "還差書名。\n"
+            "例如：國一數學講義"
+        )
+
+    # 資料齊全 → Google 查老師班級，不問數量
+    result = build_order_from_draft(user_id, draft)
+
+    # 成功建立待確認訂單後才清草稿
+    if user_id in pending_orders:
+        order_flow_context.pop(user_id, None)
+
+    return result
+
+
+def parse_order_message(text):
+    clean = str(text or "").strip()
+
+    teacher, school = extract_teacher_and_school(clean)
+    classes = extract_classes(clean)
+
+    # 訂書意圖：
+    # 1) 有「訂／定」
+    # 2) 明確說訂書、要訂、想訂、幫我訂
+    has_order_word = bool(
+        re.search(r"(?:訂書|要訂|想訂|幫我訂|訂講義|訂評量|訂教材|訂)", clean)
     )
 
-    if not m:
-        m = re.search(
-            r"^((?:\d{2,4}\s*(?:跟|和|、|,|，|\s)?\s*)+)\s*(?:訂|要訂)\s*(.+)$",
-            clean_text
-        )
+    book = ""
 
-    if m and "老師" not in clean_text:
-        class_names = re.findall(r"\d{2,4}", m.group(1))
-        book = clean_book_name(m.group(2))
-        if class_names and book:
-            order_draft_context[user_id] = {
-                "class_names": class_names,
-                "book": book
-            }
-            previous = conversation_context.get(user_id, {})
-            previous_teacher = previous.get("teacher", "")
-            previous_school = previous.get("school", "")
+    # 找「訂」後面的內容
+    m = re.search(r"(?:訂|要訂|想訂|幫我訂)\s*(.+)$", clean)
+    if m:
+        book = clean_book_name(m.group(1))
 
-            if previous_teacher and previous_school:
-                proposed_teacher_context[user_id] = {
-                    "teacher": previous_teacher,
-                    "school": previous_school
-                }
-
-                return (
-                    "👑 LeBron James：班級跟書名我記下來了。📚\n\n"
-                    f"班級：{'、'.join(class_names)}\n"
-                    f"書名：{book}\n\n"
-                    f"是 {previous_school} 的 {previous_teacher} 嗎？\n"
-                    "如果是，回我「對」或「就是他」就可以。"
-                )
-
-            proposed_teacher_context.pop(user_id, None)
-
-            return (
-                "👑 LeBron James：班級跟書名我記下來了。📚\n\n"
-                f"班級：{'、'.join(class_names)}\n"
-                f"書名：{book}\n\n"
-                "請問是哪一位老師？例如：天母王老師"
+    # 如果抓到的內容仍含班級，移掉班級
+    if book:
+        for class_name in classes:
+            book = re.sub(
+                r"(?<!\d)" + re.escape(class_name) + r"(?!\d)",
+                " ",
+                book
             )
 
-    draft = order_draft_context.get(user_id)
-    if not draft:
-        return None
+        # 移掉老師
+        if teacher:
+            book = book.replace(teacher, " ")
 
-    # -----------------------------------------------------
-    # 承接上一句：對 / 沒錯 / 就是他 / 對就是他...
-    # 只有真的存在「候選老師」時才採用，不能把單純範例當答案。
-    # -----------------------------------------------------
-    affirmative_words = {
-        "對", "對啊", "對阿", "對的", "沒錯",
-        "就是他", "就是她", "沒錯就是他", "沒錯就是她",
-        "對就是他", "對就是她", "是他", "是她",
-        "嗯就是他", "嗯就是她", "恩就是他", "恩就是她",
-        "對 沒錯", "沒錯 就是他", "沒錯 就是她"
+        book = re.sub(r"^[跟和與、,，\s]+", "", book)
+        book = re.sub(r"\s+", " ", book).strip()
+        book = clean_book_name(book)
+
+    return {
+        "has_order_intent": has_order_word,
+        "teacher": teacher,
+        "school": school,
+        "classes": classes,
+        "book": book
     }
 
-    normalized_reply = re.sub(
-        r"[，,。.!！?？\s]+",
-        "",
-        clean_text
+
+def merge_followup_into_parsed(clean, parsed, draft):
+    result = dict(parsed)
+
+    # 補老師：「王老師」「天母王老師」「天母國中王老師」
+    if not result.get("teacher"):
+        teacher, school = extract_teacher_and_school(clean)
+        if teacher:
+            result["teacher"] = teacher
+            result["school"] = school
+
+    # 補班級：純 701、703
+    classes = extract_classes(clean)
+    if classes and not result.get("classes"):
+        result["classes"] = classes
+
+    # 草稿只缺書名時，整句當書名
+    missing_book_only = (
+        draft.get("teacher")
+        and draft.get("classes")
+        and not draft.get("book")
     )
 
-    normalized_affirmatives = {
-        re.sub(r"[，,。.!！?？\s]+", "", item)
-        for item in affirmative_words
-    }
+    if missing_book_only and not result.get("book"):
+        # 避免把純老師／純班級當書名
+        if "老師" not in clean and not re.fullmatch(
+            r"[\d、,，跟和與\s]+",
+            clean
+        ):
+            result["book"] = clean_book_name(clean)
 
-    if normalized_reply in normalized_affirmatives:
-        candidate = proposed_teacher_context.get(user_id)
+    # 草稿只缺老師時，不要把「我」當老師
+    result["has_order_intent"] = True
 
-        if not candidate:
-            return (
-                "👑 LeBron James：我知道你是在確認老師 😊\n\n"
-                "但我目前還沒有一位確定的候選老師，"
-                "請直接告訴我老師名稱，例如：天母王老師。"
-            )
+    return result
 
-        clean_text = (
-            candidate["school"]
-            + candidate["teacher"]
-        )
 
-    # 補老師：天母王老師 / 天母國中王老師 / 王老師 / 對就是王老師
-    school = ""
-    teacher = ""
-
-    # 先移除自然口語前後綴，保留真正的老師名稱。
-    teacher_reply = re.sub(
-        r"[，,。.!！?？\s]+",
-        "",
-        clean_text
-    )
-    teacher_reply = re.sub(
-        r"^(?:對|對的|沒錯|是|就是|就|嗯|恩)+",
-        "",
-        teacher_reply
-    )
-    teacher_reply = re.sub(
-        r"(?:沒錯|對的|就是他|就是她)$",
-        "",
-        teacher_reply
-    )
-
-    m_full = re.fullmatch(
-        r"(.+?)(國中|高中|國小)([\u4e00-\u9fff]{1,4})老師",
-        teacher_reply
-    )
-    if m_full:
-        school = m_full.group(1) + m_full.group(2)
-        teacher = m_full.group(3) + "老師"
-    else:
-        # 學校簡稱，例如：天母王老師 → 天母國中王老師
-        m_short = re.fullmatch(
-            r"([\u4e00-\u9fff]{2,8})([\u4e00-\u9fff])老師",
-            teacher_reply
-        )
-        if m_short:
-            school = m_short.group(1) + "國中"
-            teacher = m_short.group(2) + "老師"
-        else:
-            # 只回答「王老師」「是王老師」「對就是王老師」時：
-            # 先沿用候選/最近老師的學校；都沒有時，依目前老師資料庫預設天母國中。
-            m_teacher_only = re.fullmatch(
-                r"([\u4e00-\u9fff]{1,4})老師",
-                teacher_reply
-            )
-            if m_teacher_only:
-                teacher = m_teacher_only.group(1) + "老師"
-
-                candidate = proposed_teacher_context.get(user_id, {})
-                recent = teacher_lookup_context.get(user_id, {})
-                previous = conversation_context.get(user_id, {})
-
-                school = (
-                    candidate.get("school", "")
-                    or recent.get("school", "")
-                    or previous.get("school", "")
-                    or "天母國中"
-                )
-
-    if not teacher:
-        return None
+def build_order_from_draft(user_id, draft):
+    teacher = draft["teacher"]
+    school = draft.get("school") or DEFAULT_SCHOOL
+    requested_classes = unique_list(draft["classes"])
+    book = clean_book_name(draft["book"])
 
     teacher_classes = get_teacher_classes(school, teacher)
+
     if not teacher_classes:
         return (
             "⚠️ 查不到老師班級資料\n\n"
-            f"學校：{school}\n老師：{teacher}\n\n"
+            f"學校：{school}\n"
+            f"老師：{teacher}\n\n"
             "請確認學校或老師名稱。"
         )
 
     selected = []
-    for class_name in draft["class_names"]:
+
+    for class_name in requested_classes:
         found = next(
-            (item for item in teacher_classes
-             if str(item["class_name"]) == str(class_name)),
+            (
+                item for item in teacher_classes
+                if str(item.get("class_name")) == str(class_name)
+            ),
             None
         )
+
         if not found:
-            return f"⚠️ {teacher} 的資料裡找不到 {class_name} 班。"
+            available = "、".join(
+                str(item.get("class_name"))
+                for item in teacher_classes
+            )
+            return (
+                f"⚠️ {teacher} 的資料裡找不到 {class_name} 班。\n\n"
+                f"目前班級：{available}"
+            )
+
+        # 數量直接採 Google 學生人數
         selected.append({
             "class_name": str(found["class_name"]),
             "students": int(found["students"])
         })
 
-    publisher = get_book_publisher(draft["book"])
+    publisher = get_book_publisher(book)
+
     if not publisher:
-        return f"⚠️ 查不到書籍出版社資料：{draft['book']}"
+        return (
+            "⚠️ 查不到書籍資料\n\n"
+            f"書名：{book}\n\n"
+            "請確認 Google「書籍資料」是否已建立這本書與出版社。"
+        )
 
     order = {
         "teacher": teacher,
         "school": school,
-        "book": draft["book"],
+        "book": book,
         "publisher": publisher,
-        "classes": selected
+        "classes": selected,
+        "quantity": calculate_total(selected)
     }
-    refresh_order_total(order)
+
     pending_orders[user_id] = order
+
+    # 記住老師，方便下一張單直接延續
     conversation_context[user_id] = {
         "teacher": teacher,
         "school": school,
         "classes": copy_classes(teacher_classes)
     }
-    order_draft_context.pop(user_id, None)
-    proposed_teacher_context.pop(user_id, None)
+
+    teacher_lookup_context[user_id] = {
+        "teacher": teacher,
+        "school": school,
+        "classes": copy_classes(teacher_classes)
+    }
+
     return make_order_confirmation(order)
 
 
-# 查老師
-# =========================================================
-def handle_teacher_lookup(
-    user_id,
-    text
-):
+def normalize_order_typo(text):
+    clean = str(text or "").strip()
 
-    teacher_match = re.search(
-        r"(.+?老師)",
+    # 常見輸入法「定」只在明顯訂書句型時轉成「訂」
+    # 例：701 703定國一數學講義
+    clean = re.sub(
+        r"(?<=\d)\s*定\s*(?=[^\d])",
+        "訂",
+        clean,
+        count=1
+    )
+
+    clean = re.sub(
+        r"^(我要|我想要|想要)?\s*定書$",
+        lambda m: (m.group(1) or "") + "訂書",
+        clean
+    )
+
+    return clean
+
+
+def looks_like_contextual_class_book(text, context):
+    known = {
+        str(item.get("class_name"))
+        for item in context.get("classes", [])
+    }
+
+    mentioned = extract_classes(text)
+
+    if not mentioned:
+        return False
+
+    if not all(item in known for item in mentioned):
+        return False
+
+    remainder = text
+    for class_name in mentioned:
+        remainder = re.sub(
+            r"(?<!\d)" + re.escape(class_name) + r"(?!\d)",
+            " ",
+            remainder
+        )
+
+    remainder = re.sub(r"[跟和與、,，/\s]+", " ", remainder).strip()
+
+    # 單純只打班級不算下單
+    return len(remainder) >= 2
+
+
+def parse_contextual_class_book(text, context):
+    clean = normalize_order_typo(text)
+    classes = extract_classes(clean)
+
+    if "訂" in clean:
+        book = clean.split("訂", 1)[1].strip()
+    else:
+        book = clean
+        for class_name in classes:
+            book = re.sub(
+                r"(?<!\d)" + re.escape(class_name) + r"(?!\d)",
+                " ",
+                book
+            )
+
+    book = re.sub(r"^[跟和與、,，/\s]+", "", book)
+    book = clean_book_name(book)
+
+    return {
+        "has_order_intent": True,
+        "teacher": context.get("teacher", ""),
+        "school": context.get("school", ""),
+        "classes": classes,
+        "book": book
+    }
+
+
+def extract_teacher_and_school(text):
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(text or ""))
+
+    # 完整：天母國中王老師
+    m = re.search(
+        r"([\u4e00-\u9fff]{2,16}(?:國中|高中|國小))"
+        r"([\u4e00-\u9fff]{1,4})老師",
+        clean
+    )
+
+    if m:
+        return m.group(2) + "老師", m.group(1)
+
+    # 學校簡稱：天母王老師
+    m = re.fullmatch(
+        r"([\u4e00-\u9fff]{2,8})([\u4e00-\u9fff])老師",
+        clean
+    )
+
+    if m:
+        return m.group(2) + "老師", m.group(1) + "國中"
+
+    # 一般：王老師
+    m = re.search(r"([\u4e00-\u9fff]{1,4})老師", clean)
+
+    if m:
+        name = m.group(1)
+
+        # 防止自然語言中的「哪位老師／這位老師」被當姓名
+        if name in ["哪位", "這位", "那位", "一位", "我的", "我們"]:
+            return "", ""
+
+        return name + "老師", ""
+
+    return "", ""
+
+
+def extract_classes(text):
+    matches = re.findall(
+        r"(?<!\d)([789]\d{2})(?!\d)",
+        str(text or "")
+    )
+    return unique_list(matches)
+
+
+def unique_list(items):
+    result = []
+    for item in items:
+        value = str(item)
+        if value not in result:
+            result.append(value)
+    return result
+
+
+# =========================================================
+# 新訂單確認／修改
+# =========================================================
+def make_order_confirmation(order):
+    class_lines = [
+        f"{item['class_name']}：{int(item['students'])}本"
+        for item in order.get("classes", [])
+    ]
+
+    return (
+        "👑 LeBron James 幫你把這張單整理好了：\n\n"
+        "📚 訂購確認\n\n"
+        f"老師：{order['teacher']}\n"
+        f"學校：{order['school']}\n"
+        f"書名：{order['book']}\n"
+        f"出版社：{order['publisher']}\n\n"
+        + "\n".join(class_lines)
+        + f"\n\n總數量：{int(order.get('quantity', 0))}本\n\n"
+        "如果正確，請回覆「確認」"
+    )
+
+
+def confirm_new_order(user_id):
+    order = pending_orders.get(user_id)
+
+    if not order:
+        return "⚠️ 找不到尚未確認的訂單，請重新輸入。"
+
+    success, order_number = write_to_google_sheet(order)
+
+    if not success:
+        return "❌ 訂單寫入失敗，請稍後再試。"
+
+    pending_orders.pop(user_id, None)
+
+    return (
+        "👑 LeBron James：這張我幫你收好了。\n\n"
+        "✅ 訂單已確認\n\n"
+        f"訂單編號：{order_number}\n"
+        "已成功寫入 Google 試算表。\n\n"
+        f"老師：{order['teacher']}\n"
+        f"書名：{order['book']}\n"
+        f"出版社：{order['publisher']}\n"
+        f"總數量：{order['quantity']}本\n\n"
+        f"之後可以直接問「查{order_number}」"
+    )
+
+
+def handle_pending_order_edit(user_id, text):
+    order = pending_orders[user_id]
+
+    # 移除班級
+    m = re.fullmatch(
+        r"(?:不要|刪除|刪掉|拿掉|移除)\s*(\d{3})",
+        text
+    )
+    if not m:
+        m = re.fullmatch(
+            r"(\d{3})\s*(?:取消|不要|刪除|刪掉|拿掉|移除)",
+            text
+        )
+
+    if m:
+        class_name = m.group(1)
+
+        if not find_order_class(order, class_name):
+            return f"⚠️ 目前訂單裡沒有 {class_name}。"
+
+        if len(order["classes"]) <= 1:
+            return (
+                "⚠️ 目前只剩最後一個班級。\n"
+                "如果要取消整張訂單，請直接輸入「取消」。"
+            )
+
+        order["classes"] = [
+            item for item in order["classes"]
+            if str(item["class_name"]) != class_name
+        ]
+        refresh_order_total(order)
+        return make_order_confirmation(order)
+
+    # 加班級
+    m = re.fullmatch(r"(?:加|加入|增加)\s*(\d{3})", text)
+    if m:
+        class_name = m.group(1)
+
+        if find_order_class(order, class_name):
+            return f"⚠️ {class_name} 已經在這筆訂單裡了。"
+
+        context = conversation_context.get(user_id, {})
+        source = next(
+            (
+                item for item in context.get("classes", [])
+                if str(item["class_name"]) == class_name
+            ),
+            None
+        )
+
+        if not source:
+            return f"⚠️ {order['teacher']} 沒有 {class_name} 這個班。"
+
+        order["classes"].append({
+            "class_name": class_name,
+            "students": int(source["students"])
+        })
+        refresh_order_total(order)
+        return make_order_confirmation(order)
+
+    # 更換班級
+    m = re.fullmatch(
+        r"(\d{3})\s*(?:改成|改為|換成)\s*(\d{3})",
+        text
+    )
+    if m:
+        old_class, new_class = m.groups()
+
+        old_target = find_order_class(order, old_class)
+        if not old_target:
+            return f"⚠️ {old_class} 目前不在這筆訂單裡。"
+
+        context = conversation_context.get(user_id, {})
+        source = next(
+            (
+                item for item in context.get("classes", [])
+                if str(item["class_name"]) == new_class
+            ),
+            None
+        )
+
+        if not source:
+            return f"⚠️ {order['teacher']} 沒有 {new_class} 這個班。"
+
+        if find_order_class(order, new_class):
+            return f"⚠️ {new_class} 已經在這筆訂單裡。"
+
+        order["classes"] = [
+            item for item in order["classes"]
+            if str(item["class_name"]) != old_class
+        ]
+        order["classes"].append({
+            "class_name": new_class,
+            "students": int(source["students"])
+        })
+
+        refresh_order_total(order)
+        return make_order_confirmation(order)
+
+    # 改數量
+    if looks_like_history_edit(text):
+        matches = list(re.finditer(
+            r"(?<!\d)(\d{3})(?!\d)\s*"
+            r"(改成|改為|改|多|少)\s*"
+            r"(\d+)\s*(?:人|本)?",
+            text
+        ))
+
+        if matches:
+            changes = []
+
+            for match in matches:
+                class_name, action, raw_value = match.groups()
+                target = find_order_class(order, class_name)
+
+                if not target:
+                    return f"⚠️ 目前訂單裡沒有 {class_name}。"
+
+                old_value = int(target["students"])
+                value = int(raw_value)
+
+                if action in ["改", "改成", "改為"]:
+                    new_value = value
+                elif action == "多":
+                    new_value = old_value + value
+                else:
+                    new_value = old_value - value
+
+                if new_value < 0:
+                    return "⚠️ 數量不能小於 0。"
+
+                target["students"] = new_value
+                changes.append(f"{class_name}：{old_value}→{new_value}本")
+
+            refresh_order_total(order)
+
+            return (
+                "✅ 已調整\n\n"
+                + "\n".join(changes)
+                + "\n\n"
+                + make_order_confirmation(order)
+            )
+
+    # 改書名
+    m = re.fullmatch(
+        r"(?:書名)?(?:改成|改為|換成|書改成)\s*(.+)",
         text
     )
 
-    if not teacher_match:
-        return "⚠️ 找不到老師姓名"
+    if m:
+        new_book = clean_book_name(m.group(1))
+        publisher = get_book_publisher(new_book)
 
-    teacher = teacher_match.group(1).strip()
+        if not publisher:
+            return (
+                "⚠️ 查不到這本書\n\n"
+                f"書名：{new_book}"
+            )
 
-    # 目前資料表測試使用天母國中。
-    school = "天母國中"
+        order["book"] = new_book
+        order["publisher"] = publisher
 
-    # 老師資料問題一律重新讀 Google，不使用訂單班級。
-    classes = get_teacher_classes(
-        school,
-        teacher
-    )
+        return make_order_confirmation(order)
+
+    return None
+
+
+# =========================================================
+# 老師資料庫
+# =========================================================
+def looks_like_teacher_lookup(text):
+    if "老師" not in text:
+        return False
+
+    if "訂單" in text or "訂書進度" in text or is_ai_writing_request(text):
+        return False
+
+    teacher, _ = extract_teacher_and_school(text)
+    if not teacher:
+        return False
+
+    words = [
+        "教幾個班", "教幾班", "教哪幾班", "教哪些班",
+        "有幾個班", "有哪些班", "哪幾班", "哪幾個班",
+        "班級資料", "班級人數", "每班幾人", "每班人數",
+        "學生人數", "總人數", "幾個學生", "多少學生"
+    ]
+
+    return any(word in text for word in words)
+
+
+def looks_like_teacher_followup(text):
+    words = [
+        "總共幾個班", "幾個班", "總人數多少", "總人數",
+        "總共幾人", "總共多少人", "每班幾人", "每班人數",
+        "班級人數", "有哪些班", "哪幾班"
+    ]
+
+    return any(word in text for word in words)
+
+
+def handle_teacher_lookup(user_id, text):
+    teacher, school = extract_teacher_and_school(text)
+    school = school or DEFAULT_SCHOOL
+
+    if not teacher:
+        return "⚠️ 找不到老師姓名。"
+
+    classes = get_teacher_classes(school, teacher)
 
     if not classes:
-
         return (
             "⚠️ 查不到老師資料\n\n"
             f"學校：{school}\n"
             f"老師：{teacher}"
         )
 
-    fresh_context = {
+    context = {
         "school": school,
         "teacher": teacher,
         "classes": copy_classes(classes)
     }
 
-    # 訂書上下文與「老師資料庫查詢上下文」分開保存。
-    conversation_context[user_id] = {
-        "school": school,
-        "teacher": teacher,
-        "classes": copy_classes(classes)
-    }
+    # 老師查詢上下文與訂書上下文都更新
+    teacher_lookup_context[user_id] = context
+    conversation_context[user_id] = context
 
-    teacher_lookup_context[user_id] = fresh_context
-
-    return make_teacher_reply(
-        school,
-        teacher,
-        classes
-    )
+    return make_teacher_reply(school, teacher, classes)
 
 
-def handle_teacher_followup(
-    user_id,
-    text
-):
-
-    context = teacher_lookup_context.get(
-        user_id
-    )
+def handle_teacher_followup(user_id):
+    context = teacher_lookup_context.get(user_id)
 
     if not context:
         return None
 
-    school = context["school"]
-    teacher = context["teacher"]
-
-    # 追問也重新讀 Google，避免使用舊快取或訂單內容。
     classes = get_teacher_classes(
-        school,
-        teacher
+        context["school"],
+        context["teacher"]
     )
 
     if not classes:
-        return (
-            "⚠️ 查不到老師資料\n\n"
-            f"學校：{school}\n"
-            f"老師：{teacher}"
-        )
+        return "⚠️ 老師資料庫暫時查詢失敗。"
 
-    teacher_lookup_context[user_id] = {
-        "school": school,
-        "teacher": teacher,
+    context = {
+        "school": context["school"],
+        "teacher": context["teacher"],
         "classes": copy_classes(classes)
     }
 
-    conversation_context[user_id] = {
-        "school": school,
-        "teacher": teacher,
-        "classes": copy_classes(classes)
-    }
+    teacher_lookup_context[user_id] = context
+    conversation_context[user_id] = context
 
     return make_teacher_reply(
-        school,
-        teacher,
-        classes
-    )
-
-def handle_form_teacher_lookup(
-    user_id,
-    user_text
-):
-
-    lines = user_text.splitlines()
-
-    school = ""
-    teacher = ""
-
-    for line in lines:
-
-        line = line.strip()
-
-        if "：" in line:
-            key, value = line.split("：", 1)
-
-        elif ":" in line:
-            key, value = line.split(":", 1)
-
-        else:
-            continue
-
-        key = key.strip()
-        value = value.strip()
-
-        if key == "學校":
-            school = value
-
-        elif key in [
-            "老師",
-            "老師姓名"
-        ]:
-            teacher = value
-
-    if not school or not teacher:
-
-        return (
-            "⚠️ 請用以下格式：\n\n"
-            "查老師\n"
-            "學校：天母國中\n"
-            "老師姓名：王老師"
-        )
-
-    classes = get_teacher_classes(
-        school,
-        teacher
-    )
-
-    if not classes:
-
-        return "⚠️ 查不到老師資料"
-
-    conversation_context[user_id] = {
-        "school": school,
-        "teacher": teacher,
-        "classes": copy_classes(classes)
-    }
-
-    teacher_lookup_context[user_id] = {
-        "school": school,
-        "teacher": teacher,
-        "classes": copy_classes(classes)
-    }
-
-    return make_teacher_reply(
-        school,
-        teacher,
+        context["school"],
+        context["teacher"],
         classes
     )
 
 
-def make_teacher_reply(
-    school,
-    teacher,
-    classes
-):
+def make_teacher_reply(school, teacher, classes):
+    total = calculate_total(classes)
 
-    total = sum(
-        int(item["students"])
+    lines = [
+        f"• {item['class_name']}班：{int(item['students'])}人"
         for item in classes
-    )
-
-    class_lines = []
-
-    for item in classes:
-
-        class_lines.append(
-            f"• {item['class_name']}班："
-            f"{int(item['students'])}人"
-        )
+    ]
 
     return (
         "👑 LeBron James 幫你重新查了 Google 老師班級資料：\n\n"
@@ -2268,1071 +1158,97 @@ def make_teacher_reply(
         f"老師：{teacher}\n\n"
         f"📚 班級總數：{len(classes)}個班\n\n"
         "各班人數：\n"
-        + "\n".join(class_lines)
+        + "\n".join(lines)
         + f"\n\n👥 總學生人數：{total}人\n\n"
         "以上是目前 Google「老師班級資料」中的完整資料。"
     )
 
 
 # =========================================================
-# 自然語句轉成既有訂書格式
-# =========================================================
-def normalize_contextual_order_request(
-    text,
-    context
-):
-
-    clean_text = text.strip()
-
-    # 原本就有「訂」開頭，直接沿用。
-    if clean_text.startswith("訂"):
-        return clean_text
-
-    known_classes = [
-        str(item["class_name"])
-        for item in context.get("classes", [])
-    ]
-
-    mentioned_classes = []
-
-    for class_name in known_classes:
-        if re.search(
-            r"(?<!\d)"
-            + re.escape(class_name)
-            + r"(?!\d)",
-            clean_text
-        ):
-            mentioned_classes.append(
-                class_name
-            )
-
-    if not mentioned_classes:
-        return None
-
-    # 常見口語／輸入法：
-    # 「定」視為「訂」，但只在班級後面出現時處理。
-    normalized = re.sub(
-        r"(?<=\d)\s*定\s*",
-        "訂",
-        clean_text,
-        count=1
-    )
-
-    # 如果句子裡本來就有「訂」，把它移到最前面，
-    # 讓既有 build_order 邏輯處理。
-    if "訂" in normalized:
-        normalized = normalized.replace(
-            "訂",
-            " ",
-            1
-        )
-
-        return "訂" + normalized.strip()
-
-    # 沒寫「訂」也允許：
-    # 701 703 國一數學講義
-    # 但至少要看起來還有書名內容，避免單純打班級就誤下單。
-    remainder = normalized
-
-    for class_name in mentioned_classes:
-        remainder = re.sub(
-            r"(?<!\d)"
-            + re.escape(class_name)
-            + r"(?!\d)",
-            " ",
-            remainder
-        )
-
-    remainder = re.sub(
-        r"[跟和與、,，/\s]+",
-        " ",
-        remainder
-    ).strip()
-
-    if not remainder:
-        return None
-
-    return "訂" + normalized
-
-
-# =========================================================
-# 延續老師訂書
-# =========================================================
-def create_order_from_context(
-    user_id,
-    text,
-    context
-):
-
-    teacher = context["teacher"]
-    school = context["school"]
-
-    all_classes = copy_classes(
-        context.get("classes", [])
-    )
-
-    if not all_classes:
-
-        all_classes = get_teacher_classes(
-            school,
-            teacher
-        )
-
-    if not all_classes:
-
-        return (
-            "⚠️ 找不到剛才的老師班級資料，"
-            "請重新查一次老師。"
-        )
-
-    order_part = text[1:].strip()
-
-    return build_order(
-        user_id,
-        teacher,
-        school,
-        order_part,
-        all_classes,
-        text
-    )
-
-
-# =========================================================
-# 完整一句話訂書
-# =========================================================
-def create_order_from_sentence(
-    user_id,
-    text
-):
-
-    teacher_match = re.search(
-        r"(.+?老師)",
-        text
-    )
-
-    if not teacher_match:
-        return "⚠️ 找不到老師姓名"
-
-    teacher = teacher_match.group(1).strip()
-
-    school = "天母國中"
-
-    order_position = text.find("訂")
-
-    if order_position == -1:
-        return "⚠️ 找不到訂購內容"
-
-    order_part = text[
-        order_position + 1:
-    ].strip()
-
-    all_classes = get_teacher_classes(
-        school,
-        teacher
-    )
-
-    if not all_classes:
-
-        return (
-            "⚠️ 查不到老師班級資料\n\n"
-            f"老師：{teacher}"
-        )
-
-    conversation_context[user_id] = {
-        "school": school,
-        "teacher": teacher,
-        "classes": copy_classes(all_classes)
-    }
-
-    return build_order(
-        user_id,
-        teacher,
-        school,
-        order_part,
-        all_classes,
-        text
-    )
-
-
-# =========================================================
-# 建立訂單
-# =========================================================
-def build_order(
-    user_id,
-    teacher,
-    school,
-    order_part,
-    all_classes,
-    original_text
-):
-
-    available_names = [
-        str(item["class_name"])
-        for item in all_classes
-    ]
-
-    selected_names = []
-
-    for class_name in available_names:
-
-        pattern = (
-            r"(?<!\d)"
-            + re.escape(class_name)
-            + r"(?!\d)"
-        )
-
-        if re.search(pattern, order_part):
-
-            selected_names.append(
-                class_name
-            )
-
-
-    # -----------------------------------------------------
-    # 有指定班級
-    # -----------------------------------------------------
-    if selected_names:
-
-        classes = []
-
-        for item in all_classes:
-
-            if str(item["class_name"]) in selected_names:
-
-                classes.append({
-                    "class_name":
-                        str(item["class_name"]),
-
-                    "students":
-                        int(item["students"])
-                })
-
-        book = order_part
-
-        for class_name in selected_names:
-
-            book = re.sub(
-                r"(?<!\d)"
-                + re.escape(class_name)
-                + r"(?!\d)",
-                "",
-                book
-            )
-
-        book = re.sub(
-            r"[、,，/]+",
-            " ",
-            book
-        )
-
-        book = re.sub(
-            r"^[跟和與]+",
-            "",
-            book
-        )
-
-        book = re.sub(
-            r"\s+",
-            " ",
-            book
-        ).strip()
-
-
-    # -----------------------------------------------------
-    # 沒指定班級
-    # -----------------------------------------------------
-    else:
-
-        classes = copy_classes(
-            all_classes
-        )
-
-        book = re.sub(
-            r"[一二三四五六七八九十\d]+個班.*$",
-            "",
-            order_part
-        ).strip()
-
-        requested_count = extract_class_count(
-            original_text
-        )
-
-        if (
-            requested_count
-            and requested_count != len(all_classes)
-        ):
-
-            class_names = "、".join(
-                available_names
-            )
-
-            return (
-                "⚠️ 需要指定班級\n\n"
-                f"{teacher}共有 "
-                f"{len(all_classes)} 個班：\n"
-                f"{class_names}\n\n"
-                f"你這次要訂 "
-                f"{requested_count} 個班。\n\n"
-                "請直接告訴我要哪幾班。"
-            )
-
-
-    book = clean_book_name(book)
-
-    if not book:
-
-        return (
-            "⚠️ 找不到書名，"
-            "請把班級和書名一起告訴我。"
-        )
-
-
-    publisher = get_book_publisher(
-        book
-    )
-
-    if not publisher:
-
-        return (
-            "⚠️ 查不到書籍資料\n\n"
-            f"書名：{book}\n\n"
-            "請先到「書籍資料」工作表"
-            "新增這本書與出版社。"
-        )
-
-
-    order = {
-        "teacher": teacher,
-        "school": school,
-        "book": book,
-        "publisher": publisher,
-        "classes": classes,
-        "quantity": calculate_total(classes)
-    }
-
-    pending_orders[user_id] = order
-
-    return make_order_confirmation(order)
-
-
-# =========================================================
-# 改班級數量
-# 701改28
-# 701少2
-# 701多1
-# =========================================================
-def adjust_pending_order(
-    user_id,
-    text
-):
-
-    order = pending_orders[user_id]
-
-    # -----------------------------------------------------
-    # 自然語句：只取消／移除某一個班級
-    # 701取消 / 取消701 / 不要701 / 701不要
-    # 移除701 / 刪掉701 / 刪除701 / 701移除
-    # 單獨「取消」仍然是取消整張訂單，由外層處理。
-    # -----------------------------------------------------
-    remove_patterns = [
-        r"^(\d{2,4})\s*(?:取消|不要|移除|刪掉|刪除|拿掉)$",
-        r"^(?:取消|不要|移除|刪掉|刪除|拿掉)\s*(\d{2,4})$"
-    ]
-
-    for pattern in remove_patterns:
-        match = re.fullmatch(pattern, text.strip())
-
-        if match:
-            class_name = match.group(1)
-
-            target = find_order_class(
-                order,
-                class_name
-            )
-
-            if not target:
-                return (
-                    f"⚠️ 目前訂單裡沒有 {class_name}。"
-                )
-
-            if len(order["classes"]) <= 1:
-                return (
-                    "⚠️ 目前只剩最後一個班級。\\n"
-                    "如果要取消整張訂單，請直接輸入「取消」。"
-                )
-
-            order["classes"] = [
-                item
-                for item in order["classes"]
-                if str(item["class_name"])
-                != str(class_name)
-            ]
-
-            refresh_order_total(order)
-
-            return make_order_confirmation(order)
-
-    pattern = re.compile(
-        r"(?<!\d)"
-        r"(\d{2,4})"
-        r"(?!\d)"
-        r"\s*"
-        r"(改成|改為|改|多|少)"
-        r"\s*"
-        r"(\d+)"
-        r"\s*"
-        r"(?:人|本)?"
-    )
-
-    matches = list(
-        pattern.finditer(text)
-    )
-
-    if not matches:
-
-        return (
-            "⚠️ 我看不懂要怎麼修改。"
-        )
-
-    changes = []
-
-    for match in matches:
-
-        class_name = match.group(1)
-        action = match.group(2)
-        value = int(match.group(3))
-
-        target = find_order_class(
-            order,
-            class_name
-        )
-
-        if not target:
-
-            return (
-                f"⚠️ {class_name} "
-                "目前不在這筆訂單裡。"
-            )
-
-        old_value = int(
-            target["students"]
-        )
-
-        if action in [
-            "改",
-            "改成",
-            "改為"
-        ]:
-            new_value = value
-
-        elif action == "多":
-            new_value = old_value + value
-
-        else:
-            new_value = old_value - value
-
-        if new_value < 0:
-
-            return (
-                "⚠️ 數量不能小於 0。"
-            )
-
-        target["students"] = new_value
-
-        changes.append(
-            f"{class_name}："
-            f"{old_value} → {new_value}本"
-        )
-
-    refresh_order_total(order)
-
-    return (
-        "✅ 已調整\n\n"
-        + "\n".join(changes)
-        + "\n\n"
-        + make_order_confirmation(order)
-    )
-
-
-# =========================================================
-# 移除班級
-# 不要705
-# =========================================================
-def remove_class_from_order(
-    user_id,
-    text
-):
-
-    order = pending_orders[user_id]
-
-    match = re.search(
-        r"(?:不要|刪除|拿掉|移除)\s*(\d{2,4})",
-        text
-    )
-
-    if not match:
-        return "⚠️ 找不到要移除的班級。"
-
-    class_name = match.group(1)
-
-    target = find_order_class(
-        order,
-        class_name
-    )
-
-    if not target:
-
-        return (
-            f"⚠️ {class_name} "
-            "目前不在這筆訂單裡。"
-        )
-
-    if len(order["classes"]) <= 1:
-
-        return (
-            "⚠️ 這是訂單最後一個班級。\n\n"
-            "如果整筆不要了，請直接說「取消」。"
-        )
-
-    order["classes"] = [
-        item
-        for item in order["classes"]
-        if str(item["class_name"]) != class_name
-    ]
-
-    refresh_order_total(order)
-
-    return (
-        f"✅ 已移除 {class_name}\n\n"
-        + make_order_confirmation(order)
-    )
-
-
-# =========================================================
-# 加入班級
-# 加703
-# =========================================================
-def add_class_to_order(
-    user_id,
-    text
-):
-
-    order = pending_orders[user_id]
-
-    match = re.search(
-        r"(?:加|加入|增加)\s*(\d{2,4})",
-        text
-    )
-
-    if not match:
-        return "⚠️ 找不到要加入的班級。"
-
-    class_name = match.group(1)
-
-    if find_order_class(order, class_name):
-
-        return (
-            f"⚠️ {class_name} "
-            "已經在這筆訂單裡了。"
-        )
-
-    context = conversation_context.get(
-        user_id
-    )
-
-    if not context:
-
-        return (
-            "⚠️ 找不到老師班級資料，"
-            "請重新查一次老師。"
-        )
-
-    source_class = None
-
-    for item in context.get(
-        "classes",
-        []
-    ):
-
-        if (
-            str(item["class_name"])
-            == class_name
-        ):
-            source_class = item
-            break
-
-    if not source_class:
-
-        return (
-            f"⚠️ {order['teacher']} "
-            f"沒有 {class_name} 這個班。"
-        )
-
-    order["classes"].append({
-        "class_name":
-            str(source_class["class_name"]),
-
-        "students":
-            int(source_class["students"])
-    })
-
-    refresh_order_total(order)
-
-    return (
-        f"✅ 已加入 {class_name}\n\n"
-        + make_order_confirmation(order)
-    )
-
-
-# =========================================================
-# 更換班級
-# 701改成703
-# =========================================================
-def replace_class_in_order(
-    user_id,
-    text
-):
-
-    order = pending_orders[user_id]
-
-    match = re.search(
-        r"(\d{2,4})\s*"
-        r"(?:改成|換成|改為)\s*"
-        r"(\d{2,4})",
-        text
-    )
-
-    if not match:
-
-        return (
-            "⚠️ 找不到要更換的班級。"
-        )
-
-    old_class = match.group(1)
-    new_class = match.group(2)
-
-    old_target = find_order_class(
-        order,
-        old_class
-    )
-
-    if not old_target:
-
-        return (
-            f"⚠️ {old_class} "
-            "目前不在這筆訂單裡。"
-        )
-
-    if find_order_class(
-        order,
-        new_class
-    ):
-
-        return (
-            f"⚠️ {new_class} "
-            "已經在這筆訂單裡。"
-        )
-
-    context = conversation_context.get(
-        user_id
-    )
-
-    if not context:
-
-        return (
-            "⚠️ 找不到老師班級資料。"
-        )
-
-    new_source = None
-
-    for item in context.get(
-        "classes",
-        []
-    ):
-
-        if (
-            str(item["class_name"])
-            == new_class
-        ):
-            new_source = item
-            break
-
-    if not new_source:
-
-        return (
-            f"⚠️ {order['teacher']} "
-            f"沒有 {new_class} 這個班。"
-        )
-
-    order["classes"] = [
-        item
-        for item in order["classes"]
-        if str(item["class_name"]) != old_class
-    ]
-
-    order["classes"].append({
-        "class_name":
-            str(new_source["class_name"]),
-
-        "students":
-            int(new_source["students"])
-    })
-
-    refresh_order_total(order)
-
-    return (
-        f"✅ 已把 {old_class} "
-        f"改成 {new_class}\n\n"
-        + make_order_confirmation(order)
-    )
-
-
-# =========================================================
-# 更換書名
-# 改成國一自然講義
-# =========================================================
-def change_book(
-    user_id,
-    text
-):
-
-    order = pending_orders[user_id]
-
-    new_book = re.sub(
-        r"^(?:書名)?(?:改成|換成|書改成)",
-        "",
-        text
-    ).strip()
-
-    new_book = clean_book_name(
-        new_book
-    )
-
-    if not new_book:
-
-        return (
-            "⚠️ 請告訴我要改成哪一本書。"
-        )
-
-    publisher = get_book_publisher(
-        new_book
-    )
-
-    if not publisher:
-
-        return (
-            "⚠️ 查不到這本書\n\n"
-            f"書名：{new_book}\n\n"
-            "請先確認「書籍資料」裡"
-            "是否已經有這本書。"
-        )
-
-    old_book = order["book"]
-
-    order["book"] = new_book
-    order["publisher"] = publisher
-
-    return (
-        "✅ 已更換書籍\n\n"
-        f"{old_book}\n"
-        f"→ {new_book}\n\n"
-        + make_order_confirmation(order)
-    )
-
-
-# =========================================================
-# 依老師查「訂書進度」
-# =========================================================
-def parse_teacher_book_order_query(text):
-
-    patterns = [
-        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書進度$",
-        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書訂單$",
-        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書紀錄$",
-        r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書進度$",
-        r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書訂單$",
-        r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書紀錄$"
-    ]
-
-    for pattern in patterns:
-        match = re.fullmatch(
-            pattern,
-            text.strip()
-        )
-
-        if match:
-            return {
-                "teacher": match.group(1).strip()
-            }
-
-    return None
-
-
-def lookup_book_orders_by_teacher(teacher):
-
-    if not GOOGLE_SCRIPT_URL:
-        return []
-
-    payload = {
-        "action": "lookup_orders_by_teacher",
-        "teacher": teacher
-    }
-
-    try:
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=payload,
-            timeout=15
-        )
-
-        print(
-            "Lookup teacher book orders response:",
-            response.status_code,
-            response.text
-        )
-
-        if response.status_code != 200:
-            return []
-
-        data = response.json()
-
-        if not data.get("success"):
-            return []
-
-        orders = data.get("orders", [])
-
-        for order in orders:
-            order["order_number"] = normalize_order_number(
-                order.get("order_number", "")
-            )
-            order["classes"] = copy_classes(
-                order.get("classes", [])
-            )
-            order["quantity"] = calculate_total(
-                order["classes"]
-            )
-
-        return orders
-
-    except Exception as error:
-        print(
-            "Lookup teacher book orders error:",
-            error
-        )
-        return []
-
-
-def make_teacher_book_orders_reply(
-    teacher,
-    orders
-):
-
-    lines = [
-        "👑 LeBron James 幫你查了「訂書進度」：📚",
-        "",
-        f"老師：{teacher}",
-        f"共找到 {len(orders)} 張訂書訂單",
-        ""
-    ]
-
-    for order in orders[:10]:
-        lines.extend([
-            f"📘 訂單 {order['order_number']}",
-            f"學校：{order.get('school', '')}",
-            f"書名：{order.get('book', '')}",
-            f"出版社：{order.get('publisher', '')}"
-        ])
-
-        for item in order.get("classes", []):
-            lines.append(
-                f"• {item['class_name']}班："
-                f"{int(item['students'])}本"
-            )
-
-        lines.extend([
-            f"總數量：{int(order.get('quantity', 0))}本",
-            f"狀態：{order.get('status', '')}",
-            (
-                f"訂購時間：{order.get('order_time', '')}"
-                if order.get("order_time")
-                else ""
-            ),
-            ""
-        ])
-
-    if len(orders) > 10:
-        lines.append(
-            f"另外還有 {len(orders) - 10} 張較舊訂單。"
-        )
-
-    lines.append(
-        "要看某一張詳細內容，可以直接說「查002」。"
-    )
-
-    return "\n".join(
-        line for line in lines
-        if line != ""
-        or True
-    )
-
-
-# =========================================================
-# 歷史訂單：辨識查詢
+# 歷史訂單
 # =========================================================
 def extract_order_lookup_number(text):
-
     patterns = [
-        r"^查\s*(\d{1,})$",
-        r"^查詢\s*(\d{1,})$",
-        r"^查\s*訂單\s*(\d{1,})$",
-        r"^查詢\s*訂單\s*(\d{1,})$",
-        r"^查訂單\s*(\d{1,})$",
-        r"^查詢訂單\s*(\d{1,})$",
-        r"^訂單\s*(\d{1,})$",
-        r"^(\d{1,})\s*訂單(?:內容)?(?:是什麼|內容是什麼|呢|？|\?)?$",
-        r"^查\s*(\d{1,})\s*訂單(?:內容)?$",
-        r"^查詢\s*(\d{1,})\s*訂單(?:內容)?$"
+        r"^查\s*(\d+)$",
+        r"^查詢\s*(\d+)$",
+        r"^查\s*訂單\s*(\d+)$",
+        r"^查詢\s*訂單\s*(\d+)$",
+        r"^查訂單\s*(\d+)$",
+        r"^訂單\s*(\d+)$",
+        r"^(\d+)\s*訂單(?:內容)?(?:是什麼|內容是什麼|呢|？|\?)?$"
     ]
 
     for pattern in patterns:
-
-        match = re.search(pattern, text)
-
-        if match:
-            return normalize_order_number(match.group(1))
+        m = re.fullmatch(pattern, text.strip())
+        if m:
+            return normalize_order_number(m.group(1))
 
     return None
 
 
-# =========================================================
-# 歷史訂單：直接指定訂單修改
-# 001的701改28本
-# =========================================================
 def parse_direct_history_adjustment(text):
+    m = re.fullmatch(r"(?:訂單)?(\d+)\s*的\s*(.+)", text.strip())
 
-    # 必須明確寫出「的」，例如：
-    # 001的705改35
-    # 訂單001的705改35
-    # 001的705改50本 701取消
-    # 這樣單獨的 705改35 不會被誤認成訂單編號。
-    match = re.search(
-        r"^(?:訂單)?(\d{1,})\s*的\s*(.+)$",
-        text
-    )
-
-    if not match:
+    if not m:
         return None
 
-    edit_text = match.group(2).strip()
-
-    if not looks_like_history_edit(edit_text):
+    if not looks_like_history_edit(m.group(2)):
         return None
 
     return {
-        "order_number": normalize_order_number(match.group(1)),
-        "edit_text": edit_text
+        "order_number": normalize_order_number(m.group(1)),
+        "edit_text": m.group(2).strip()
     }
 
 
-# =========================================================
-# 歷史訂單：判斷是否像修改指令
-# 支援：
-# 705改50
-# 701取消
-# 705改50本 701取消
-# =========================================================
 def looks_like_history_edit(text):
-
-    has_quantity_edit = re.search(
-        r"\d{2,4}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
+    quantity = re.search(
+        r"\d{3}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
         text
     )
 
-    has_remove_edit = re.search(
-        r"\d{2,4}\s*(?:取消|不要|移除|刪除|拿掉)",
+    remove = re.search(
+        r"\d{3}\s*(?:取消|不要|移除|刪除|拿掉)",
         text
     )
 
-    return bool(
-        has_quantity_edit
-        or has_remove_edit
-    )
+    return bool(quantity or remove)
 
 
-# =========================================================
-# 歷史訂單：準備修改，但先不寫 Google
-# =========================================================
-def prepare_history_adjustment(
-    user_id,
-    original_order,
-    text
-):
-
+def prepare_history_adjustment(user_id, original_order, text):
     order = copy_order(original_order)
+    changes = []
 
-    quantity_pattern = re.compile(
-        r"(?<!\d)"
-        r"(\d{2,4})"
-        r"(?!\d)"
-        r"\s*"
-        r"(改成|改為|改|多|少)"
-        r"\s*"
-        r"(\d+)"
-        r"\s*"
-        r"(?:人|本)?"
-    )
+    quantity_matches = list(re.finditer(
+        r"(?<!\d)(\d{3})(?!\d)\s*"
+        r"(改成|改為|改|多|少)\s*"
+        r"(\d+)\s*(?:人|本)?",
+        text
+    ))
 
-    remove_pattern = re.compile(
-        r"(?<!\d)"
-        r"(\d{2,4})"
-        r"(?!\d)"
-        r"\s*"
-        r"(取消|不要|移除|刪除|拿掉)"
-    )
-
-    quantity_matches = list(
-        quantity_pattern.finditer(text)
-    )
-
-    remove_matches = list(
-        remove_pattern.finditer(text)
-    )
+    remove_matches = list(re.finditer(
+        r"(?<!\d)(\d{3})(?!\d)\s*"
+        r"(?:取消|不要|移除|刪除|拿掉)",
+        text
+    ))
 
     if not quantity_matches and not remove_matches:
         return "⚠️ 我看不懂要修改哪個班級。"
 
-    changes = []
-
-    # -----------------------------------------------------
-    # 先處理數量修改
-    # -----------------------------------------------------
     for match in quantity_matches:
-
-        class_name = match.group(1)
-        action = match.group(2)
-        value = int(match.group(3))
-
-        target = find_order_class(
-            order,
-            class_name
-        )
+        class_name, action, raw_value = match.groups()
+        target = find_order_class(order, class_name)
 
         if not target:
-            return (
-                f"⚠️ 訂單 {order['order_number']} "
-                f"裡沒有 {class_name}。"
-            )
+            return f"⚠️ 訂單 {order['order_number']} 裡沒有 {class_name}。"
 
-        old_value = int(
-            target["students"]
-        )
+        old_value = int(target["students"])
+        value = int(raw_value)
 
         if action in ["改", "改成", "改為"]:
             new_value = value
-
         elif action == "多":
             new_value = old_value + value
-
         else:
             new_value = old_value - value
 
@@ -3340,48 +1256,24 @@ def prepare_history_adjustment(
             return "⚠️ 數量不能小於 0。"
 
         target["students"] = new_value
+        changes.append(f"{class_name}：{old_value}→{new_value}本")
 
-        changes.append(
-            f"{class_name}：{old_value}→{new_value}本"
-        )
-
-    # -----------------------------------------------------
-    # 再處理取消／移除班級
-    # -----------------------------------------------------
     for match in remove_matches:
-
         class_name = match.group(1)
-
-        target = find_order_class(
-            order,
-            class_name
-        )
+        target = find_order_class(order, class_name)
 
         if not target:
-            return (
-                f"⚠️ 訂單 {order['order_number']} "
-                f"裡沒有 {class_name}。"
-            )
+            return f"⚠️ 訂單 {order['order_number']} 裡沒有 {class_name}。"
 
         if len(order["classes"]) <= 1:
-            return (
-                "⚠️ 不能取消這張訂單最後一個班級。"
-            )
+            return "⚠️ 不能取消這張訂單最後一個班級。"
 
-        old_value = int(
-            target["students"]
-        )
-
+        old_value = int(target["students"])
         order["classes"] = [
-            item
-            for item in order["classes"]
-            if str(item["class_name"])
-            != str(class_name)
+            item for item in order["classes"]
+            if str(item["class_name"]) != class_name
         ]
-
-        changes.append(
-            f"{class_name}：{old_value}本→取消"
-        )
+        changes.append(f"{class_name}：{old_value}本→取消")
 
     refresh_order_total(order)
 
@@ -3399,23 +1291,40 @@ def prepare_history_adjustment(
     )
 
 
-# =========================================================
-# 歷史訂單：修改確認畫面
-# =========================================================
-def make_history_update_confirmation(
-    original_order,
-    new_order,
-    changes
-):
+def confirm_history_update(user_id):
+    update_data = pending_history_updates.get(user_id)
 
-    class_lines = []
+    if not update_data:
+        return "⚠️ 找不到等待確認的歷史訂單修改。"
 
-    for item in new_order["classes"]:
+    success, _ = update_google_order(
+        update_data["order"],
+        update_data["modification_text"]
+    )
 
-        class_lines.append(
-            f"{item['class_name']}："
-            f"{item['students']}本"
-        )
+    if not success:
+        return "❌ 歷史訂單修改失敗，Google 原訂單沒有變動。"
+
+    order_number = update_data["order"]["order_number"]
+    refreshed = lookup_google_order(order_number)
+
+    if refreshed:
+        historical_order_context[user_id] = refreshed
+
+    pending_history_updates.pop(user_id, None)
+
+    return (
+        "✅ 訂單修改完成\n\n"
+        f"訂單編號：{order_number}\n"
+        "Google 試算表已更新。"
+    )
+
+
+def make_history_update_confirmation(original_order, new_order, changes):
+    lines = [
+        f"{item['class_name']}：{int(item['students'])}本"
+        for item in new_order.get("classes", [])
+    ]
 
     return (
         "🔄 訂單修改確認\n\n"
@@ -3425,7 +1334,7 @@ def make_history_update_confirmation(
         "修改內容：\n"
         + "\n".join(changes)
         + "\n\n修改後：\n"
-        + "\n".join(class_lines)
+        + "\n".join(lines)
         + f"\n\n原總數：{original_order['quantity']}本"
         + f"\n新總數：{new_order['quantity']}本\n\n"
         "如果正確，請回覆「確認」或「確認修改」\n"
@@ -3433,29 +1342,21 @@ def make_history_update_confirmation(
     )
 
 
-# =========================================================
-# 歷史訂單：顯示查詢結果
-# =========================================================
 def make_historical_order_reply(order):
-
-    class_lines = []
-
-    for item in order.get("classes", []):
-
-        class_lines.append(
-            f"{item['class_name']}："
-            f"{item['students']}本"
-        )
+    lines = [
+        f"{item['class_name']}：{int(item['students'])}本"
+        for item in order.get("classes", [])
+    ]
 
     message = (
         "📋 歷史訂單\n\n"
         f"訂單編號：{order['order_number']}\n"
-        f"老師：{order['teacher']}\n"
-        f"學校：{order['school']}\n"
-        f"書名：{order['book']}\n"
-        f"出版社：{order['publisher']}\n\n"
-        + "\n".join(class_lines)
-        + f"\n\n總數量：{order['quantity']}本\n"
+        f"老師：{order.get('teacher', '')}\n"
+        f"學校：{order.get('school', '')}\n"
+        f"書名：{order.get('book', '')}\n"
+        f"出版社：{order.get('publisher', '')}\n\n"
+        + "\n".join(lines)
+        + f"\n\n總數量：{int(order.get('quantity', 0))}本\n"
         + f"狀態：{order.get('status', '')}"
     )
 
@@ -3468,186 +1369,952 @@ def make_historical_order_reply(order):
     if order.get("modification_log"):
         message += f"\n修改紀錄：{order['modification_log']}"
 
-    message += (
-        "\n\n如果要調整，可以直接說：\n"
-        "701改28本"
-    )
+    message += "\n\n如果要調整，可以直接說：\n701改28本"
 
     return message
 
 
-# =========================================================
-# 歷史訂單：從 Google 查詢
-# =========================================================
-def lookup_google_order(order_number):
+def parse_teacher_book_order_query(text):
+    patterns = [
+        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書進度$",
+        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書訂單$",
+        r"^(?:查|查詢)\s*([\u4e00-\u9fff]{1,4}老師)\s*訂書紀錄$",
+        r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書進度$",
+        r"^([\u4e00-\u9fff]{1,4}老師)\s*訂書紀錄$"
+    ]
 
-    if not GOOGLE_SCRIPT_URL:
+    for pattern in patterns:
+        m = re.fullmatch(pattern, text.strip())
+        if m:
+            return {"teacher": m.group(1)}
+
+    return None
+
+
+def make_teacher_book_orders_reply(teacher, orders):
+    lines = [
+        "👑 LeBron James 幫你查了「訂書進度」：📚",
+        "",
+        f"老師：{teacher}",
+        f"共找到 {len(orders)} 張訂書訂單",
+        ""
+    ]
+
+    for order in orders[:10]:
+        lines.extend([
+            f"📘 訂單 {order.get('order_number', '')}",
+            f"學校：{order.get('school', '')}",
+            f"書名：{order.get('book', '')}",
+            f"出版社：{order.get('publisher', '')}"
+        ])
+
+        for item in order.get("classes", []):
+            lines.append(
+                f"• {item['class_name']}班：{int(item['students'])}本"
+            )
+
+        lines.extend([
+            f"總數量：{int(order.get('quantity', 0))}本",
+            f"狀態：{order.get('status', '')}",
+            ""
+        ])
+
+    lines.append("要看某一張詳細內容，可以直接說「查002」。")
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# 學校學生資料
+# =========================================================
+def parse_school_stats_query(user_id, text):
+    clean = text.strip()
+
+    query_words = [
+        "多少人", "幾人", "幾個人", "學生人數", "總人數",
+        "幾個班", "多少班", "有哪些班", "哪幾班", "哪幾個班"
+    ]
+
+    if not any(word in clean for word in query_words):
         return None
 
-    data = {
-        "action": "lookup_order",
-        "order_number": normalize_order_number(order_number)
+    # 有老師的句子交給老師資料庫
+    if "老師" in clean:
+        return None
+
+    school = extract_school_name(clean) or get_context_school(user_id)
+    if not school:
+        return None
+
+    class_match = re.search(r"(?<!\d)([789]\d{2})(?!\d)", clean)
+    class_name = class_match.group(1) if class_match else ""
+
+    grade = extract_grade_text(clean)
+
+    intent = "summary"
+
+    if any(word in clean for word in ["有哪些班", "哪幾班", "哪幾個班"]):
+        intent = "classes"
+    elif any(word in clean for word in ["幾個班", "多少班"]):
+        intent = "class_count"
+    elif any(word in clean for word in ["多少人", "幾人", "幾個人", "學生人數", "總人數"]):
+        intent = "students"
+
+    return {
+        "school": school,
+        "grade": grade,
+        "class_name": class_name,
+        "intent": intent
     }
 
-    # Google Apps Script 偶爾會短暫逾時或回傳異常。
-    # 查詢採最多 3 次短重試，避免把暫時性錯誤誤報成「查不到訂單」。
-    for attempt in range(3):
+
+def handle_school_stats_query(query):
+    result = lookup_school_classes(
+        query["school"],
+        query.get("grade", ""),
+        query.get("class_name", "")
+    )
+
+    if result is None:
+        return "⚠️ 學校資料庫暫時查詢失敗，請稍後再試。"
+
+    classes = result["classes"]
+
+    if not classes:
+        return "⚠️ 查不到學生資料。"
+
+    if query.get("class_name"):
+        item = classes[0]
+        return (
+            "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
+            "🏫 班級資料\n"
+            f"學校：{query['school']}\n"
+            f"班級：{item['class_name']}班\n"
+            f"學生人數：{item['students']}人"
+        )
+
+    title = query["school"]
+    if query.get("grade"):
+        title += f" {query['grade']}"
+
+    class_lines = [
+        f"• {item['class_name']}班：{item['students']}人"
+        for item in classes
+    ]
+
+    return (
+        "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
+        f"🏫 {title}\n"
+        f"班級總數：{result['class_count']}個班\n"
+        f"學生總人數：{result['total_students']}人\n\n"
+        "各班人數：\n"
+        + "\n".join(class_lines)
+    )
+
+
+# =========================================================
+# 教科書版本
+# =========================================================
+def parse_school_version_query(user_id, text):
+    clean = text.strip()
+
+    if not any(
+        word in clean
+        for word in ["版本", "哪一版", "哪個版本", "什麼版本", "教科書"]
+    ):
+        return None
+
+    school = extract_school_name(clean) or get_context_school(user_id)
+    if not school:
+        return None
+
+    grade = extract_grade_text(clean)
+
+    subjects = [
+        "國文", "英文", "數學", "自然", "生物", "理化",
+        "地科", "社會", "歷史", "地理", "公民"
+    ]
+
+    subject = next((s for s in subjects if s in clean), "")
+
+    period_match = re.search(
+        r"(?<!\d)(\d{2,3}\s*(?:上|下))(?!\d)",
+        clean
+    )
+
+    academic_period = ""
+    if period_match:
+        academic_period = re.sub(r"\s+", "", period_match.group(1))
+
+    return {
+        "school": school,
+        "grade": grade,
+        "subject": subject,
+        "academic_period": academic_period
+    }
+
+
+def handle_school_version_query(query):
+    result = lookup_school_versions(
+        query["school"],
+        query.get("grade", ""),
+        query.get("subject", ""),
+        query.get("academic_period", "")
+    )
+
+    if result is None:
+        return "⚠️ 教科書版本資料庫暫時查詢失敗，請稍後再試。"
+
+    versions = result["versions"]
+
+    if not versions:
+        return "⚠️ 查不到教科書版本資料。"
+
+    if len(versions) == 1:
+        item = versions[0]
+        return (
+            "👑 LeBron James 幫你查了 Google 教科書版本資料：\n\n"
+            "📚 教科書版本\n"
+            f"學校：{item['school']}\n"
+            f"年級：{item['grade']}\n"
+            f"科目：{item['subject']}\n"
+            f"版本：{item['version']}"
+            + (
+                f"\n學年度：{item['academic_period']}"
+                if item.get("academic_period") else ""
+            )
+        )
+
+    lines = []
+    for item in versions:
+        prefix = ""
+        if not query.get("grade") and item.get("grade"):
+            prefix = f"{item['grade']} "
+        lines.append(f"• {prefix}{item['subject']}：{item['version']}")
+
+    return (
+        "👑 LeBron James 幫你查了 Google 教科書版本資料：\n\n"
+        f"📚 {query['school']}"
+        + (f" {query['grade']}" if query.get("grade") else "")
+        + "\n\n"
+        + "\n".join(lines)
+    )
+
+
+def extract_school_name(text):
+    m = re.search(
+        r"([\u4e00-\u9fff]{2,16}(?:國中|高中|國小))",
+        text
+    )
+    return m.group(1).strip() if m else ""
+
+
+def extract_grade_text(text):
+    grade_map = {
+        "七年級": "七年級",
+        "八年級": "八年級",
+        "九年級": "九年級",
+        "國一": "七年級",
+        "國二": "八年級",
+        "國三": "九年級",
+        "7年級": "七年級",
+        "8年級": "八年級",
+        "9年級": "九年級"
+    }
+
+    for key, value in grade_map.items():
+        if key in text:
+            return value
+
+    return ""
+
+
+def get_context_school(user_id):
+    for source in [
+        teacher_lookup_context.get(user_id, {}),
+        conversation_context.get(user_id, {})
+    ]:
+        if source.get("school"):
+            return source["school"]
+
+    return ""
+
+
+# =========================================================
+# 其他訂單
+# =========================================================
+def parse_other_order(user_id, text):
+    clean = text.strip()
+
+    m = re.fullmatch(
+        r"(.+?(?:國中|高中|國小))"
+        r"([\u4e00-\u9fff]{1,4})老師"
+        r"\s*(?:買|購買|要買)\s*(.+)",
+        clean
+    )
+
+    if m:
+        school = m.group(1).strip()
+        teacher = m.group(2).strip() + "老師"
+        item = m.group(3).strip()
+    else:
+        m = re.fullmatch(
+            r"([\u4e00-\u9fff]{1,4})老師"
+            r"\s*(?:買|購買|要買)\s*(.+)",
+            clean
+        )
+
+        if not m:
+            return None
+
+        teacher = m.group(1).strip() + "老師"
+        item = m.group(2).strip()
+
+        context = teacher_lookup_context.get(user_id) or conversation_context.get(user_id, {})
+        if context.get("teacher") != teacher:
+            return None
+
+        school = context.get("school", "")
+
+    if not school:
+        return None
+
+    # 確認老師存在
+    if not get_teacher_classes(school, teacher):
+        return None
+
+    return {
+        "school": school,
+        "teacher": teacher,
+        "item": item
+    }
+
+
+def make_other_order_confirmation(order):
+    return (
+        "🧾 其他訂單確認\n\n"
+        f"學校：{order['school']}\n"
+        f"老師：{order['teacher']}\n"
+        f"項目：{order['item']}\n"
+        "進度：（空白）\n"
+        "備註：（空白）\n\n"
+        "如果正確，請回覆「確認」\n"
+        "不要這筆請回覆「取消」"
+    )
+
+
+def confirm_other_order(user_id):
+    order = pending_other_orders.get(user_id)
+
+    if not order:
+        return "⚠️ 找不到等待確認的其他訂單。"
+
+    success, result = write_other_order_to_google_sheet(order)
+
+    if not success:
+        return "❌ 其他訂單寫入失敗，請稍後再試。"
+
+    pending_other_orders.pop(user_id, None)
+
+    return (
+        "✅ 已寫入 Google「其他訂單」\n\n"
+        f"學校：{order['school']}\n"
+        f"老師：{order['teacher']}\n"
+        f"項目：{order['item']}"
+    )
+
+
+def parse_other_order_query(text):
+    patterns = [
+        r"^(?:查|查詢)?\s*([\u4e00-\u9fff]{1,4}老師)\s*其他訂單$",
+        r"^(?:查|查詢)\s*其他訂單\s*([\u4e00-\u9fff]{1,4}老師)$"
+    ]
+
+    for pattern in patterns:
+        m = re.fullmatch(pattern, text.strip())
+        if m:
+            return {
+                "teacher": m.group(1).strip(),
+                "item_keyword": ""
+            }
+
+    return None
+
+
+def parse_other_order_update(user_id, text):
+    clean = text.strip()
+
+    m = re.fullmatch(
+        r"(?:其他訂單|其他單)\s*#?\s*(\d+)\s*"
+        r"(進度|備註)\s*(?:改成|改為|改|設成|設為)\s*(.+)",
+        clean
+    )
+
+    if m:
+        return {
+            "row_number": int(m.group(1)),
+            "field": "progress" if m.group(2) == "進度" else "note",
+            "value": m.group(3).strip()
+        }
+
+    m = re.fullmatch(
+        r"(進度|備註)\s*(?:改成|改為|改|設成|設為)\s*(.+)",
+        clean
+    )
+
+    if m and user_id in other_order_context:
+        return {
+            "use_context": True,
+            "field": "progress" if m.group(1) == "進度" else "note",
+            "value": m.group(2).strip()
+        }
+
+    return None
+
+
+def resolve_other_order_target(user_id, update_data):
+    if update_data.get("use_context"):
+        return other_order_context.get(user_id)
+
+    if update_data.get("row_number"):
+        orders = lookup_other_orders(row_number=update_data["row_number"])
+        return orders[0] if orders else None
+
+    return None
+
+
+def make_other_order_update_confirmation(target, field, value):
+    field_name = "進度" if field == "progress" else "備註"
+
+    return (
+        "🔄 其他訂單修改確認\n\n"
+        f"其他訂單 #{target['row_number']}\n"
+        f"老師：{target.get('teacher', '')}\n"
+        f"項目：{target.get('item', '')}\n"
+        f"{field_name}改成：{value}\n\n"
+        "正確請回覆「確認」\n"
+        "取消請回覆「取消修改」"
+    )
+
+
+def confirm_other_order_update(user_id):
+    update_data = pending_other_updates.get(user_id)
+
+    success, _ = update_other_order_in_google_sheet(
+        update_data["row_number"],
+        update_data["field"],
+        update_data["value"]
+    )
+
+    if not success:
+        return "❌ 其他訂單修改失敗，Google 資料沒有變動。"
+
+    pending_other_updates.pop(user_id, None)
+
+    return (
+        "✅ 其他訂單已更新\n\n"
+        f"其他訂單 #{update_data['row_number']}"
+    )
+
+
+def make_other_orders_reply(orders):
+    lines = ["📦 其他訂單", ""]
+
+    for item in orders[:10]:
+        lines.extend([
+            f"#{item.get('row_number', '')} {item.get('teacher', '')}",
+            f"項目：{item.get('item', '')}",
+            f"進度：{item.get('progress', '')}",
+            f"備註：{item.get('note', '')}",
+            ""
+        ])
+
+    return "\n".join(lines)
+
+
+# =========================================================
+# AI 寫作／一般問答
+# =========================================================
+def is_ai_writing_request(text):
+    words = [
+        "幫我寫", "幫我整理", "幫我修飾", "幫我回覆",
+        "幫我回報", "寫一段", "寫訊息", "回報老師",
+        "傳給老師", "給老師一段", "草擬"
+    ]
+    return any(word in text for word in words)
+
+
+def extract_referenced_order_number(text):
+    m = re.search(r"(?:訂單)?\s*(\d{3})", text)
+    return normalize_order_number(m.group(1)) if m else None
+
+
+def ask_ai_with_order(user_id, user_text, order):
+    class_lines = [
+        f"{item['class_name']}班：{int(item['students'])}本"
+        for item in order.get("classes", [])
+    ]
+
+    context = (
+        "以下是 Google 試算表查到的真實訂單資料：\n"
+        f"訂單編號：{order.get('order_number', '')}\n"
+        f"老師：{order.get('teacher', '')}\n"
+        f"學校：{order.get('school', '')}\n"
+        f"書名：{order.get('book', '')}\n"
+        f"出版社：{order.get('publisher', '')}\n"
+        + "\n".join(class_lines)
+        + f"\n總數量：{order.get('quantity', 0)}本\n"
+        f"狀態：{order.get('status', '')}"
+    )
+
+    return ask_ai(
+        user_id,
+        user_text,
+        extra_context=context
+    )
+
+
+def ask_ai(user_id, user_text, extra_context=""):
+    if not OPENAI_API_KEY:
+        print("OpenAI API key missing")
+        return AI_FALLBACK_MESSAGE
+
+    history = ai_conversation_context.get(user_id, [])
+    recent = history[-8:]
+
+    conversation_text = ""
+
+    for item in recent:
+        role_name = "使用者" if item["role"] == "user" else "助理"
+        conversation_text += f"{role_name}：{item['text']}\n"
+
+    if extra_context:
+        conversation_text += (
+            "\n【系統提供的真實資料】\n"
+            + extra_context
+            + "\n【資料結束】\n"
+        )
+
+    conversation_text += f"使用者：{user_text}\n助理："
+
+    instructions = (
+        "你是『大漢訂書小幫手』，使用者是公司內部工作人員，不是老師本人。"
+        "請用繁體中文，口吻自然、簡潔、實用。"
+        "不要把使用者說的『我』推論成王老師或任何老師。"
+        "只有使用者明確說出『X老師』時，才能把該名稱視為老師。"
+        "訂單建立、修改、查詢由外層固定程式處理；"
+        "你不能聲稱自己已修改 Google 或已完成訂單。"
+        "若系統提供真實訂單資料，可以引用資料幫使用者寫 LINE 訊息。"
+        "不要捏造班級、數量、書名、出版社、到貨或出貨進度。"
+        "若是在寫給老師的訊息，直接給可複製貼上的成品。"
+        "回答適合直接顯示在 LINE，不使用 Markdown 表格。"
+    )
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "instructions": instructions,
+        "input": conversation_text,
+        "max_output_tokens": 600
+    }
+
+    headers = {
+        "Authorization": "Bearer " + OPENAI_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/responses",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+        print("OpenAI status:", response.status_code)
+
+        if response.status_code != 200:
+            print("OpenAI error:", response.text)
+            return AI_FALLBACK_MESSAGE
+
+        answer = extract_openai_text(response.json())
+
+        if not answer:
+            return AI_FALLBACK_MESSAGE
+
+        answer = answer.strip()[:4500]
+
+        history.append({"role": "user", "text": user_text})
+        history.append({"role": "assistant", "text": answer})
+        ai_conversation_context[user_id] = history[-10:]
+
+        return answer
+
+    except Exception as error:
+        print("OpenAI request error:", error)
+        return AI_FALLBACK_MESSAGE
+
+
+def extract_openai_text(data):
+    texts = []
+
+    for item in data.get("output", []):
+        for content in item.get("content", []):
+            if (
+                content.get("type") == "output_text"
+                and content.get("text")
+            ):
+                texts.append(content["text"])
+
+    if texts:
+        return "\n".join(texts)
+
+    if data.get("output_text"):
+        return str(data["output_text"])
+
+    return ""
+
+
+# =========================================================
+# Google Apps Script 共用
+# =========================================================
+def google_post(payload, timeout=15, retries=1):
+    if not GOOGLE_SCRIPT_URL:
+        print("GOOGLE_SCRIPT_URL missing")
+        return None
+
+    for attempt in range(retries):
         try:
             response = requests.post(
                 GOOGLE_SCRIPT_URL,
-                json=data,
-                timeout=15
+                json=payload,
+                timeout=timeout
             )
 
             print(
-                "Lookup order status:",
+                "Google action:",
+                payload.get("action"),
+                "status:",
                 response.status_code,
-                "attempt:",
-                attempt + 1
+                "response:",
+                response.text[:1000]
             )
-            print("Lookup order response:", response.text)
 
             if response.status_code != 200:
-                if attempt < 2:
-                    time.sleep(0.35 * (attempt + 1))
+                if attempt < retries - 1:
+                    time.sleep(0.4 * (attempt + 1))
                     continue
                 return None
 
-            try:
-                result = response.json()
-            except Exception as json_error:
-                print("Lookup order JSON error:", json_error)
-                if attempt < 2:
-                    time.sleep(0.35 * (attempt + 1))
-                    continue
-                return None
-
-            if not result.get("success"):
-                print("Lookup order error:", result)
-                if attempt < 2:
-                    time.sleep(0.35 * (attempt + 1))
-                    continue
-                return None
-
-            if not result.get("found"):
-                # 偶發情況下 Google 端第一次會回 found=false，
-                # 再查一次卻能找到，因此也允許短暫重試。
-                if attempt < 2:
-                    time.sleep(0.35 * (attempt + 1))
-                    continue
-                return None
-
-            order = result.get("order", {})
-
-            order["order_number"] = normalize_order_number(
-                order.get("order_number", order_number)
-            )
-
-            order["classes"] = copy_classes(
-                order.get("classes", [])
-            )
-
-            order["quantity"] = calculate_total(
-                order["classes"]
-            )
-
-            return order
+            return response.json()
 
         except Exception as error:
             print(
-                "Lookup order error:",
-                error,
-                "attempt:",
-                attempt + 1
+                "Google request error:",
+                payload.get("action"),
+                error
             )
-            if attempt < 2:
-                time.sleep(0.35 * (attempt + 1))
+
+            if attempt < retries - 1:
+                time.sleep(0.4 * (attempt + 1))
                 continue
+
             return None
 
     return None
 
 
-# =========================================================
-# 歷史訂單：正式更新 Google
-# =========================================================
-def update_google_order(
-    order,
-    modification_text
-):
+def get_teacher_classes(school, teacher):
+    result = google_post({
+        "action": "lookup_teacher",
+        "school": school,
+        "teacher": teacher
+    })
 
-    if not GOOGLE_SCRIPT_URL:
-        return False, None
+    if not result:
+        return None
 
-    data = {
+    classes = []
+
+    for item in result.get("classes", []):
+        try:
+            classes.append({
+                "class_name": str(item.get("class_name", "")),
+                "students": int(item.get("students", 0) or 0)
+            })
+        except Exception:
+            continue
+
+    return classes
+
+
+def get_book_publisher(book):
+    result = google_post({
+        "action": "lookup_book",
+        "book": book
+    })
+
+    if result and result.get("found"):
+        return str(result.get("publisher", ""))
+
+    return None
+
+
+def write_to_google_sheet(order):
+    result = google_post({
+        "action": "create_order",
+        "teacher": order["teacher"],
+        "school": order["school"],
+        "book": order["book"],
+        "publisher": order["publisher"],
+        "classes": order.get("classes", [])
+    })
+
+    if result and result.get("success") is True:
+        return True, result.get("order_number")
+
+    return False, None
+
+
+def lookup_google_order(order_number):
+    result = google_post({
+        "action": "lookup_order",
+        "order_number": normalize_order_number(order_number)
+    }, retries=3)
+
+    if not result or not result.get("success") or not result.get("found"):
+        return None
+
+    order = result.get("order", {})
+    order["order_number"] = normalize_order_number(
+        order.get("order_number", order_number)
+    )
+    order["classes"] = copy_classes(order.get("classes", []))
+    order["quantity"] = calculate_total(order["classes"])
+
+    return order
+
+
+def update_google_order(order, modification_text):
+    result = google_post({
         "action": "update_order",
         "order_number": order["order_number"],
         "book": order["book"],
         "publisher": order["publisher"],
         "classes": order.get("classes", []),
         "modification_text": modification_text
+    })
+
+    if result and result.get("success") is True:
+        return True, result
+
+    # 最後重新讀 Google，防止 Apps Script 寫入成功但回傳逾時
+    time.sleep(0.4)
+    verified = lookup_google_order(order["order_number"])
+
+    if verified and orders_have_same_core_data(verified, order):
+        return True, {"success": True, "verified_after_write": True}
+
+    return False, result
+
+
+def lookup_book_orders_by_teacher(teacher):
+    result = google_post({
+        "action": "lookup_orders_by_teacher",
+        "teacher": teacher
+    })
+
+    if not result or not result.get("success"):
+        return []
+
+    orders = result.get("orders", [])
+
+    for order in orders:
+        order["order_number"] = normalize_order_number(
+            order.get("order_number", "")
+        )
+        order["classes"] = copy_classes(order.get("classes", []))
+        order["quantity"] = calculate_total(order["classes"])
+
+    return orders
+
+
+def lookup_school_classes(school, grade="", class_name=""):
+    result = google_post({
+        "action": "lookup_school_classes",
+        "school": school,
+        "grade": grade,
+        "class_name": class_name
+    }, timeout=20, retries=3)
+
+    if not result or not result.get("success"):
+        return None
+
+    classes = []
+
+    for item in result.get("classes", []):
+        classes.append({
+            "school": str(item.get("school", school)),
+            "class_name": str(item.get("class_name", "")),
+            "students": int(item.get("students", 0) or 0)
+        })
+
+    return {
+        "classes": classes,
+        "class_count": int(result.get("class_count", len(classes)) or 0),
+        "total_students": int(
+            result.get(
+                "total_students",
+                sum(item["students"] for item in classes)
+            ) or 0
+        )
     }
 
-    try:
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=data,
-            timeout=15
-        )
 
-        print("Update order status:", response.status_code)
-        print("Update order response:", response.text)
+def lookup_school_versions(
+    school,
+    grade="",
+    subject="",
+    academic_period=""
+):
+    result = google_post({
+        "action": "lookup_versions",
+        "school": school,
+        "grade": grade,
+        "subject": subject,
+        "academic_period": academic_period
+    }, timeout=20, retries=3)
 
-        result = {}
+    if not result or not result.get("success"):
+        return None
+
+    versions = []
+
+    for item in result.get("versions", []):
+        versions.append({
+            "school": str(item.get("school", school)),
+            "grade": str(item.get("grade", "")),
+            "subject": str(item.get("subject", "")),
+            "version": str(item.get("version", "")),
+            "academic_period": str(item.get("academic_period", ""))
+        })
+
+    return {
+        "latest_period": str(result.get("latest_period", "")),
+        "versions": versions
+    }
+
+
+def write_other_order_to_google_sheet(order):
+    result = google_post({
+        "action": "create_other_order",
+        "school": order["school"],
+        "teacher": order["teacher"],
+        "item": order["item"]
+    })
+
+    return bool(result and result.get("success")), result or {}
+
+
+def lookup_other_orders(
+    teacher="",
+    item_keyword="",
+    row_number=None
+):
+    payload = {
+        "action": "lookup_other_orders",
+        "teacher": teacher,
+        "item_keyword": item_keyword
+    }
+
+    if row_number is not None:
+        payload["row_number"] = row_number
+
+    result = google_post(payload)
+
+    if not result or not result.get("success"):
+        return []
+
+    return result.get("orders", [])
+
+
+def update_other_order_in_google_sheet(row_number, field, value):
+    result = google_post({
+        "action": "update_other_order",
+        "row_number": row_number,
+        "field": field,
+        "value": value
+    })
+
+    return bool(result and result.get("success")), result
+
+
+# =========================================================
+# 小工具
+# =========================================================
+def normalize_text(text):
+    return str(text or "").replace("　", " ").strip()
+
+
+def normalize_order_number(value):
+    digits = re.sub(r"\D", "", str(value or ""))
+
+    if not digits:
+        return ""
+
+    return str(int(digits)).zfill(3)
+
+
+def clean_book_name(book):
+    book = str(book or "").strip()
+
+    book = re.sub(r"^[、,，。:：\s]+", "", book)
+    book = re.sub(r"^[跟和與]+", "", book)
+    book = re.sub(r"[、,，。:：\s]+$", "", book)
+
+    return book.strip()
+
+
+def copy_classes(classes):
+    result = []
+
+    for item in classes or []:
         try:
-            result = response.json()
-        except Exception as json_error:
-            print("Update order JSON error:", json_error)
+            result.append({
+                "class_name": str(item.get("class_name", "")),
+                "students": int(item.get("students", 0) or 0)
+            })
+        except Exception:
+            continue
 
-        if (
-            response.status_code == 200
-            and result.get("success") is True
-        ):
-            return True, result
+    return result
 
-        # 有些情況 Google 已經完成修改，但 Apps Script 最後回傳異常，
-        # 會造成 LINE 誤判「修改失敗」。因此在回報失敗前，
-        # 重新讀一次 Google，以實際資料是否已更新為最後判斷。
-        time.sleep(0.4)
-        verified = lookup_google_order(order["order_number"])
 
-        if verified and orders_have_same_core_data(verified, order):
-            print(
-                "Update order verified from Google despite response issue:",
-                order["order_number"]
-            )
-            if not isinstance(result, dict):
-                result = {}
-            result["success"] = True
-            result["verified_after_write"] = True
-            return True, result
+def calculate_total(classes):
+    return sum(
+        int(item.get("students", 0) or 0)
+        for item in classes or []
+    )
 
-        return False, result
 
-    except Exception as error:
-        print("Update order error:", error)
+def refresh_order_total(order):
+    order["quantity"] = calculate_total(order.get("classes", []))
 
-        # 即使 request 端看到例外，也可能是 Google 寫入後回應逾時。
-        # 最後再查一次真實資料，避免成功卻向使用者報失敗。
-        time.sleep(0.4)
-        verified = lookup_google_order(order["order_number"])
 
-        if verified and orders_have_same_core_data(verified, order):
-            return True, {
-                "success": True,
-                "verified_after_exception": True
-            }
+def find_order_class(order, class_name):
+    for item in order.get("classes", []):
+        if str(item.get("class_name")) == str(class_name):
+            return item
+    return None
 
-        return False, None
+
+def copy_order(order):
+    result = dict(order)
+    result["classes"] = copy_classes(order.get("classes", []))
+    result["quantity"] = calculate_total(result["classes"])
+    return result
 
 
 def orders_have_same_core_data(actual_order, expected_order):
-
     if not actual_order or not expected_order:
         return False
 
@@ -3670,1157 +2337,36 @@ def orders_have_same_core_data(actual_order, expected_order):
     return actual_classes == expected_classes
 
 
-def normalize_order_number(value):
-
-    digits = re.sub(
-        r"\D",
-        "",
-        str(value or "")
-    )
-
-    if not digits:
-        return ""
-
-    return str(int(digits)).zfill(3)
-
-
-def copy_order(order):
-
-    result = dict(order)
-
-    result["classes"] = copy_classes(
-        order.get("classes", [])
-    )
-
-    result["quantity"] = calculate_total(
-        result["classes"]
-    )
-
-    return result
-
-
-# =========================================================
-# 訂購確認
-# =========================================================
-def make_order_confirmation(order):
-
-    class_lines = []
-
-    for item in order["classes"]:
-
-        class_lines.append(
-            f"{item['class_name']}："
-            f"{item['students']}本"
-        )
-
-    return (
-        "👑 LeBron James 幫你把這張單整理好了：\n\n"
-        "📚 訂購確認\n\n"
-        f"老師：{order['teacher']}\n"
-        f"學校：{order['school']}\n"
-        f"書名：{order['book']}\n"
-        f"出版社：{order['publisher']}\n\n"
-        + "\n".join(class_lines)
-        + f"\n\n總數量："
-        f"{order['quantity']}本\n\n"
-        "如果正確，請回覆「確認」"
-    )
-
-
-# =========================================================
-# 小工具
-# =========================================================
-def find_order_class(
-    order,
-    class_name
-):
-
-    for item in order.get(
-        "classes",
-        []
-    ):
-
-        if (
-            str(item["class_name"])
-            == str(class_name)
-        ):
-            return item
-
-    return None
-
-
-def copy_classes(classes):
-
-    result = []
-
-    for item in classes:
-
-        result.append({
-            "class_name":
-                str(item["class_name"]),
-
-            "students":
-                int(item["students"])
-        })
-
-    return result
-
-
-def calculate_total(classes):
-
-    return sum(
-        int(item["students"])
-        for item in classes
-    )
-
-
-def refresh_order_total(order):
-
-    order["quantity"] = (
-        calculate_total(
-            order["classes"]
-        )
-    )
-
-
-def clean_book_name(book):
-
-    book = book.strip()
-
-    book = re.sub(
-        r"^[、,，。:：\s]+",
-        "",
-        book
-    )
-
-    book = re.sub(
-        r"^[跟和與]+",
-        "",
-        book
-    )
-
-    book = re.sub(
-        r"[、,，。:：\s]+$",
-        "",
-        book
-    )
-
-    return book.strip()
-
-
-def extract_class_count(text):
-
-    number_map = {
-        "一": 1,
-        "二": 2,
-        "三": 3,
-        "四": 4,
-        "五": 5,
-        "六": 6,
-        "七": 7,
-        "八": 8,
-        "九": 9,
-        "十": 10
-    }
-
-    match = re.search(
-        r"([一二三四五六七八九十\d]+)個班",
-        text
-    )
-
-    if not match:
-        return None
-
-    value = match.group(1)
-
-    if value.isdigit():
-        return int(value)
-
-    return number_map.get(value)
-
-
-
-# =========================================================
-# 學校資料／教科書版本：自然語言解析
-# =========================================================
-def extract_school_name(text):
-
-    match = re.search(
-        r"([\u4e00-\u9fff]{2,16}(?:國中|高中|國小))",
-        text
-    )
-
-    if match:
-        return match.group(1).strip()
-
-    return ""
-
-
-def extract_grade_text(text):
-
-    grade_patterns = [
-        ("七年級", "七年級"),
-        ("八年級", "八年級"),
-        ("九年級", "九年級"),
-        ("國中一年級", "七年級"),
-        ("國中二年級", "八年級"),
-        ("國中三年級", "九年級"),
-        ("國一", "七年級"),
-        ("國二", "八年級"),
-        ("國三", "九年級"),
-    ]
-
-    for keyword, normalized in grade_patterns:
-        if keyword in text:
-            return normalized
-
-    # 「一年級 / 二年級 / 三年級」在國中語境下視為七／八／九年級。
-    if "一年級" in text:
-        return "七年級"
-
-    if "二年級" in text:
-        return "八年級"
-
-    if "三年級" in text:
-        return "九年級"
-
-    return ""
-
-
-def grade_from_class_name(class_name):
-
-    value = str(class_name or "").strip()
-
-    if value.startswith("7"):
-        return "七年級"
-
-    if value.startswith("8"):
-        return "八年級"
-
-    if value.startswith("9"):
-        return "九年級"
-
-    return ""
-
-
-def get_context_school(user_id):
-
-    for context_store in [
-        teacher_lookup_context,
-        conversation_context
-    ]:
-        context = context_store.get(
-            user_id,
-            {}
-        )
-
-        school = str(
-            context.get("school", "")
-        ).strip()
-
-        if school:
-            return school
-
-    return ""
-
-
-def parse_school_stats_query(
-    user_id,
-    text
-):
-
-    clean_text = text.strip()
-
-    # 老師個人的班級／學生問題交給既有老師資料查詢處理。
-    if "老師" in clean_text:
-        return None
-
-    intent_words = [
-        "多少人",
-        "幾人",
-        "幾個人",
-        "學生人數",
-        "總人數",
-        "幾個學生",
-        "多少學生",
-        "幾個班",
-        "多少班",
-        "有哪些班",
-        "哪幾班",
-        "哪幾個班",
-        "班級"
-    ]
-
-    if not any(
-        word in clean_text
-        for word in intent_words
-    ):
-        return None
-
-    school = extract_school_name(
-        clean_text
-    )
-
-    class_match = re.search(
-        r"(?<!\d)([789]\d{2})(?:班)?(?!\d)",
-        clean_text
-    )
-
-    class_name = (
-        class_match.group(1)
-        if class_match
-        else ""
-    )
-
-    grade = extract_grade_text(
-        clean_text
-    )
-
-    if not grade and class_name:
-        grade = grade_from_class_name(
-            class_name
-        )
-
-    # 若使用者只問「701班多少人」，
-    # 可沿用最近查過老師的學校。
-    if not school:
-        school = get_context_school(
-            user_id
-        )
-
-    # 沒有學校又沒有可沿用的上下文時，
-    # 不要冒然把問題送去 Google。
-    if not school:
-        return None
-
-    if not grade and not class_name:
-        # 像「天母國中多少人」也允許查全校目前資料。
-        if not any(
-            word in clean_text
-            for word in [
-                "多少人",
-                "幾人",
-                "幾個人",
-                "學生人數",
-                "總人數",
-                "幾個班",
-                "多少班",
-                "有哪些班",
-                "哪幾班",
-                "哪幾個班"
-            ]
-        ):
-            return None
-
-    intent = "summary"
-
-    if any(
-        word in clean_text
-        for word in [
-            "有哪些班",
-            "哪幾班",
-            "哪幾個班"
-        ]
-    ):
-        intent = "classes"
-
-    elif any(
-        word in clean_text
-        for word in [
-            "幾個班",
-            "多少班"
-        ]
-    ):
-        intent = "class_count"
-
-    elif any(
-        word in clean_text
-        for word in [
-            "多少人",
-            "幾人",
-            "幾個人",
-            "學生人數",
-            "總人數",
-            "幾個學生",
-            "多少學生"
-        ]
-    ):
-        intent = "students"
-
-    return {
-        "school": school,
-        "grade": grade,
-        "class_name": class_name,
-        "intent": intent
-    }
-
-
-def lookup_school_classes(
-    school,
-    grade="",
-    class_name=""
-):
-
-    if not GOOGLE_SCRIPT_URL:
-        return None
-
-    payload = {
-        "action": "lookup_school_classes",
-        "school": school,
-        "grade": grade,
-        "class_name": class_name
-    }
-
-    # Apps Script 本身可能已完成，但 Google 的回傳節點偶爾會 timeout。
-    # 這裡採 3 次重試，避免一次暫時性網路問題就直接回報失敗。
-    for attempt in range(3):
-
-        try:
-
-            response = requests.post(
-                GOOGLE_SCRIPT_URL,
-                json=payload,
-                timeout=20
-            )
-
-            print(
-                "School classes status:",
-                response.status_code,
-                "attempt:",
-                attempt + 1
-            )
-
-            if response.status_code != 200:
-                print(
-                    "School classes HTTP error:",
-                    response.status_code,
-                    response.text
-                )
-
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-
-                return None
-
-            try:
-                result = response.json()
-            except Exception as json_error:
-                print(
-                    "School classes JSON error:",
-                    json_error,
-                    response.text[:500]
-                )
-
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-
-                return None
-
-            if not result.get("success"):
-                print(
-                    "School classes API error:",
-                    result
-                )
-                return None
-
-            classes = []
-
-            for item in result.get(
-                "classes",
-                []
-            ):
-                classes.append({
-                    "school": str(
-                        item.get("school", school)
-                    ),
-                    "class_name": str(
-                        item.get("class_name", "")
-                    ),
-                    "students": int(
-                        item.get("students", 0) or 0
-                    )
-                })
-
-            return {
-                "classes": classes,
-                "class_count": int(
-                    result.get(
-                        "class_count",
-                        len(classes)
-                    ) or 0
-                ),
-                "total_students": int(
-                    result.get(
-                        "total_students",
-                        0
-                    ) or 0
-                )
-            }
-
-        except requests.exceptions.RequestException as error:
-
-            print(
-                "School classes lookup error:",
-                error,
-                "attempt:",
-                attempt + 1
-            )
-
-            if attempt < 2:
-                time.sleep(0.5 * (attempt + 1))
-                continue
-
-            return None
-
-        except Exception as error:
-
-            print(
-                "School classes unexpected error:",
-                error
-            )
-
-            return None
-
-    return None
-
-
-def handle_school_stats_query(query):
-
-    school = query["school"]
-    grade = query.get("grade", "")
-    class_name = query.get(
-        "class_name",
-        ""
-    )
-    intent = query.get(
-        "intent",
-        "summary"
-    )
-
-    result = lookup_school_classes(
-        school,
-        grade,
-        class_name
-    )
-
-    if result is None:
-        return (
-            "⚠️ 學校資料庫暫時查詢失敗，"
-            "請稍後再試。"
-        )
-
-    classes = result["classes"]
-
-    if not classes:
-        target = school
-
-        if grade:
-            target += f" {grade}"
-
-        if class_name:
-            target += f" {class_name}班"
-
-        return (
-            "⚠️ 查不到學生資料\n\n"
-            f"查詢：{target}"
-        )
-
-    if class_name:
-
-        item = classes[0]
-
-        return (
-            "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
-            "🏫 班級資料\n"
-            f"學校：{school}\n"
-            f"班級：{item['class_name']}班\n"
-            f"學生人數：{item['students']}人"
-        )
-
-    title = school
-
-    if grade:
-        title += f" {grade}"
-
-    class_lines = []
-
-    for item in classes:
-        class_lines.append(
-            f"• {item['class_name']}班："
-            f"{item['students']}人"
-        )
-
-    if intent == "class_count":
-
-        return (
-            "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
-            f"🏫 {title}\n"
-            f"班級總數：{result['class_count']}個班\n\n"
-            "班級："
-            + "、".join(
-                item["class_name"]
-                for item in classes
-            )
-        )
-
-    if intent == "classes":
-
-        return (
-            "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
-            f"🏫 {title}\n"
-            f"共有 {result['class_count']} 個班：\n"
-            + "\n".join(class_lines)
-            + f"\n\n總學生人數：{result['total_students']}人"
-        )
-
-    return (
-        "👑 LeBron James 幫你查了 Google 學生資料：\n\n"
-        f"🏫 {title}\n"
-        f"班級總數：{result['class_count']}個班\n"
-        f"學生總人數：{result['total_students']}人\n\n"
-        "各班人數：\n"
-        + "\n".join(class_lines)
-    )
-
-
-def parse_school_version_query(
-    user_id,
-    text
-):
-
-    clean_text = text.strip()
-
-    version_words = [
-        "版本",
-        "哪一版",
-        "哪個版本",
-        "什麼版本",
-        "教科書"
-    ]
-
-    if not any(
-        word in clean_text
-        for word in version_words
-    ):
-        return None
-
-    # 「這本書版本」等一般問題不應誤送資料庫；
-    # 至少要有學校名稱，或可沿用最近學校上下文。
-    school = extract_school_name(
-        clean_text
-    )
-
-    if not school:
-        school = get_context_school(
-            user_id
-        )
-
-    if not school:
-        return None
-
-    grade = extract_grade_text(
-        clean_text
-    )
-
-    subjects = [
-        "國文",
-        "英文",
-        "數學",
-        "自然",
-        "生物",
-        "理化",
-        "地科",
-        "社會",
-        "歷史",
-        "地理",
-        "公民"
-    ]
-
-    subject = ""
-
-    for item in subjects:
-        if item in clean_text:
-            subject = item
-            break
-
-    period_match = re.search(
-        r"(?<!\d)(\d{2,3}\s*(?:上|下))(?!\d)",
-        clean_text
-    )
-
-    academic_period = ""
-
-    if period_match:
-        academic_period = re.sub(
-            r"\s+",
-            "",
-            period_match.group(1)
-        )
-
-    return {
-        "school": school,
-        "grade": grade,
-        "subject": subject,
-        "academic_period": academic_period
-    }
-
-
-def lookup_school_versions(
-    school,
-    grade="",
-    subject="",
-    academic_period=""
-):
-
-    if not GOOGLE_SCRIPT_URL:
-        return None
-
-    payload = {
-        "action": "lookup_versions",
-        "school": school,
-        "grade": grade,
-        "subject": subject,
-        "academic_period": academic_period
-    }
-
-    # 與學生資料查詢相同，針對 Google 回傳節點的暫時 timeout 做重試。
-    for attempt in range(3):
-
-        try:
-
-            response = requests.post(
-                GOOGLE_SCRIPT_URL,
-                json=payload,
-                timeout=20
-            )
-
-            print(
-                "Version lookup status:",
-                response.status_code,
-                "attempt:",
-                attempt + 1
-            )
-
-            if response.status_code != 200:
-                print(
-                    "Version lookup HTTP error:",
-                    response.status_code,
-                    response.text
-                )
-
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-
-                return None
-
-            try:
-                result = response.json()
-            except Exception as json_error:
-                print(
-                    "Version lookup JSON error:",
-                    json_error,
-                    response.text[:500]
-                )
-
-                if attempt < 2:
-                    time.sleep(0.5 * (attempt + 1))
-                    continue
-
-                return None
-
-            if not result.get("success"):
-                print(
-                    "Version lookup API error:",
-                    result
-                )
-                return None
-
-            versions = []
-
-            for item in result.get(
-                "versions",
-                []
-            ):
-                versions.append({
-                    "school": str(
-                        item.get("school", school)
-                    ),
-                    "grade": str(
-                        item.get("grade", "")
-                    ),
-                    "subject": str(
-                        item.get("subject", "")
-                    ),
-                    "version": str(
-                        item.get("version", "")
-                    ),
-                    "academic_period": str(
-                        item.get(
-                            "academic_period",
-                            ""
-                        )
-                    )
-                })
-
-            return {
-                "latest_period": str(
-                    result.get(
-                        "latest_period",
-                        ""
-                    )
-                ),
-                "versions": versions
-            }
-
-        except requests.exceptions.RequestException as error:
-
-            print(
-                "Version lookup error:",
-                error,
-                "attempt:",
-                attempt + 1
-            )
-
-            if attempt < 2:
-                time.sleep(0.5 * (attempt + 1))
-                continue
-
-            return None
-
-        except Exception as error:
-
-            print(
-                "Version lookup unexpected error:",
-                error
-            )
-
-            return None
-
-    return None
-
-
-def handle_school_version_query(query):
-
-    school = query["school"]
-    grade = query.get("grade", "")
-    subject = query.get(
-        "subject",
-        ""
-    )
-    academic_period = query.get(
-        "academic_period",
-        ""
-    )
-
-    result = lookup_school_versions(
-        school,
-        grade,
-        subject,
-        academic_period
-    )
-
-    if result is None:
-        return (
-            "⚠️ 教科書版本資料庫暫時查詢失敗，"
-            "請稍後再試。"
-        )
-
-    versions = result["versions"]
-
-    if not versions:
-        target = school
-
-        if grade:
-            target += f" {grade}"
-
-        if subject:
-            target += f" {subject}"
-
-        if academic_period:
-            target += f" {academic_period}"
-
-        return (
-            "⚠️ 查不到教科書版本資料\n\n"
-            f"查詢：{target}\n\n"
-            "請確認 Google「學校版本資料」是否已建立這筆資料。"
-        )
-
-    period = (
-        academic_period
-        or result.get(
-            "latest_period",
-            ""
-        )
-    )
-
-    if len(versions) == 1:
-
-        item = versions[0]
-
-        return (
-            "👑 LeBron James 幫你查了 Google 教科書版本資料：\n\n"
-            "📚 教科書版本\n"
-            f"學校：{item['school']}\n"
-            f"年級：{item['grade']}\n"
-            f"科目：{item['subject']}\n"
-            f"版本：{item['version']}"
-            + (
-                f"\n學年度：{item['academic_period']}"
-                if item["academic_period"]
-                else ""
-            )
-        )
-
-    lines = []
-
-    for item in versions:
-        grade_prefix = ""
-
-        # 若使用者沒有指定年級，避免不同年級資料混在一起看不懂。
-        if not grade:
-            grade_prefix = (
-                f"{item['grade']} "
-                if item["grade"]
-                else ""
-            )
-
-        lines.append(
-            f"• {grade_prefix}"
-            f"{item['subject']}："
-            f"{item['version']}"
-        )
-
-    title = school
-
-    if grade:
-        title += f" {grade}"
-
-    return (
-        "👑 LeBron James 幫你查了 Google 教科書版本資料：\n\n"
-        f"📚 {title}\n"
-        + (
-            f"學年度：{period}\n\n"
-            if period
-            else "\n"
-        )
-        + "\n".join(lines)
-    )
-
-
-# =========================================================
-# Google Sheet：查老師
-# =========================================================
-def get_teacher_classes(
-    school,
-    teacher
-):
-
-    if not GOOGLE_SCRIPT_URL:
-        return None
-
-    data = {
-        "action": "lookup_teacher",
-        "school": school,
-        "teacher": teacher
-    }
-
-    try:
-
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=data,
-            timeout=15
-        )
-
-        result = response.json()
-
-        raw_classes = result.get(
-            "classes",
-            []
-        )
-
-        classes = []
-
-        for item in raw_classes:
-
-            classes.append({
-                "class_name": str(
-                    item.get(
-                        "class_name",
-                        ""
-                    )
-                ),
-
-                "students": int(
-                    item.get(
-                        "students",
-                        0
-                    )
-                )
-            })
-
-        return classes
-
-    except Exception as error:
-
-        print(
-            "Teacher lookup error:",
-            error
-        )
-
-        return None
-
-
-# =========================================================
-# Google Sheet：查書籍
-# =========================================================
-def get_book_publisher(book):
-
-    if not GOOGLE_SCRIPT_URL:
-        return None
-
-    data = {
-        "action": "lookup_book",
-        "book": book
-    }
-
-    try:
-
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=data,
-            timeout=15
-        )
-
-        result = response.json()
-
-        if result.get("found"):
-
-            return result.get(
-                "publisher",
-                ""
-            )
-
-        return None
-
-    except Exception as error:
-
-        print(
-            "Book lookup error:",
-            error
-        )
-
-        return None
-
-
-# =========================================================
-# 寫入 Google Sheet
-# =========================================================
-def write_to_google_sheet(order):
-
-    if not GOOGLE_SCRIPT_URL:
-        return False, None
-
-    data = {
-        "action": "create_order",
-        "teacher": order["teacher"],
-        "school": order["school"],
-        "book": order["book"],
-        "publisher": order["publisher"],
-        "classes": order.get(
-            "classes",
-            []
-        )
-    }
-
-    try:
-
-        response = requests.post(
-            GOOGLE_SCRIPT_URL,
-            json=data,
-            timeout=15
-        )
-
-        result = response.json()
-
-        print(
-            "Google Sheet status:",
-            response.status_code
-        )
-
-        print(
-            "Google Sheet response:",
-            response.text
-        )
-
-        if (
-            response.status_code == 200
-            and result.get("success") is True
-        ):
-            return (
-                True,
-                result.get("order_number")
-            )
-
-        return False, None
-
-    except Exception as error:
-
-        print(
-            "Google Sheet error:",
-            error
-        )
-
-        return False, None
-
-
 # =========================================================
 # LINE 回覆
 # =========================================================
-def reply_to_line(
-    reply_token,
-    message
-):
-
-    url = (
-        "https://api.line.me/"
-        "v2/bot/message/reply"
-    )
-
-    if not CHANNEL_ACCESS_TOKEN:
-
-        print(
-            "❌ LINE_CHANNEL_ACCESS_TOKEN "
-            "沒有讀到"
-        )
-
+def reply_to_line(reply_token, message):
+    if not reply_token:
+        print("reply_token missing")
         return
 
-    headers = {
-        "Content-Type":
-            "application/json",
+    if not CHANNEL_ACCESS_TOKEN:
+        print("❌ LINE_CHANNEL_ACCESS_TOKEN 沒有讀到")
+        return
 
-        "Authorization":
-            "Bearer "
-            + CHANNEL_ACCESS_TOKEN
+    url = "https://api.line.me/v2/bot/message/reply"
+
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
     }
 
     data = {
         "replyToken": reply_token,
-
         "messages": [
             {
                 "type": "text",
-                "text": message
+                "text": str(message or "")[:4900]
             }
         ]
     }
 
     try:
-
         response = requests.post(
             url,
             headers=headers,
@@ -4828,32 +2374,15 @@ def reply_to_line(
             timeout=10
         )
 
-        print(
-            "LINE reply status:",
-            response.status_code
-        )
-
-        print(
-            "LINE reply response:",
-            response.text
-        )
+        print("LINE reply status:", response.status_code)
+        print("LINE reply response:", response.text)
 
     except Exception as error:
-
-        print(
-            "LINE reply error:",
-            error
-        )
+        print("LINE reply error:", error)
 
 
 if __name__ == "__main__":
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            5000
-        )
-    )
+    port = int(os.environ.get("PORT", 5000))
 
     app.run(
         host="0.0.0.0",
