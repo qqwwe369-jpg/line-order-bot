@@ -442,6 +442,18 @@ def handle_message(user_id, user_text):
         order = pending_orders.get(user_id)
 
         if not order:
+            draft = order_draft_context.get(user_id)
+            if draft:
+                missing = []
+                if not draft.get("teacher"):
+                    missing.append("老師")
+                if not draft.get("book"):
+                    missing.append("書名")
+                return (
+                    "⚠️ 目前訂購資料還沒完整，還不能加入 Google 訂單表單。\n\n"
+                    + (f"還缺：{'、'.join(missing)}\n\n" if missing else "")
+                    + "請先把缺少的資料告訴我。"
+                )
             return (
                 "⚠️ 找不到尚未確認的訂單，"
                 "請重新輸入。"
@@ -1484,21 +1496,158 @@ def handle_conversational_order(user_id, text):
         teacher_lookup_context.pop(user_id, None)
         return (
             "👑 LeBron James：好，全部重新開始。😊\n\n"
-            "你直接跟我說要訂哪些班、哪本書，缺什麼我再問你。"
+            "你直接跟我說老師、書名或班級都可以，缺什麼我再問你。"
         )
 
-    # 先說班級＋書名。支援：
-    # 訂701跟705，國一數學講義
-    # 701 705訂國一數學講義
-    # 701訂國一數學講義
+    # 「確認」只能由 handle_message 前面的 pending_orders 確認流程處理。
+    # 草稿還不完整時，絕對不能把「確認」當成老師姓名或書名。
+    if clean_text in ["確認", "確認訂單", "確定"]:
+        if user_id in order_draft_context:
+            draft = order_draft_context[user_id]
+            missing = []
+            if not draft.get("teacher"):
+                missing.append("老師")
+            if not draft.get("book"):
+                missing.append("書名")
+            return (
+                "⚠️ 目前訂購資料還沒完整，還不能加入 Google 訂單表單。\n\n"
+                + (f"還缺：{'、'.join(missing)}\n\n" if missing else "")
+                + "請先把缺少的資料告訴我。"
+            )
+        return None
+
+    def parse_teacher_identity(value):
+        teacher_text = re.sub(r"[，,。.!！?？\s]+", "", value)
+        teacher_text = re.sub(
+            r"^(?:對|對的|沒錯|是|就是|就|嗯|恩)+",
+            "",
+            teacher_text
+        )
+        teacher_text = re.sub(
+            r"(?:要訂書|想訂書|要訂|想訂|訂書|沒錯|對的|就是他|就是她)$",
+            "",
+            teacher_text
+        )
+
+        school = ""
+        teacher = ""
+
+        m_full = re.fullmatch(
+            r"(.+?)(國中|高中|國小)([\u4e00-\u9fff]{1,4})老師",
+            teacher_text
+        )
+        if m_full:
+            school = m_full.group(1) + m_full.group(2)
+            teacher = m_full.group(3) + "老師"
+            return school, teacher
+
+        m_short = re.fullmatch(
+            r"([\u4e00-\u9fff]{2,8})([\u4e00-\u9fff])老師",
+            teacher_text
+        )
+        if m_short:
+            school = m_short.group(1) + "國中"
+            teacher = m_short.group(2) + "老師"
+            return school, teacher
+
+        m_teacher_only = re.fullmatch(
+            r"([\u4e00-\u9fff]{1,4})老師",
+            teacher_text
+        )
+        if m_teacher_only:
+            teacher = m_teacher_only.group(1) + "老師"
+            candidate = proposed_teacher_context.get(user_id, {})
+            recent = teacher_lookup_context.get(user_id, {})
+            previous = conversation_context.get(user_id, {})
+            school = (
+                candidate.get("school", "")
+                or recent.get("school", "")
+                or previous.get("school", "")
+                or "天母國中"
+            )
+            return school, teacher
+
+        return "", ""
+
+    def finalize_draft(draft):
+        school = draft.get("school", "")
+        teacher = draft.get("teacher", "")
+        book = clean_book_name(draft.get("book", ""))
+        class_names = [str(x) for x in draft.get("class_names", [])]
+
+        if not teacher:
+            return "請問是哪一位老師？例如：王老師或天母王老師"
+        if not book:
+            return (
+                f"👑 LeBron James：{teacher} 我記下來了。📚\n\n"
+                "請問要訂哪一本書？"
+            )
+
+        teacher_classes = get_teacher_classes(school, teacher)
+        if not teacher_classes:
+            return (
+                "⚠️ 查不到老師班級資料\n\n"
+                f"學校：{school}\n老師：{teacher}\n\n"
+                "請確認學校或老師名稱。"
+            )
+
+        if class_names:
+            selected = []
+            for class_name in class_names:
+                found = next(
+                    (
+                        item for item in teacher_classes
+                        if str(item["class_name"]) == str(class_name)
+                    ),
+                    None
+                )
+                if not found:
+                    return f"⚠️ {teacher} 的資料裡找不到 {class_name} 班。"
+                selected.append({
+                    "class_name": str(found["class_name"]),
+                    "students": int(found["students"])
+                })
+        else:
+            # 沒有特別指定班級時，依老師資料庫帶入該老師全部班級與人數。
+            selected = copy_classes(teacher_classes)
+
+        publisher = get_book_publisher(book)
+        if not publisher:
+            return (
+                "⚠️ 查不到書籍資料\n\n"
+                f"書名：{book}\n\n"
+                "請確認書名，或先到 Google「書籍資料」新增這本書。"
+            )
+
+        order = {
+            "teacher": teacher,
+            "school": school,
+            "book": book,
+            "publisher": publisher,
+            "classes": selected
+        }
+        refresh_order_total(order)
+        pending_orders[user_id] = order
+        conversation_context[user_id] = {
+            "teacher": teacher,
+            "school": school,
+            "classes": copy_classes(teacher_classes)
+        }
+        order_draft_context.pop(user_id, None)
+        proposed_teacher_context.pop(user_id, None)
+        return make_order_confirmation(order)
+
+    # -----------------------------------------------------
+    # A. 先說班級＋書名，再補老師
+    # 例：701 703訂國一數學講義 / 訂701跟705國一數學講義
+    # -----------------------------------------------------
     m = re.search(
         r"^(?:訂|要訂)\s*((?:\d{2,4}\s*(?:跟|和|、|,|，|\s)?\s*)+)[，,、\s]*(.+)$",
         clean_text
     )
-
     if not m:
         m = re.search(
-            r"^((?:\d{2,4}\s*(?:跟|和|、|,|，|\s)?\s*)+)\s*(?:訂|要訂)\s*(.+)$",
+            r"^((?:\d{2,4}\s*(?:跟|和|、|,|，|\s)?\s*)+)\s*(?:訂|定|要訂)\s*(.+)$",
             clean_text
         )
 
@@ -1506,10 +1655,14 @@ def handle_conversational_order(user_id, text):
         class_names = re.findall(r"\d{2,4}", m.group(1))
         book = clean_book_name(m.group(2))
         if class_names and book:
-            order_draft_context[user_id] = {
+            draft = {
                 "class_names": class_names,
-                "book": book
+                "book": book,
+                "teacher": "",
+                "school": ""
             }
+            order_draft_context[user_id] = draft
+
             previous = conversation_context.get(user_id, {})
             previous_teacher = previous.get("teacher", "")
             previous_school = previous.get("school", "")
@@ -1519,46 +1672,104 @@ def handle_conversational_order(user_id, text):
                     "teacher": previous_teacher,
                     "school": previous_school
                 }
-
                 return (
                     "👑 LeBron James：班級跟書名我記下來了。📚\n\n"
                     f"班級：{'、'.join(class_names)}\n"
                     f"書名：{book}\n\n"
                     f"是 {previous_school} 的 {previous_teacher} 嗎？\n"
-                    "如果是，回我「對」或「就是他」就可以。"
+                    "如果是，回我「對」或「就是他」就可以；不是的話直接告訴我老師。"
                 )
 
             proposed_teacher_context.pop(user_id, None)
-
             return (
                 "👑 LeBron James：班級跟書名我記下來了。📚\n\n"
                 f"班級：{'、'.join(class_names)}\n"
                 f"書名：{book}\n\n"
-                "請問是哪一位老師？例如：天母王老師"
+                "請問是哪一位老師？例如：王老師或天母王老師"
             )
+
+    draft = order_draft_context.get(user_id)
+
+    # -----------------------------------------------------
+    # B. 老師先講：王老師要訂書 / 王老師訂書
+    # 先記老師，不先顯示班級，下一步只追問書名。
+    # -----------------------------------------------------
+    teacher_order_start = re.fullmatch(
+        r"(.+?老師)\s*(?:要|想)?\s*(?:訂|定)\s*書(?:籍)?",
+        clean_text
+    )
+    if teacher_order_start:
+        school, teacher = parse_teacher_identity(teacher_order_start.group(1))
+        if teacher:
+            order_draft_context[user_id] = {
+                "teacher": teacher,
+                "school": school,
+                "book": "",
+                "class_names": []
+            }
+            return (
+                f"👑 LeBron James：{teacher} 我記下來了。📚\n\n"
+                "請問要訂哪一本書？"
+            )
+
+    # -----------------------------------------------------
+    # C. 老師＋書名一次講完：王老師訂國一數學講義
+    # -----------------------------------------------------
+    teacher_with_book = re.fullmatch(
+        r"(.+?老師)\s*(?:要|想)?\s*(?:訂|定)\s*(.+)",
+        clean_text
+    )
+    if teacher_with_book:
+        school, teacher = parse_teacher_identity(teacher_with_book.group(1))
+        book = clean_book_name(teacher_with_book.group(2))
+        if teacher and book and book not in ["書", "書籍"]:
+            draft = {
+                "teacher": teacher,
+                "school": school,
+                "book": book,
+                "class_names": []
+            }
+            order_draft_context[user_id] = draft
+            return finalize_draft(draft)
+
+    # -----------------------------------------------------
+    # D. 先講書名：訂國一數學講義 / 我要訂國一數學講義
+    # -----------------------------------------------------
+    if not draft and "老師" not in clean_text:
+        book_start = re.fullmatch(
+            r"(?:我)?(?:要|想)?\s*(?:訂|定)\s*(.+)",
+            clean_text
+        )
+        if book_start:
+            book = clean_book_name(book_start.group(1))
+            if book and book not in ["書", "書籍"]:
+                order_draft_context[user_id] = {
+                    "teacher": "",
+                    "school": "",
+                    "book": book,
+                    "class_names": []
+                }
+                proposed_teacher_context.pop(user_id, None)
+                return (
+                    "👑 LeBron James：書名我記下來了。📚\n\n"
+                    f"書名：{book}\n\n"
+                    "請問是哪一位老師？例如：王老師或天母王老師"
+                )
 
     draft = order_draft_context.get(user_id)
     if not draft:
         return None
 
     # -----------------------------------------------------
-    # 承接上一句：對 / 沒錯 / 就是他 / 對就是他...
-    # 只有真的存在「候選老師」時才採用，不能把單純範例當答案。
+    # E. 承接「對／就是他」確認候選老師
     # -----------------------------------------------------
     affirmative_words = {
         "對", "對啊", "對阿", "對的", "沒錯",
         "就是他", "就是她", "沒錯就是他", "沒錯就是她",
         "對就是他", "對就是她", "是他", "是她",
-        "嗯就是他", "嗯就是她", "恩就是他", "恩就是她",
-        "對 沒錯", "沒錯 就是他", "沒錯 就是她"
+        "嗯就是他", "嗯就是她", "恩就是他", "恩就是她"
     }
-
-    normalized_reply = re.sub(
-        r"[，,。.!！?？\s]+",
-        "",
-        clean_text
-    )
-
+    normalized_reply = re.sub(r"[，,。.!！?？\s]+", "", clean_text)
     normalized_affirmatives = {
         re.sub(r"[，,。.!！?？\s]+", "", item)
         for item in affirmative_words
@@ -1566,123 +1777,39 @@ def handle_conversational_order(user_id, text):
 
     if normalized_reply in normalized_affirmatives:
         candidate = proposed_teacher_context.get(user_id)
-
         if not candidate:
             return (
                 "👑 LeBron James：我知道你是在確認老師 😊\n\n"
                 "但我目前還沒有一位確定的候選老師，"
-                "請直接告訴我老師名稱，例如：天母王老師。"
+                "請直接告訴我老師名稱，例如：王老師。"
             )
+        draft["teacher"] = candidate["teacher"]
+        draft["school"] = candidate["school"]
+        return finalize_draft(draft)
 
-        clean_text = (
-            candidate["school"]
-            + candidate["teacher"]
-        )
-
-    # 補老師：天母王老師 / 天母國中王老師 / 王老師 / 對就是王老師
-    school = ""
-    teacher = ""
-
-    # 先移除自然口語前後綴，保留真正的老師名稱。
-    teacher_reply = re.sub(
-        r"[，,。.!！?？\s]+",
-        "",
-        clean_text
-    )
-    teacher_reply = re.sub(
-        r"^(?:對|對的|沒錯|是|就是|就|嗯|恩)+",
-        "",
-        teacher_reply
-    )
-    teacher_reply = re.sub(
-        r"(?:沒錯|對的|就是他|就是她)$",
-        "",
-        teacher_reply
-    )
-
-    m_full = re.fullmatch(
-        r"(.+?)(國中|高中|國小)([\u4e00-\u9fff]{1,4})老師",
-        teacher_reply
-    )
-    if m_full:
-        school = m_full.group(1) + m_full.group(2)
-        teacher = m_full.group(3) + "老師"
-    else:
-        # 學校簡稱，例如：天母王老師 → 天母國中王老師
-        m_short = re.fullmatch(
-            r"([\u4e00-\u9fff]{2,8})([\u4e00-\u9fff])老師",
-            teacher_reply
-        )
-        if m_short:
-            school = m_short.group(1) + "國中"
-            teacher = m_short.group(2) + "老師"
-        else:
-            # 只回答「王老師」「是王老師」「對就是王老師」時：
-            # 先沿用候選/最近老師的學校；都沒有時，依目前老師資料庫預設天母國中。
-            m_teacher_only = re.fullmatch(
-                r"([\u4e00-\u9fff]{1,4})老師",
-                teacher_reply
-            )
-            if m_teacher_only:
-                teacher = m_teacher_only.group(1) + "老師"
-
-                candidate = proposed_teacher_context.get(user_id, {})
-                recent = teacher_lookup_context.get(user_id, {})
-                previous = conversation_context.get(user_id, {})
-
-                school = (
-                    candidate.get("school", "")
-                    or recent.get("school", "")
-                    or previous.get("school", "")
-                    or "天母國中"
-                )
-
-    if not teacher:
+    # -----------------------------------------------------
+    # F. 草稿缺老師：本句只當老師回答，不可能把「確認」當老師。
+    # -----------------------------------------------------
+    if not draft.get("teacher"):
+        school, teacher = parse_teacher_identity(clean_text)
+        if teacher:
+            draft["teacher"] = teacher
+            draft["school"] = school
+            return finalize_draft(draft)
         return None
 
-    teacher_classes = get_teacher_classes(school, teacher)
-    if not teacher_classes:
-        return (
-            "⚠️ 查不到老師班級資料\n\n"
-            f"學校：{school}\n老師：{teacher}\n\n"
-            "請確認學校或老師名稱。"
-        )
+    # -----------------------------------------------------
+    # G. 草稿已有老師但缺書名：下一句就是書名。
+    # 例：王老師要訂書 → 國一數學講義
+    # -----------------------------------------------------
+    if not draft.get("book"):
+        book = clean_book_name(clean_text)
+        if not book or book in ["確認", "書", "書籍"]:
+            return "請告訴我要訂哪一本書。"
+        draft["book"] = book
+        return finalize_draft(draft)
 
-    selected = []
-    for class_name in draft["class_names"]:
-        found = next(
-            (item for item in teacher_classes
-             if str(item["class_name"]) == str(class_name)),
-            None
-        )
-        if not found:
-            return f"⚠️ {teacher} 的資料裡找不到 {class_name} 班。"
-        selected.append({
-            "class_name": str(found["class_name"]),
-            "students": int(found["students"])
-        })
-
-    publisher = get_book_publisher(draft["book"])
-    if not publisher:
-        return f"⚠️ 查不到書籍出版社資料：{draft['book']}"
-
-    order = {
-        "teacher": teacher,
-        "school": school,
-        "book": draft["book"],
-        "publisher": publisher,
-        "classes": selected
-    }
-    refresh_order_total(order)
-    pending_orders[user_id] = order
-    conversation_context[user_id] = {
-        "teacher": teacher,
-        "school": school,
-        "classes": copy_classes(teacher_classes)
-    }
-    order_draft_context.pop(user_id, None)
-    proposed_teacher_context.pop(user_id, None)
-    return make_order_confirmation(order)
+    return finalize_draft(draft)
 
 
 # 查老師
@@ -2033,7 +2160,13 @@ def create_order_from_sentence(
 
     teacher = teacher_match.group(1).strip()
 
-    school = "天母國中"
+    explicit_school = extract_school_name(text)
+    recent_context = conversation_context.get(user_id, {})
+    school = (
+        explicit_school
+        or recent_context.get("school", "")
+        or "天母國中"
+    )
 
     order_position = text.find("訂")
 
@@ -3325,23 +3458,24 @@ def make_order_confirmation(order):
     class_lines = []
 
     for item in order["classes"]:
-
         class_lines.append(
-            f"{item['class_name']}："
+            f"• {item['class_name']}班："
             f"{item['students']}本"
         )
 
     return (
         "👑 LeBron James 幫你把這張單整理好了：\n\n"
         "📚 訂購確認\n\n"
-        f"老師：{order['teacher']}\n"
         f"學校：{order['school']}\n"
+        f"老師：{order['teacher']}\n"
         f"書名：{order['book']}\n"
         f"出版社：{order['publisher']}\n\n"
+        "班級與數量：\n"
         + "\n".join(class_lines)
-        + f"\n\n總數量："
-        f"{order['quantity']}本\n\n"
-        "如果正確，請回覆「確認」"
+        + f"\n\n總數量：{order['quantity']}本\n\n"
+        "以上訂購資料是否正確？\n"
+        "回覆「確認」後加入 Google 訂單表單；\n"
+        "如需修改，直接告訴我要改哪個班級、數量或書名。"
     )
 
 
@@ -3883,6 +4017,18 @@ def parse_school_version_query(
     school = extract_school_name(
         clean_text
     )
+
+    # 支援學校簡稱：例如「華興教科書版本」視為「華興國中」。
+    # 只在版本查詢語境使用，避免一般句子被誤判成學校。
+    if not school:
+        short_school_match = re.match(
+            r"^([\u4e00-\u9fff]{2,8}?)(?=(?:七年級|八年級|九年級|國一|國二|國三|教科書|版本|哪一版|哪個版本|什麼版本))",
+            clean_text
+        )
+        if short_school_match:
+            short_school = short_school_match.group(1).strip()
+            if short_school not in ["這本書", "這一本", "請問", "想問"]:
+                school = short_school + "國中"
 
     if not school:
         school = get_context_school(
