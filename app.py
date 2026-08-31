@@ -4,6 +4,7 @@ import re
 import time
 import requests
 from datetime import datetime
+from difflib import SequenceMatcher
 
 app = Flask(__name__)
 
@@ -20,7 +21,7 @@ CHANNEL_SECRET = (
 )
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
-SYSTEM_FALLBACK_MESSAGE = "👑 LeBron James 正在想辦法處理中，請稍後再試一次。"
+FIXED_FALLBACK_MESSAGE = "👑 LeBron James 正在想辦法處理中，請稍後再試一次。"
 
 DEFAULT_SCHOOL = os.environ.get("DEFAULT_SCHOOL", "天母國中")
 
@@ -89,7 +90,7 @@ def callback():
             reply_message = add_lebron_flavor(handle_message(user_id, user_text))
         except Exception as error:
             print("handle_message error:", error)
-            reply_message = add_lebron_flavor("⚠️ 系統剛剛處理失敗，請再傳一次。")
+            reply_message = FIXED_FALLBACK_MESSAGE
 
         reply_to_line(reply_token, reply_message)
 
@@ -285,10 +286,9 @@ def handle_message(user_id, user_text):
 
         return make_teacher_book_orders_reply(teacher, orders)
 
-    # 14. 原 AI 草擬功能已停用
-    # 任何需要自由生成文字的要求，一律回固定卡關訊息。
+    # 14. AI 功能已停用：草擬／自由問答不再呼叫 OpenAI
     if is_ai_writing_request(text):
-        return SYSTEM_FALLBACK_MESSAGE
+        return FIXED_FALLBACK_MESSAGE
 
     # 15. 老師資料庫：優先於學校統計
     # 例如「造德芳教哪幾個班」不能被誤判成「華興有哪些班」。
@@ -359,8 +359,8 @@ def handle_message(user_id, user_text):
     if order_reply is not None:
         return order_reply
 
-    # 20. 所有未命中固定功能的內容，一律回制式卡關訊息
-    return SYSTEM_FALLBACK_MESSAGE
+    # 20. 其他內容：固定卡關訊息，不再交給 AI
+    return FIXED_FALLBACK_MESSAGE
 
 
 # =========================================================
@@ -409,7 +409,7 @@ def get_help_reply():
         "👥 查老師／班級人數\n"
         "📖 查學校教科書版本\n"
         "📦 其他訂單\n"
-
+        "✍️ 整理／草擬 LINE 訊息\n\n"
         "💡 直接用平常講話告訴我就可以。"
     )
 
@@ -474,8 +474,6 @@ def handle_order_flow(user_id, text):
             draft["school"] = recent["school"]
 
     if draft["teacher"] and not draft["school"]:
-        # 先沿用明確的老師上下文；沒有的話直接跨全資料庫找同名老師，
-        # 不再硬塞 DEFAULT_SCHOOL，避免華興老師被錯查成天母國中。
         for recent in [
             teacher_lookup_context.get(user_id, {}),
             conversation_context.get(user_id, {})
@@ -484,24 +482,6 @@ def handle_order_flow(user_id, text):
                 draft["school"] = recent["school"]
                 break
 
-        if not draft["school"]:
-            teacher_matches = lookup_teacher_matches(draft["teacher"])
-
-            if len(teacher_matches) == 1:
-                matched = teacher_matches[0]
-                draft["teacher"] = matched["teacher"]
-                draft["school"] = matched["school"]
-
-            elif len(teacher_matches) > 1:
-                schools = "、".join(
-                    unique_list(item.get("school", "") for item in teacher_matches)
-                )
-                order_flow_context[user_id] = draft
-                return (
-                    "🔎 找到同名老師，請補充學校名稱。\n\n"
-                    f"老師：{draft['teacher']}\n"
-                    f"可能學校：{schools}"
-                )
 
     order_flow_context[user_id] = draft
 
@@ -542,18 +522,6 @@ def make_order_guide_reply(draft):
 def parse_order_message(text):
     clean = str(text or "").strip()
     teacher, school = extract_teacher_and_school(clean)
-
-    # 支援「蔡志強要訂書」「蔡志強想訂書」「蔡志強下單」
-    # 不強迫使用者一定輸入「老師」兩字。
-    if not teacher:
-        compact = re.sub(r"[，,。.!！?？\s]+", "", clean)
-        bare_teacher_match = re.fullmatch(
-            r"([\u4e00-\u9fff]{2,4})(?:老師)?(?:要|想要|想|準備|幫忙)?(?:訂書|下單)",
-            compact
-        )
-        if bare_teacher_match:
-            teacher = bare_teacher_match.group(1) + "老師"
-
     classes = extract_classes(clean)
 
     order_words = [
@@ -706,35 +674,24 @@ def merge_followup_into_parsed(clean, parsed, draft):
 
 def build_order_from_draft(user_id, draft):
     teacher = draft["teacher"]
-    school = draft.get("school", "")
+    school = str(draft.get("school") or "").strip()
     requested_classes = unique_list(draft.get("classes", []))
     book = clean_book_name(draft["book"])
 
-    # 沒有學校時先跨全資料庫做 exact teacher lookup。
-    if not school:
-        teacher_matches = lookup_teacher_matches(teacher)
+    # 老師先做跨校 exact lookup。若只有一筆，直接採用資料庫正式學校與姓名。
+    teacher_classes = []
+    exact_matches = lookup_teacher_matches(teacher, school=school)
+    if len(exact_matches) == 1:
+        exact = exact_matches[0]
+        teacher = exact["teacher"]
+        school = exact["school"]
+        teacher_classes = copy_classes(exact.get("classes", []))
+        draft["teacher"] = teacher
+        draft["school"] = school
+    elif school:
+        teacher_classes = get_teacher_classes(school, teacher) or []
 
-        if len(teacher_matches) == 1:
-            matched = teacher_matches[0]
-            teacher = matched["teacher"]
-            school = matched["school"]
-            draft["teacher"] = teacher
-            draft["school"] = school
-
-        elif len(teacher_matches) > 1:
-            schools = "、".join(
-                unique_list(item.get("school", "") for item in teacher_matches)
-            )
-            order_flow_context[user_id] = draft
-            return (
-                "🔎 找到同名老師，請補充學校名稱。\n\n"
-                f"老師：{teacher}\n"
-                f"可能學校：{schools}"
-            )
-
-    # 先精確查老師；查不到才啟用模糊／錯字比對。
-    teacher_classes = get_teacher_classes(school, teacher) if school else None
-
+    # exact 找不到才啟用模糊／同音錯字比對，而且不鎖死錯誤預設學校。
     if not teacher_classes:
         match = resolve_fuzzy_name("teacher", teacher, school=school)
 
@@ -760,12 +717,7 @@ def build_order_from_draft(user_id, draft):
             )
 
     if not teacher_classes:
-        return (
-            "⚠️ 查不到老師班級資料\n\n"
-            f"學校：{school}\n"
-            f"老師：{teacher}\n\n"
-            "請確認學校或老師名稱。"
-        )
+        return FIXED_FALLBACK_MESSAGE
 
     # 未指定班級時，預設帶入老師資料庫中的全部班級，先讓使用者確認。
     if not requested_classes:
@@ -827,11 +779,7 @@ def build_order_from_draft(user_id, draft):
             )
 
     if not publisher:
-        return (
-            "⚠️ 查不到書籍資料\n\n"
-            f"書名：{book}\n\n"
-            "請確認 Google「書籍資料」是否已建立這本書與出版社。"
-        )
+        return FIXED_FALLBACK_MESSAGE
 
     order = {
         "teacher": teacher,
@@ -867,6 +815,10 @@ def normalize_order_typo(text):
         "寒林": "翰林",
         "難一": "南一",
         "南壹": "南一",
+        # 常見書名語音／同音輸入
+        "超級悍將": "超級翰將",
+        "超級漢將": "超級翰將",
+        "超級瀚將": "超級翰將",
     }
     for wrong, correct in common_aliases.items():
         clean = clean.replace(wrong, correct)
@@ -940,6 +892,15 @@ def parse_contextual_class_book(text, context):
 
 def extract_teacher_and_school(text):
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(text or ""))
+
+    # 訂書口語：蔡志強要訂書 / 蔡志強老師要訂書
+    # 必須只抓人名，不能把「要」吃進老師姓名。
+    m = re.fullmatch(
+        r"([\u4e00-\u9fff]{2,4}?)(?:老師)?(?:要|想要|想|準備|打算)?(?:訂書|下單)",
+        clean
+    )
+    if m:
+        return m.group(1) + "老師", ""
 
     m = re.search(
         r"([\u4e00-\u9fff]{2,16}(?:國中|高中|國小|中學))"
@@ -2458,17 +2419,122 @@ def extract_referenced_order_number(text):
     return normalize_order_number(m.group(1)) if m else None
 
 
-
 # =========================================================
 # 名稱容錯／同音錯字
 # =========================================================
+def normalize_book_match_text(value):
+    text = str(value or "").strip()
+    aliases = {
+        "悍將": "翰將",
+        "漢將": "翰將",
+        "瀚將": "翰將",
+        "康宣": "康軒",
+        "康玄": "康軒",
+        "韓林": "翰林",
+        "寒林": "翰林",
+    }
+    for wrong, correct in aliases.items():
+        text = text.replace(wrong, correct)
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]", "", text).lower()
+
+
+def book_core_text(value):
+    text = normalize_book_match_text(value)
+    text = re.sub(r"\d+", "", text)
+    for word in [
+        "國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科",
+        "社會", "歷史", "地理", "公民",
+        "講義", "評量", "教材", "複習", "測驗", "題本", "自修", "課本", "習作"
+    ]:
+        text = text.replace(word, "")
+    return text
+
+
+def book_keyword_score(query, candidate):
+    q = normalize_book_match_text(query)
+    c = normalize_book_match_text(candidate)
+    if not q or not c:
+        return 0.0
+    if q == c:
+        return 1.0
+
+    score = 0.0
+    qcore = book_core_text(query)
+    ccore = book_core_text(candidate)
+
+    if qcore and ccore:
+        if qcore == ccore:
+            score += 0.55
+        elif qcore in ccore or ccore in qcore:
+            score += 0.45
+        else:
+            score += 0.35 * SequenceMatcher(None, qcore, ccore).ratio()
+
+    subjects = ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]
+    q_subjects = {x for x in subjects if x in q}
+    c_subjects = {x for x in subjects if x in c}
+    if q_subjects and c_subjects and q_subjects & c_subjects:
+        score += 0.20
+
+    q_nums = set(re.findall(r"\d+", q))
+    c_nums = set(re.findall(r"\d+", c))
+    if q_nums and c_nums and q_nums & c_nums:
+        score += 0.15
+
+    generic = ["講義", "評量", "教材", "複習", "測驗", "題本", "自修", "課本", "習作"]
+    if any(x in q and x in c for x in generic):
+        score += 0.05
+
+    score += 0.05 * SequenceMatcher(None, q, c).ratio()
+    return min(score, 1.0)
+
+
+def lookup_book_candidates_enhanced(query):
+    # 多種 query 送去 Google，避免正式書名的字序不同而掉出前五名。
+    normalized = normalize_book_match_text(query)
+    core = book_core_text(query)
+    variants = [str(query or "").strip(), normalized, core]
+
+    # 把科目與冊次也單獨保留，增加命中「5 數學-超級翰將講義」的機會。
+    for subject in ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]:
+        if subject in normalized:
+            variants.append(subject + core)
+            variants.append(core + subject)
+    nums = re.findall(r"\d+", normalized)
+    for num in nums:
+        variants.append(num + core)
+        variants.append(core + num)
+
+    merged = {}
+    for variant in unique_list([v for v in variants if v]):
+        for item in lookup_fuzzy_candidates("book", variant):
+            value = str(item.get("value", "")).strip()
+            if not value:
+                continue
+            local_score = book_keyword_score(query, value)
+            old = merged.get(value)
+            if old is None or local_score > old["score"]:
+                merged[value] = {
+                    "value": value,
+                    "publisher": str(item.get("publisher", "")),
+                    "school": "",
+                    "score": local_score
+                }
+
+    return sorted(merged.values(), key=lambda x: x["score"], reverse=True)[:10]
+
+
 def resolve_fuzzy_name(kind, query, school=""):
     """
     精確查不到時才使用。
     Google Apps Script 會回傳依相似度排序的候選名稱。
     高相似度直接採用；中等相似度要求使用者確認；低相似度不猜。
     """
-    candidates = lookup_fuzzy_candidates(kind, query, school=school)
+    candidates = (
+        lookup_book_candidates_enhanced(query)
+        if kind == "book"
+        else lookup_fuzzy_candidates(kind, query, school=school)
+    )
     if not candidates:
         return {"status": "none"}
 
@@ -2491,10 +2557,10 @@ def resolve_fuzzy_name(kind, query, school=""):
         auto_threshold = 0.78
         confirm_threshold = 0.58
         required_gap = 0.10
-    else:  # book
-        auto_threshold = 0.88
-        confirm_threshold = 0.68
-        required_gap = 0.06
+    else:  # book：採關鍵字／冊次／科目／系列名綜合分數
+        auto_threshold = 0.78
+        confirm_threshold = 0.58
+        required_gap = 0.08
 
     result = {
         "value": str(first.get("value", "")),
