@@ -117,6 +117,10 @@ def handle_message(user_id, user_text):
             "我會記住班級＋書名，再問你是哪一位老師。"
         )
 
+    # 0.5 一般招呼：固定回覆，避免掉到卡關訊息
+    if is_greeting_request(text):
+        return get_greeting_reply()
+
     # 1. 名稱容錯確認（老師／書名／學校）
     fuzzy_reply = handle_name_confirmation(user_id, text)
     if fuzzy_reply is not None:
@@ -382,35 +386,62 @@ def clear_all_user_state(user_id):
 
 
 # =========================================================
-# 功能選單
+# 招呼 / 功能選單
 # =========================================================
+def is_greeting_request(text):
+    compact = re.sub(r"[\s，,。.!！?？～~]+", "", str(text or "").lower())
+    phrases = {
+        "你好", "妳好", "您好", "哈囉", "哈羅", "hello", "hi",
+        "嗨", "早安", "午安", "晚安", "在嗎", "在不在"
+    }
+    return compact in phrases
+
+
+def get_greeting_reply():
+    return (
+        "👑 歡迎使用大漢訂書小幫手！\n\n"
+        "直接用平常講話告訴我就可以。\n"
+        "例如：王老師要訂書\n\n"
+        "想看完整功能，請輸入「功能」。"
+    )
+
+
 def is_help_request(text):
-    compact = re.sub(r"\s+", "", str(text or "").lower())
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or "").lower())
     phrases = {
         "功能", "功能介紹", "使用說明", "說明", "幫助", "help",
         "怎麼用", "如何使用", "你會什麼", "你可以幹嘛",
         "你可以做什麼", "你能幹嘛", "你能做什麼",
-        "你能幫我做什麼", "可以幫我做什麼",
-        "有什麼功能", "有哪些功能", "你有什麼功能",
-        "你有哪些功能"
+        "你能幫我做什麼", "可以幫我做什麼", "可以幹嘛",
+        "可以做什麼", "有什麼功能", "有哪些功能",
+        "你有什麼功能", "你有哪些功能"
     }
     return compact in phrases
 
 
 def get_help_reply():
     return (
-        "📚 大漢訂書小幫手\n\n"
-        "我可以幫你：\n"
-        "📚 訂書\n"
-        "📅 查詢單日訂單\n"
-        "👨‍🏫 查老師歷史訂單\n"
-        "✏️ 修改歷史訂單\n"
-        "❌ 取消歷史訂單\n"
-        "👥 查老師／班級人數\n"
-        "📖 查學校教科書版本\n"
-        "📦 其他訂單\n"
-        "✍️ 整理／草擬 LINE 訊息\n\n"
-        "💡 直接用平常講話告訴我就可以。"
+        "📚 大漢訂書小幫手功能\n\n"
+        "📚 1. 訂書\n"
+        "例：王老師701、703訂國一數學講義\n"
+        "例：701訂國一數學講義\n\n"
+        "📅 2. 查詢單日訂單\n"
+        "例：查今天訂單\n\n"
+        "👨‍🏫 3. 查老師訂書紀錄／進度\n"
+        "例：查王老師訂書紀錄\n\n"
+        "✏️ 4. 查詢／修改／取消歷史訂單\n"
+        "例：查005\n"
+        "例：005的701改30本\n"
+        "例：取消005訂單\n\n"
+        "👥 5. 查老師／班級／學生人數\n"
+        "例：王老師有幾個班\n"
+        "例：天母國中七年級多少人\n\n"
+        "📖 6. 查學校教科書版本\n"
+        "例：華興教科書版本\n"
+        "例：華興七年級版本\n\n"
+        "📦 7. 其他訂單\n"
+        "可新增、查詢、修改進度。\n\n"
+        "💡 不用背固定指令，直接用平常講話告訴我就可以。"
     )
 
 
@@ -771,14 +802,23 @@ def build_order_from_draft(user_id, draft):
                 "publisher": match.get("publisher", ""),
                 "original": book
             }
+            # 候選尚未確認前，不把錯的舊書名鎖在草稿裡。
+            # 使用者若直接輸入另一個書名，下一句可以重新辨識。
+            draft["book"] = ""
+            order_flow_context[user_id] = draft
             return (
                 "🔎 我猜你可能打到同音字或錯字。\n\n"
                 f"你輸入：{book}\n"
                 f"你是指：{match['value']} 嗎？\n\n"
-                "請回覆「是」或「不是」。"
+                "請回覆「是」或「不是」；也可以直接重新輸入書名。"
             )
 
     if not publisher:
+        # 查不到時只清掉書名，老師／學校／班級全部保留。
+        # 下一句會被當成新的書名重新查詢，而不是卡在第一次錯誤值。
+        draft["book"] = ""
+        order_flow_context[user_id] = draft
+        pending_name_confirmations.pop(user_id, None)
         return FIXED_FALLBACK_MESSAGE
 
     order = {
@@ -948,20 +988,22 @@ def unique_list(items):
 # =========================================================
 def make_order_confirmation(order):
     class_lines = [
-        f"{item['class_name']}：{int(item['students'])}本"
+        f"• {item['class_name']}班：{int(item['students'])}本"
         for item in order.get("classes", [])
     ]
 
     return (
         "📚 訂購確認\n\n"
-        f"老師：{order['teacher']}\n"
         f"學校：{order['school']}\n"
+        f"老師：{order['teacher']}\n"
         f"書名：{order['book']}\n"
         f"出版社：{order['publisher']}\n\n"
+        "班級與數量：\n"
         + "\n".join(class_lines)
         + f"\n\n總數量：{int(order.get('quantity', 0))}本\n\n"
-        "確認無誤請回覆「確認」。\n"
-        "若班級不對，直接告訴我要保留、增加或取消哪些班級。"
+        "以上訂購資料是否正確？\n"
+        "回覆「確認」後加入 Google 訂單表單。\n"
+        "如需修改，請直接告訴我要保留、增加、取消或調整哪些班級。"
     )
 
 
@@ -2495,15 +2537,30 @@ def lookup_book_candidates_enhanced(query):
     core = book_core_text(query)
     variants = [str(query or "").strip(), normalized, core]
 
-    # 把科目與冊次也單獨保留，增加命中「5 數學-超級翰將講義」的機會。
+    # 書名以「系列關鍵字＋科目＋冊次」拆開搜尋，字序不重要。
+    # 例如：麻辣自然5 -> 5 自然-麻辣講義
+    #       超級悍將數學5 -> 5 數學-超級翰將講義
+    subjects_found = []
     for subject in ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]:
         if subject in normalized:
-            variants.append(subject + core)
-            variants.append(core + subject)
+            subjects_found.append(subject)
+            variants.extend([subject, subject + core, core + subject])
+
     nums = re.findall(r"\d+", normalized)
     for num in nums:
-        variants.append(num + core)
-        variants.append(core + num)
+        variants.extend([num + core, core + num])
+        for subject in subjects_found:
+            variants.extend([
+                num + subject, subject + num,
+                num + subject + core, num + core + subject,
+                subject + num + core, subject + core + num,
+                core + subject + num, core + num + subject
+            ])
+
+    # 系列名通常是最有辨識力的關鍵字（例如「麻辣」「超級翰將」），
+    # 額外單獨查一次，避免 Google 端整串相似度把正式書名排除在前五名之外。
+    if core:
+        variants.append(core)
 
     merged = {}
     for variant in unique_list([v for v in variants if v]):
