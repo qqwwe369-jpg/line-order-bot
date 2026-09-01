@@ -49,6 +49,9 @@ pending_name_confirmations = {}
 # 王毓君 -> 直接重新查老師資料庫，不掉到一般 AI。
 pending_teacher_corrections = {}
 
+# 引導式功能模式
+guided_mode = {}
+
 # 學校清單快取：學校名稱直接由 Google 資料庫取得。
 # 未來新增學校，只要新增到「老師班級資料」或「學校版本資料」，
 # 不需要再修改 app.py。
@@ -109,17 +112,37 @@ def handle_message(user_id, user_text):
         or re.fullmatch(r"(?:重來|重新開始|全部重來|全部重設)[喔哦唷啦吧啊呀]*[！!。.]?", text)
     ):
         clear_all_user_state(user_id)
-        return (
-            "🔄 已重新開始\n\n"
-            "目前的老師、訂書草稿、待確認訂單、歷史訂單修改狀態都已清除。\n\n"
-            "你可以直接重新輸入，例如：\n"
-            "701訂國一數學講義\n\n"
-            "我會記住班級＋書名，再問你是哪一位老師。"
-        )
+        return get_main_menu_reply()
 
-    # 0.5 一般招呼：固定回覆，避免掉到卡關訊息
-    if is_greeting_request(text):
-        return get_greeting_reply()
+    # 0.5 引導式功能入口
+    if is_teacher_mode_start(text):
+        clear_task_states_for_new_mode(user_id)
+        guided_mode[user_id] = "teacher_lookup"
+        return "👨‍🏫 老師查詢\n\n請直接輸入老師姓名。\n如果有同音字或打錯一個字，我會先幫你找最接近的老師。"
+
+    if is_order_mode_start(text):
+        guided_mode.pop(user_id, None)
+        pending_teacher_corrections.pop(user_id, None)
+        pending_name_confirmations.pop(user_id, None)
+        return handle_order_flow(user_id, text)
+
+    if guided_mode.get(user_id) == "teacher_lookup":
+        if text in ["取消", "回主選單", "主選單", "離開"]:
+            guided_mode.pop(user_id, None)
+            pending_teacher_corrections.pop(user_id, None)
+            pending_name_confirmations.pop(user_id, None)
+            return get_main_menu_reply()
+        if user_id in pending_name_confirmations:
+            fuzzy_reply = handle_name_confirmation(user_id, text)
+            if fuzzy_reply is not None:
+                return fuzzy_reply
+        return handle_guided_teacher_lookup(user_id, text)
+
+    # 訂書模式鎖定：進入後不允許一般老師查詢把話題搶走。
+    if user_id in order_flow_context:
+        order_reply = handle_order_flow(user_id, text)
+        if order_reply is not None:
+            return order_reply
 
     # 1. 名稱容錯確認（老師／書名／學校）
     fuzzy_reply = handle_name_confirmation(user_id, text)
@@ -383,65 +406,99 @@ def clear_all_user_state(user_id):
     other_order_context.pop(user_id, None)
     pending_name_confirmations.pop(user_id, None)
     pending_teacher_corrections.pop(user_id, None)
+    guided_mode.pop(user_id, None)
 
 
 # =========================================================
-# 招呼 / 功能選單
+# 引導式主選單／查老師模式
 # =========================================================
-def is_greeting_request(text):
-    compact = re.sub(r"[\s，,。.!！?？～~]+", "", str(text or "").lower())
-    phrases = {
-        "你好", "妳好", "您好", "哈囉", "哈羅", "hello", "hi",
-        "嗨", "早安", "午安", "晚安", "在嗎", "在不在"
-    }
-    return compact in phrases
-
-
-def get_greeting_reply():
+def get_main_menu_reply():
     return (
-        "👑 歡迎使用大漢訂書小幫手！\n\n"
-        "直接用平常講話告訴我就可以。\n"
-        "例如：王老師要訂書\n\n"
-        "想看完整功能，請輸入「功能」。"
+        "🔄 已重新開始\n\n"
+        "請告訴我你要使用哪一個功能：\n\n"
+        "📚 要訂書 → 輸入「我要訂書」\n"
+        "👨‍🏫 要查老師 → 輸入「查老師」\n"
+        "📖 要查版本 → 輸入「查版本」\n"
+        "📅 要查訂單 → 輸入「查訂單」\n"
+        "📦 其他訂單 → 輸入「其他訂單」\n\n"
+        "完成一個查詢後，下一句會重新當成新的對話。"
     )
 
+def is_teacher_mode_start(text):
+    compact=re.sub(r"[\s，,。.!！?？]+","",str(text or ""))
+    return compact in {"查老師","我要查老師","查詢老師","老師查詢","找老師","我要找老師","查老師資料"}
 
+def is_order_mode_start(text):
+    compact=re.sub(r"[\s，,。.!！?？]+","",str(text or ""))
+    return compact in {"訂書","我要訂書","我訂書","開始訂書","幫我訂書","我要下單","幫我下單","要訂書"}
+
+def clear_task_states_for_new_mode(user_id):
+    order_flow_context.pop(user_id,None); pending_orders.pop(user_id,None)
+    pending_name_confirmations.pop(user_id,None); pending_teacher_corrections.pop(user_id,None)
+    teacher_lookup_context.pop(user_id,None)
+
+def normalize_teacher_name_input(text):
+    clean=re.sub(r"[，,。.!！?？\s]+","",str(text or ""))
+    clean=re.sub(r"^(?:我要)?(?:查|找)(?:一下)?(?:老師)?","",clean)
+    clean=re.sub(r"(?:老師)?(?:教哪個班|教哪歌班|教哪幾個班|教哪幾班|教哪些班|有哪些班|有幾個班|教什麼科|教哪科)$","",clean)
+    clean=re.sub(r"老師$","",clean)
+    return clean
+
+def finish_teacher_lookup(user_id,item):
+    reply=make_teacher_reply(item["school"],item["teacher"],item["classes"])
+    guided_mode.pop(user_id,None); pending_teacher_corrections.pop(user_id,None)
+    pending_name_confirmations.pop(user_id,None); teacher_lookup_context.pop(user_id,None)
+    conversation_context.pop(user_id,None)
+    return reply
+
+def handle_guided_teacher_lookup(user_id,text):
+    name=normalize_teacher_name_input(text)
+    if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}",name):
+        return "👨‍🏫 老師查詢\n\n我還在查老師模式。\n請直接輸入 2～4 個中文字的老師姓名。"
+    matches=lookup_teacher_matches(name+"老師",school="")
+    if len(matches)==1: return finish_teacher_lookup(user_id,matches[0])
+    if len(matches)>1:
+        schools=unique_list([m.get("school","") for m in matches if m.get("school")])
+        return f"🔎 找到同名老師。\n\n老師：{name}\n學校：{'、'.join(schools)}\n\n請輸入「學校＋老師姓名」，我會繼續留在查老師模式。"
+    fuzzy=resolve_fuzzy_name("teacher",name+"老師",school="")
+    if fuzzy.get("status")=="auto":
+        cm=lookup_teacher_matches(str(fuzzy.get("value","") or "").strip(),school=str(fuzzy.get("school","") or "").strip())
+        if len(cm)==1: return finish_teacher_lookup(user_id,cm[0])
+    if fuzzy.get("status")=="confirm":
+        pending_name_confirmations[user_id]={"field":"teacher","purpose":"guided_teacher_lookup","value":fuzzy.get("value",""),"school":fuzzy.get("school",""),"original":name}
+        return ("🔎 我猜你可能打到同音字或錯字。\n\n"+f"你輸入：{name}\n你是指：{fuzzy.get('value','')}"+(f"（{fuzzy.get('school')}）" if fuzzy.get("school") else "")+" 嗎？\n\n請回覆「是」或「不是」。")
+    return "⚠️ 目前找不到這位老師。\n\n"+f"你輸入：{name}\n\n"+"我還在「查老師」模式。\n請直接重新輸入老師姓名，不用再打一次「查老師」。"
+
+# =========================================================
+# 功能選單
+# =========================================================
 def is_help_request(text):
-    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or "").lower())
+    compact = re.sub(r"\s+", "", str(text or "").lower())
     phrases = {
         "功能", "功能介紹", "使用說明", "說明", "幫助", "help",
         "怎麼用", "如何使用", "你會什麼", "你可以幹嘛",
         "你可以做什麼", "你能幹嘛", "你能做什麼",
-        "你能幫我做什麼", "可以幫我做什麼", "可以幹嘛",
-        "可以做什麼", "有什麼功能", "有哪些功能",
-        "你有什麼功能", "你有哪些功能"
+        "你能幫我做什麼", "可以幫我做什麼",
+        "有什麼功能", "有哪些功能", "你有什麼功能",
+        "你有哪些功能"
     }
     return compact in phrases
 
 
 def get_help_reply():
     return (
-        "📚 大漢訂書小幫手功能\n\n"
-        "📚 1. 訂書\n"
-        "例：王老師701、703訂國一數學講義\n"
-        "例：701訂國一數學講義\n\n"
-        "📅 2. 查詢單日訂單\n"
-        "例：查今天訂單\n\n"
-        "👨‍🏫 3. 查老師訂書紀錄／進度\n"
-        "例：查王老師訂書紀錄\n\n"
-        "✏️ 4. 查詢／修改／取消歷史訂單\n"
-        "例：查005\n"
-        "例：005的701改30本\n"
-        "例：取消005訂單\n\n"
-        "👥 5. 查老師／班級／學生人數\n"
-        "例：王老師有幾個班\n"
-        "例：天母國中七年級多少人\n\n"
-        "📖 6. 查學校教科書版本\n"
-        "例：華興教科書版本\n"
-        "例：華興七年級版本\n\n"
-        "📦 7. 其他訂單\n"
-        "可新增、查詢、修改進度。\n\n"
-        "💡 不用背固定指令，直接用平常講話告訴我就可以。"
+        "📚 大漢訂書小幫手\n\n"
+        "我可以幫你：\n"
+        "📚 訂書\n"
+        "📅 查詢單日訂單\n"
+        "👨‍🏫 查老師歷史訂單\n"
+        "✏️ 修改歷史訂單\n"
+        "❌ 取消歷史訂單\n"
+        "👥 查老師／班級人數\n"
+        "📖 查學校教科書版本\n"
+        "📦 其他訂單\n"
+        "✍️ 整理／草擬 LINE 訊息\n\n"
+        "💡 直接用平常講話告訴我就可以。"
     )
 
 
@@ -484,6 +541,10 @@ def handle_order_flow(user_id, text):
 
     if user_id in order_flow_context:
         parsed = merge_followup_into_parsed(clean, parsed, draft)
+        if draft.get("teacher") and not draft.get("book") and not parsed.get("book"):
+            candidate=re.sub(r"^(?:我要訂|要訂|訂)","",clean).strip()
+            if candidate and any(w in candidate for w in ["講義","評量","教材","複習","測驗","題本","自修","課本","習作","學習單"]):
+                parsed["book"]=clean_book_name(candidate); parsed["has_order_intent"]=True
 
     if parsed.get("teacher"):
         draft["teacher"] = parsed["teacher"]
@@ -988,22 +1049,20 @@ def unique_list(items):
 # =========================================================
 def make_order_confirmation(order):
     class_lines = [
-        f"• {item['class_name']}班：{int(item['students'])}本"
+        f"{item['class_name']}：{int(item['students'])}本"
         for item in order.get("classes", [])
     ]
 
     return (
         "📚 訂購確認\n\n"
-        f"學校：{order['school']}\n"
         f"老師：{order['teacher']}\n"
+        f"學校：{order['school']}\n"
         f"書名：{order['book']}\n"
         f"出版社：{order['publisher']}\n\n"
-        "班級與數量：\n"
         + "\n".join(class_lines)
         + f"\n\n總數量：{int(order.get('quantity', 0))}本\n\n"
-        "以上訂購資料是否正確？\n"
-        "回覆「確認」後加入 Google 訂單表單。\n"
-        "如需修改，請直接告訴我要保留、增加、取消或調整哪些班級。"
+        "確認無誤請回覆「確認」。\n"
+        "若班級不對，直接告訴我要保留、增加或取消哪些班級。"
     )
 
 
@@ -1200,7 +1259,7 @@ def looks_like_teacher_lookup(text):
         return False
 
     words = [
-        "教幾個班", "教幾班", "教哪幾班", "教哪幾個班", "教哪些班",
+        "教幾個班", "教幾班", "教哪個班", "教哪歌班", "教哪幾班", "教哪幾個班", "教哪些班",
         "有幾個班", "有哪些班", "哪幾班", "哪幾個班",
         "班級資料", "班級人數", "每班幾人", "每班人數",
         "學生人數", "總人數", "幾個學生", "多少學生",
@@ -2649,6 +2708,13 @@ def handle_name_confirmation(user_id, text):
     if clean in yes_words:
         pending_name_confirmations.pop(user_id, None)
 
+        if pending.get("purpose") == "guided_teacher_lookup":
+            teacher=pending.get("value",""); school=pending.get("school","")
+            matches=lookup_teacher_matches(teacher,school=school)
+            if len(matches)==1: return finish_teacher_lookup(user_id,matches[0])
+            guided_mode[user_id]="teacher_lookup"
+            return "⚠️ 這個名稱仍找不到唯一老師資料。\n\n我還在「查老師」模式，請直接重新輸入老師姓名。"
+
         if pending.get("purpose") == "teacher_lookup":
             teacher = pending.get("value", "")
             school = pending.get("school", "")
@@ -2696,7 +2762,11 @@ def handle_name_confirmation(user_id, text):
         return make_order_guide_reply(draft)
 
     if clean in no_words:
-        pending_name_confirmations.pop(user_id, None)
+        was_guided_teacher=pending.get("purpose")=="guided_teacher_lookup"
+        pending_name_confirmations.pop(user_id,None)
+        if was_guided_teacher:
+            guided_mode[user_id]="teacher_lookup"
+            return "好，我不採用剛才的候選。\n\n我還在「查老師」模式，請直接重新輸入老師姓名。"
         field_name = {
             "teacher": "老師姓名",
             "book": "書名",
