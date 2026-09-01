@@ -114,17 +114,46 @@ def handle_message(user_id, user_text):
         clear_all_user_state(user_id)
         return get_main_menu_reply()
 
-    # 0.5 引導式功能入口
+    # 0.5 引導式功能入口：主選單五個指令都一定有下一步
     if is_teacher_mode_start(text):
         clear_task_states_for_new_mode(user_id)
         guided_mode[user_id] = "teacher_lookup"
-        return "👨‍🏫 老師查詢\n\n請直接輸入老師姓名。\n如果有同音字或打錯一個字，我會先幫你找最接近的老師。"
+        return (
+            "👨‍🏫 老師查詢\n\n"
+            "請直接輸入老師姓名。\n"
+            "如果有同音字或打錯一個字，我會先幫你找最接近的老師。"
+        )
 
     if is_order_mode_start(text):
         guided_mode.pop(user_id, None)
         pending_teacher_corrections.pop(user_id, None)
         pending_name_confirmations.pop(user_id, None)
         return handle_order_flow(user_id, text)
+
+    if is_version_mode_start(text):
+        clear_task_states_for_new_mode(user_id)
+        guided_mode[user_id] = "version_lookup"
+        return (
+            "📖 教科書版本查詢\n\n"
+            "請輸入學校名稱。\n"
+            "例如：天母國中、衛理女中、華興中學\n\n"
+            "也可以直接輸入「天母國中八年級」或「華興中學國一數學」。"
+        )
+
+    if is_history_mode_start(text):
+        clear_task_states_for_new_mode(user_id)
+        guided_mode[user_id] = "history_lookup"
+        return get_history_lookup_guide_reply()
+
+    if is_other_order_mode_start(text):
+        clear_task_states_for_new_mode(user_id)
+        guided_mode[user_id] = "other_order"
+        return (
+            "📦 其他訂單\n\n"
+            "請直接輸入：學校＋老師＋品項。\n"
+            "例如：天母國中王老師買書面紙20張\n\n"
+            "我會先整理成確認畫面，等你回覆「確認」後才寫入 Google。"
+        )
 
     if guided_mode.get(user_id) == "teacher_lookup":
         if text in ["取消", "回主選單", "主選單", "離開"]:
@@ -137,6 +166,37 @@ def handle_message(user_id, user_text):
             if fuzzy_reply is not None:
                 return fuzzy_reply
         return handle_guided_teacher_lookup(user_id, text)
+
+    if guided_mode.get(user_id) == "version_lookup":
+        if text in ["取消", "回主選單", "主選單", "離開"]:
+            guided_mode.pop(user_id, None)
+            return get_main_menu_reply()
+        return handle_guided_version_lookup(user_id, text)
+
+    if guided_mode.get(user_id) == "history_lookup":
+        if text in ["取消", "回主選單", "主選單", "離開"]:
+            guided_mode.pop(user_id, None)
+            return get_main_menu_reply()
+        return handle_guided_history_lookup(user_id, text)
+
+    if guided_mode.get(user_id) == "other_order":
+        if text in ["回主選單", "主選單", "離開"]:
+            pending_other_orders.pop(user_id, None)
+            guided_mode.pop(user_id, None)
+            return get_main_menu_reply()
+
+        if text == "確認" and user_id in pending_other_orders:
+            reply = confirm_other_order(user_id)
+            if not reply.startswith("❌") and not reply.startswith("⚠️"):
+                guided_mode.pop(user_id, None)
+            return reply
+
+        if text in ["取消", "不要了", "這筆不要"] and user_id in pending_other_orders:
+            pending_other_orders.pop(user_id, None)
+            guided_mode.pop(user_id, None)
+            return "❌ 已取消這筆「其他訂單」，Google 沒有寫入。"
+
+        return handle_guided_other_order(user_id, text)
 
     # 訂書模式鎖定：進入後不允許一般老師查詢把話題搶走。
     if user_id in order_flow_context:
@@ -432,6 +492,197 @@ def is_order_mode_start(text):
     compact=re.sub(r"[\s，,。.!！?？]+","",str(text or ""))
     return compact in {"訂書","我要訂書","我訂書","開始訂書","幫我訂書","我要下單","幫我下單","要訂書"}
 
+def is_version_mode_start(text):
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+    return compact in {
+        "查版本", "我要查版本", "查教科書版本", "版本查詢",
+        "我要查教科書版本", "教科書版本"
+    }
+
+
+def is_history_mode_start(text):
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+    return compact in {
+        "查訂單", "我要查訂單", "訂單查詢", "查訂書",
+        "查訂書訂單", "我要查訂書訂單"
+    }
+
+
+def is_other_order_mode_start(text):
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+    return compact in {
+        "其他訂單", "我要其他訂單", "新增其他訂單",
+        "登記其他訂單", "我要登記其他訂單"
+    }
+
+
+def get_history_lookup_guide_reply():
+    return (
+        "📅 訂單查詢\n\n"
+        "請直接告訴我要怎麼查：\n"
+        "• 今天 → 輸入「今天」\n"
+        "• 昨天 → 輸入「昨天」\n"
+        "• 指定日期 → 例如「8月30日」\n"
+        "• 訂單編號 → 例如「001」\n"
+        "• 老師 → 例如「王老師」\n\n"
+        "查不到時我會繼續留在「查訂單」模式。"
+    )
+
+
+def _finish_guided_mode(user_id, reply):
+    guided_mode.pop(user_id, None)
+    return reply
+
+
+def handle_guided_version_lookup(user_id, text):
+    clean = str(text or "").strip()
+    school = extract_school_name(clean)
+    if not school:
+        return (
+            "📖 教科書版本查詢\n\n"
+            "我還在「查版本」模式。\n"
+            "請輸入學校名稱，例如：天母國中、衛理女中、華興中學。"
+        )
+
+    grade = extract_grade_text(clean)
+    subjects = [
+        "國文", "英文", "數學", "自然", "生物", "理化",
+        "地科", "地球科學", "社會", "歷史", "地理", "公民"
+    ]
+    subject = next((s for s in subjects if s in clean), "")
+    if subject == "地球科學":
+        subject = "地科"
+
+    query = {
+        "school": school,
+        "grade": grade,
+        "subject": subject,
+        "academic_period": ""
+    }
+    result = lookup_school_versions(
+        query["school"], query["grade"], query["subject"], query["academic_period"]
+    )
+
+    if result is None:
+        return (
+            "⚠️ 教科書版本資料庫暫時查詢失敗。\n\n"
+            "我還在「查版本」模式，請稍後直接再輸入學校名稱。"
+        )
+    if not result.get("versions"):
+        return (
+            "⚠️ 查不到這個條件的教科書版本資料。\n\n"
+            f"學校：{school}"
+            + (f"\n年級：{grade}" if grade else "")
+            + (f"\n科目：{subject}" if subject else "")
+            + "\n\n我還在「查版本」模式，可以直接換一個學校、年級或科目。"
+        )
+    return _finish_guided_mode(user_id, handle_school_version_query(query))
+
+
+def parse_guided_date(text):
+    clean = re.sub(r"\s+", "", str(text or "").strip())
+    if clean in {"今天", "今日", "今天的", "今日的"}:
+        return datetime.now().strftime("%Y-%m-%d")
+    if clean in {"昨天", "昨日", "昨天的", "昨日的"}:
+        from datetime import timedelta
+        return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    m = re.fullmatch(r"(?:(\d{4})年)?(\d{1,2})月(\d{1,2})日?", clean)
+    if m:
+        year = int(m.group(1)) if m.group(1) else datetime.now().year
+        try:
+            return datetime(year, int(m.group(2)), int(m.group(3))).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    m = re.fullmatch(r"(?:(\d{4})[/-])?(\d{1,2})[/-](\d{1,2})", clean)
+    if m:
+        year = int(m.group(1)) if m.group(1) else datetime.now().year
+        try:
+            return datetime(year, int(m.group(2)), int(m.group(3))).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+
+    m = re.fullmatch(r"(\d{2})(\d{2})", clean)
+    if m:
+        try:
+            return datetime(datetime.now().year, int(m.group(1)), int(m.group(2))).strftime("%Y-%m-%d")
+        except ValueError:
+            return None
+    return None
+
+
+def handle_guided_history_lookup(user_id, text):
+    clean = re.sub(r"\s+", "", str(text or "").strip())
+
+    date_text = parse_guided_date(clean)
+    if date_text:
+        orders = lookup_orders_by_date(date_text)
+        if orders is None:
+            return "⚠️ 訂單查詢暫時失敗。\n\n我還在「查訂單」模式，可以直接再試一次。"
+        if not orders:
+            return (
+                f"📅 {date_text} 目前查不到訂書訂單。\n\n"
+                "我還在「查訂單」模式，可以改查其他日期、訂單編號或老師。"
+            )
+        return _finish_guided_mode(user_id, make_daily_orders_reply(date_text, orders))
+
+    m = re.fullmatch(r"(?:查)?(?:訂單)?(\d{1,6})", clean)
+    if m:
+        number = normalize_order_number(m.group(1))
+        order = lookup_google_order(number)
+        if not order:
+            return (
+                f"⚠️ 查不到訂單 {number}。\n\n"
+                "我還在「查訂單」模式，可以直接輸入另一個編號。"
+            )
+        historical_order_context[user_id] = order
+        return _finish_guided_mode(user_id, make_historical_order_reply(order))
+
+    teacher_name = re.sub(r"(?:老師)?(?:訂單|訂書|進度|紀錄)$", "", clean)
+    teacher_name = re.sub(r"老師$", "", teacher_name)
+    if re.fullmatch(r"[\u4e00-\u9fff]{2,4}", teacher_name):
+        teacher_matches = lookup_teacher_matches(teacher_name + "老師", school="")
+        canonical = ""
+        if len(teacher_matches) == 1:
+            canonical = str(teacher_matches[0].get("teacher", "") or "").strip()
+        else:
+            fuzzy = resolve_fuzzy_name("teacher", teacher_name + "老師", school="")
+            if fuzzy.get("status") == "auto":
+                canonical = str(fuzzy.get("value", "") or "").strip()
+
+        if not canonical:
+            canonical = teacher_name + "老師"
+
+        orders = lookup_book_orders_by_teacher(canonical)
+        if not orders:
+            return (
+                "⚠️ 查不到這位老師的訂書紀錄。\n\n"
+                f"老師：{canonical}\n\n"
+                "我還在「查訂單」模式，可以直接改輸入其他老師、日期或訂單編號。"
+            )
+        if len(orders) == 1:
+            historical_order_context[user_id] = orders[0]
+        return _finish_guided_mode(user_id, make_teacher_book_orders_reply(canonical, orders))
+
+    return get_history_lookup_guide_reply()
+
+
+def handle_guided_other_order(user_id, text):
+    parsed = parse_other_order(user_id, str(text or "").strip())
+    if parsed:
+        pending_other_orders[user_id] = parsed
+        return make_other_order_confirmation(parsed)
+
+    return (
+        "📦 其他訂單\n\n"
+        "我還在「其他訂單」模式。\n"
+        "請輸入：學校＋老師＋品項。\n"
+        "例如：天母國中王老師買書面紙20張\n\n"
+        "如果要離開，輸入「主選單」。"
+    )
+
+
 def clear_task_states_for_new_mode(user_id):
     order_flow_context.pop(user_id,None); pending_orders.pop(user_id,None)
     pending_name_confirmations.pop(user_id,None); pending_teacher_corrections.pop(user_id,None)
@@ -488,17 +739,13 @@ def is_help_request(text):
 def get_help_reply():
     return (
         "📚 大漢訂書小幫手\n\n"
-        "我可以幫你：\n"
-        "📚 訂書\n"
-        "📅 查詢單日訂單\n"
-        "👨‍🏫 查老師歷史訂單\n"
-        "✏️ 修改歷史訂單\n"
-        "❌ 取消歷史訂單\n"
-        "👥 查老師／班級人數\n"
-        "📖 查學校教科書版本\n"
-        "📦 其他訂單\n"
-        "✍️ 整理／草擬 LINE 訊息\n\n"
-        "💡 直接用平常講話告訴我就可以。"
+        "請告訴我你要使用哪一個功能：\n\n"
+        "📚 要訂書 → 輸入「我要訂書」\n"
+        "👨‍🏫 要查老師 → 輸入「查老師」\n"
+        "📖 要查版本 → 輸入「查版本」\n"
+        "📅 要查訂單 → 輸入「查訂單」\n"
+        "📦 其他訂單 → 輸入「其他訂單」\n\n"
+        "進入功能後，我會一步一步引導你完成。"
     )
 
 
@@ -1076,6 +1323,8 @@ def confirm_new_order(user_id):
         return "❌ 訂單寫入失敗，請稍後再試。"
 
     pending_orders.pop(user_id, None)
+    order_flow_context.pop(user_id, None)
+    guided_mode.pop(user_id, None)
 
     return (
         "✅ 訂單已確認\n\n"
@@ -2389,6 +2638,7 @@ def confirm_other_order(user_id):
         return "❌ 其他訂單寫入失敗，請稍後再試。"
 
     pending_other_orders.pop(user_id, None)
+    guided_mode.pop(user_id, None)
 
     return (
         "✅ 已寫入 Google「其他訂單」\n\n"
