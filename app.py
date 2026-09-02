@@ -10,7 +10,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-02-confirm-state-v5"
+APP_VERSION = "2026-09-02-candidate-replace-v7"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -136,7 +136,13 @@ def _hydrate_order_state(user_id):
             return
         draft_json, pending_json = row
         if draft_json:
-            order_flow_context[user_id] = json.loads(draft_json)
+            restored_draft = json.loads(draft_json)
+            order_flow_context[user_id] = restored_draft
+            # 最終訂購確認也要跨 worker 保存。否則使用者下一句「確認」
+            # 可能只恢復訂書草稿，卻遺失 pending_orders，導致再次產生確認單。
+            final_order = restored_draft.get("_pending_final_order")
+            if isinstance(final_order, dict) and final_order:
+                pending_orders[user_id] = final_order
         if pending_json:
             pending_name_confirmations[user_id] = json.loads(pending_json)
     except Exception as e:
@@ -244,6 +250,14 @@ def handle_message(user_id, user_text):
             confirmed_reply = handle_name_confirmation(user_id, text)
             if confirmed_reply is not None:
                 return confirmed_reply
+
+        # 名稱確認之後，第二優先就是「最終訂單確認」。
+        # 這一步一定要在訂書流程鎖定之前處理，否則「確認」會重新走
+        # handle_order_flow() 並再次產生同一張訂購確認。
+        final_order = pending_orders.get(user_id) or draft_for_confirm.get("_pending_final_order")
+        if isinstance(final_order, dict) and final_order:
+            pending_orders[user_id] = final_order
+            return confirm_new_order(user_id)
 
     # 0.5 引導式功能入口：主選單五個指令都一定有下一步
     if is_teacher_mode_start(text):
@@ -965,11 +979,26 @@ def validate_order_teacher_input(user_id, raw_text, draft):
         order_flow_context[user_id] = draft
         _persist_order_state(user_id)
         print(f"STATE saved teacher candidate user={user_id} value={value} school={candidate_school}")
-        return ("🔎 老師姓名可能有錯字。\n\n"
-                f"你輸入：{clean}\n"
-                f"資料庫找到：{value}" +
-                (f"（{candidate_school}）" if candidate_school else "") +
-                "\n\n請問你是指這位老師嗎？\n請回覆「確認」；不是的話請直接重新輸入姓名。")
+        # 候選不一定就是使用者真正想找的人。清楚告知：確認只代表採用這一位；
+        # 若不是，直接輸入另一個老師姓名，系統會取消舊候選並重新查資料庫。
+        other_candidates = []
+        for c in candidates[1:4]:
+            other_value = str(c.get("value", "") or "").strip()
+            other_school = str(c.get("school", "") or "").strip()
+            other_score = float(c.get("score", 0) or 0)
+            if other_value and other_score >= 0.52 and other_value != value:
+                other_candidates.append(other_value + (f"（{other_school}）" if other_school else ""))
+
+        reply = ("🔎 老師姓名可能有錯字。\n\n"
+                 f"你輸入：{clean}\n"
+                 f"資料庫找到：{value}" +
+                 (f"（{candidate_school}）" if candidate_school else "") +
+                 "\n\n請問你是指這位老師嗎？\n"
+                 "是的請回覆「確認」。\n"
+                 "如果不是，請直接輸入正確老師姓名，我會取消這個候選並重新查資料庫。")
+        if other_candidates:
+            reply += "\n\n其他接近的老師：" + "、".join(other_candidates)
+        return reply
 
     return ("⚠️ 老師資料庫目前無法確認這個姓名。\n\n"
             f"你輸入：{clean}\n\n"
@@ -1441,6 +1470,12 @@ def build_order_from_draft(user_id, draft):
 
     pending_orders[user_id] = order
 
+    # 把最終待確認訂單一起存在訂書狀態，讓 Render/Gunicorn 不同 worker
+    # 也能在下一句「確認」時直接寫入 Google，而不是重新產生確認單。
+    draft["_pending_final_order"] = copy.deepcopy(order)
+    order_flow_context[user_id] = draft
+    _persist_order_state(user_id)
+
     context = {
         "teacher": teacher,
         "school": school,
@@ -1625,7 +1660,9 @@ def confirm_new_order(user_id):
 
     pending_orders.pop(user_id, None)
     order_flow_context.pop(user_id, None)
+    pending_name_confirmations.pop(user_id, None)
     guided_mode.pop(user_id, None)
+    _clear_persisted_order_state(user_id)
 
     return (
         "✅ 訂單已確認\n\n"
@@ -3320,13 +3357,19 @@ def handle_name_confirmation(user_id, text):
         }.get(pending.get("field"), "名稱")
         return f"好，沒有採用。請重新輸入正確的{field_name}。"
 
-    # 使用者沒有回答是/不是，而是直接重打新名稱：放棄舊候選，照新訊息正常解析。
+    # 使用者沒有回答是/不是，而是直接輸入新的老師／書名：
+    # 明確放棄舊候選並保留目前訂書流程，讓同一則訊息立刻重新進資料庫驗證。
+    old_pending = dict(pending)
     pending_name_confirmations.pop(user_id, None)
     draft_for_pending = order_flow_context.get(user_id)
     if draft_for_pending:
         draft_for_pending.pop("_pending_name_confirmation", None)
         order_flow_context[user_id] = draft_for_pending
     _persist_order_state(user_id)
+    print(
+        f"STATE candidate replaced user={user_id} "
+        f"field={old_pending.get('field','')} old={old_pending.get('value','')} new_input={clean}"
+    )
     return None
 
 
