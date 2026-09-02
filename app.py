@@ -10,7 +10,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-02-candidate-replace-v7"
+APP_VERSION = "2026-09-02-book-candidate-replace-v8"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -1045,7 +1045,7 @@ def validate_order_book_input(user_id, raw_text, draft):
                f"資料庫找到：{value}\n")
         if extra:
             msg += "其他接近結果：" + "、".join(extra) + "\n"
-        return msg + "\n請問是這一本嗎？\n請回覆「確認」；不是的話請直接重新輸入書名。"
+        return msg + "\n請問是這一本嗎？\n是的請回覆「確認」。\n如果不是，請直接輸入正確書名或更明確的關鍵字，我會取消這個候選並重新查資料庫。"
 
     return ("⚠️ 我目前無法確認書名。\n\n"
             f"你輸入：{query}\n\n"
@@ -1422,7 +1422,11 @@ def build_order_from_draft(user_id, draft):
             "students": int(found["students"])
         })
 
-    publisher = get_book_publisher(book)
+    # 如果書名剛剛已由候選確認，出版社也已經一起存在 draft，直接採用。
+    # 只有沒有出版社資料時才重新查 Google，避免「書名候選 → 確認」又因 Google timeout 掉 fallback。
+    publisher = str(draft.get("publisher", "") or "").strip()
+    if not publisher:
+        publisher = get_book_publisher(book)
 
     # 書名精確查不到時，再查最接近的正式書名。
     if not publisher:
@@ -3321,7 +3325,8 @@ def handle_name_confirmation(user_id, text):
             draft["school"] = str(pending.get("school", "") or "").strip()
             draft["classes"] = []
         elif pending["field"] == "book":
-            # 書名候選同樣已由書籍資料庫搜尋取得；確認後直接採用正式書名與出版社暫存。
+            # 書名候選已由書籍資料庫取得；確認後直接採用正式書名與出版社。
+            # 不再把「確認」送回書名搜尋，也不為同一本書重查 Google。
             draft["book"] = str(pending.get("value", "") or "").strip()
             if pending.get("publisher"):
                 draft["publisher"] = str(pending.get("publisher", "") or "").strip()
