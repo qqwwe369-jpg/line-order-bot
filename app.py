@@ -3,10 +3,39 @@ import os
 import re
 import time
 import requests
+import json
+import copy
 from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
+
+# =========================================================
+# 速度優化：共用 HTTP Session + 讀取快取
+# =========================================================
+HTTP = requests.Session()
+_google_read_cache = {}
+
+# 這些都是相對穩定的資料庫讀取，可安全短時間快取。
+_GOOGLE_CACHE_TTLS = {
+    "list_schools": 600,
+    "lookup_teacher_matches": 300,
+    "lookup_teacher": 300,
+    "lookup_school_classes": 300,
+    "lookup_versions": 300,
+    "lookup_book": 300,
+    "lookup_fuzzy_candidates": 180,
+}
+
+def _cache_key(payload):
+    try:
+        return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        return str(payload)
+
+def clear_google_read_cache():
+    _google_read_cache.clear()
+
 
 # =========================================================
 # 環境變數
@@ -89,13 +118,22 @@ def callback():
         source = event.get("source", {})
         user_id = source.get("userId", "unknown")
 
+        request_started = time.perf_counter()
         try:
             reply_message = add_lebron_flavor(handle_message(user_id, user_text))
         except Exception as error:
             print("handle_message error:", error)
             reply_message = FIXED_FALLBACK_MESSAGE
 
+        handle_elapsed = time.perf_counter() - request_started
+        line_started = time.perf_counter()
         reply_to_line(reply_token, reply_message)
+        line_elapsed = time.perf_counter() - line_started
+        total_elapsed = time.perf_counter() - request_started
+        print(
+            f"PERF user={user_id} handle={handle_elapsed:.3f}s "
+            f"line={line_elapsed:.3f}s total={total_elapsed:.3f}s text={user_text[:40]}"
+        )
 
     return "OK", 200
 
@@ -2519,8 +2557,8 @@ def get_school_catalog(force_refresh=False):
 
     result = google_post(
         {"action": "list_schools"},
-        timeout=20,
-        retries=2
+        timeout=7,
+        retries=1
     )
 
     schools = []
@@ -3035,7 +3073,7 @@ def lookup_fuzzy_candidates(kind, query, school=""):
         "kind": kind,
         "query": str(query or ""),
         "school": str(school or "")
-    }, timeout=20, retries=2)
+    }, timeout=7, retries=1)
 
     if not result or not result.get("success"):
         return []
@@ -3046,41 +3084,70 @@ def lookup_fuzzy_candidates(kind, query, school=""):
 # =========================================================
 # Google Apps Script
 # =========================================================
-def google_post(payload, timeout=15, retries=1):
+def google_post(payload, timeout=10, retries=1):
     if not GOOGLE_SCRIPT_URL:
         print("GOOGLE_SCRIPT_URL missing")
         return None
 
-    for attempt in range(retries):
+    action = str(payload.get("action", ""))
+    cache_ttl = int(_GOOGLE_CACHE_TTLS.get(action, 0) or 0)
+    key = _cache_key(payload) if cache_ttl > 0 else ""
+    now = time.time()
+
+    # 快取命中：完全不打 Google Apps Script，通常可把回覆縮到很短。
+    if cache_ttl > 0 and key in _google_read_cache:
+        item = _google_read_cache.get(key) or {}
+        if now < float(item.get("expires_at", 0) or 0):
+            print(f"Google cache HIT: {action}")
+            return copy.deepcopy(item.get("data"))
+        _google_read_cache.pop(key, None)
+
+    attempts = max(1, int(retries or 1))
+    started = time.perf_counter()
+
+    for attempt in range(attempts):
         try:
-            response = requests.post(
+            response = HTTP.post(
                 GOOGLE_SCRIPT_URL,
                 json=payload,
                 timeout=timeout
             )
 
+            elapsed = time.perf_counter() - started
             print(
-                "Google action:",
-                payload.get("action"),
-                "status:",
-                response.status_code,
-                "response:",
-                response.text[:1000]
+                f"Google action={action} status={response.status_code} "
+                f"elapsed={elapsed:.3f}s attempt={attempt + 1}/{attempts}"
             )
 
             if response.status_code != 200:
-                if attempt < retries - 1:
-                    time.sleep(0.4 * (attempt + 1))
+                if attempt < attempts - 1:
+                    time.sleep(0.15 * (attempt + 1))
                     continue
                 return None
 
-            return response.json()
+            data = response.json()
+
+            if cache_ttl > 0 and isinstance(data, dict):
+                _google_read_cache[key] = {
+                    "data": copy.deepcopy(data),
+                    "expires_at": time.time() + cache_ttl
+                }
+
+            # 寫入／修改／取消成功後，把舊讀取快取清掉，避免看到舊資料。
+            if action in {
+                "create_order", "update_order", "cancel_order",
+                "create_other_order", "update_other_order"
+            } and isinstance(data, dict) and data.get("success"):
+                clear_google_read_cache()
+
+            return data
 
         except Exception as error:
-            print("Google request error:", payload.get("action"), error)
+            elapsed = time.perf_counter() - started
+            print(f"Google request error: {action} elapsed={elapsed:.3f}s error={error}")
 
-            if attempt < retries - 1:
-                time.sleep(0.4 * (attempt + 1))
+            if attempt < attempts - 1:
+                time.sleep(0.15 * (attempt + 1))
                 continue
 
             return None
@@ -3093,7 +3160,7 @@ def lookup_teacher_matches(teacher, school=""):
         "action": "lookup_teacher_matches",
         "teacher": str(teacher or "").strip(),
         "school": str(school or "").strip()
-    }, timeout=20, retries=2)
+    }, timeout=7, retries=1)
 
     if not result or not result.get("success"):
         return []
@@ -3272,7 +3339,7 @@ def lookup_school_classes(school, grade="", class_name=""):
         "school": school,
         "grade": grade,
         "class_name": class_name
-    }, timeout=20, retries=3)
+    }, timeout=7, retries=1)
 
     if not result or not result.get("success"):
         return None
@@ -3310,7 +3377,7 @@ def lookup_school_versions(
             "grade": grade,
             "subject": subject,
             "academic_period": academic_period
-        }, timeout=20, retries=3)
+        }, timeout=7, retries=1)
 
     result = do_lookup(school)
 
@@ -3597,7 +3664,7 @@ def reply_to_line(reply_token, message):
     }
 
     try:
-        response = requests.post(
+        response = HTTP.post(
             url,
             headers=headers,
             json=data,
