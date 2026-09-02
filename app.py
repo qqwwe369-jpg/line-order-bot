@@ -10,7 +10,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-02-book-search-stable-v9"
+APP_VERSION = "2026-09-02-wrapup-v10"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -531,6 +531,12 @@ def handle_message(user_id, user_text):
     if is_ai_writing_request(text):
         return FIXED_FALLBACK_MESSAGE
 
+    # 14.5 學校＋年級＋科目老師：直接查老師班級資料庫。
+    # 例如「華興七年級歷史老師」→ 依老師分組列出班級＋人數。
+    subject_teacher_query = parse_subject_teacher_query(text)
+    if subject_teacher_query:
+        return handle_subject_teacher_query(subject_teacher_query)
+
     # 15. 老師資料庫：優先於學校統計
     # 例如「造德芳教哪幾個班」不能被誤判成「華興有哪些班」。
     if looks_like_teacher_lookup(text):
@@ -632,7 +638,8 @@ def get_main_menu_reply():
         "🔄 已重新開始\n\n"
         "請告訴我你要使用哪一個功能：\n\n"
         "📚 要訂書 → 輸入「我要訂書」\n"
-        "👨‍🏫 要查老師 → 輸入「查老師」\n"
+        "👨‍🏫 查個別老師 → 例如「謝明清有幾個班」\n"
+        "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
         "📖 要查版本 → 輸入「查版本」\n"
         "📅 要查訂單 → 輸入「查訂單」\n"
         "📦 其他訂單 → 輸入「其他訂單」\n\n"
@@ -641,7 +648,7 @@ def get_main_menu_reply():
 
 def is_teacher_mode_start(text):
     compact=re.sub(r"[\s，,。.!！?？]+","",str(text or ""))
-    return compact in {"查老師","我要查老師","查詢老師","老師查詢","找老師","我要找老師","查老師資料"}
+    return compact in {"查老師","我要查老師","查詢老師","老師查詢","找老師","我要找老師","查老師資料","查各科老師","各科老師"}
 
 def is_order_mode_start(text):
     compact=re.sub(r"[\s，,。.!！?？]+","",str(text or ""))
@@ -714,9 +721,16 @@ def handle_guided_version_lookup(user_id, text):
         "subject": subject,
         "academic_period": ""
     }
-    result = lookup_school_versions(
-        query["school"], query["grade"], query["subject"], query["academic_period"]
-    )
+    # 未指定年級時，強制分別查七／八／九年級後合併。
+    # 避免 Google 端「最新學年度」篩選只留下其中一個年級。
+    if not query["grade"]:
+        result = lookup_school_versions_all_junior_grades(
+            query["school"], query["subject"], query["academic_period"]
+        )
+    else:
+        result = lookup_school_versions(
+            query["school"], query["grade"], query["subject"], query["academic_period"]
+        )
 
     if result is None:
         return (
@@ -858,7 +872,58 @@ def finish_teacher_lookup(user_id,item):
     conversation_context.pop(user_id,None)
     return reply
 
+def parse_subject_teacher_query(text):
+    clean = re.sub(r"[，,。.!！?？：:\s]+", "", str(text or ""))
+    if "老師" not in clean and "誰教" not in clean:
+        return None
+    school = extract_school_name(clean)
+    grade = extract_grade_text(clean)
+    subjects = ["國文", "英文", "數學", "自然", "生物", "理化", "地球科學", "地科", "社會", "歷史", "地理", "公民"]
+    subject = next((x for x in subjects if x in clean), "")
+    if subject == "地球科學":
+        subject = "地科"
+    if not school or not grade or not subject:
+        return None
+    return {"school": school, "grade": grade, "subject": subject}
+
+
+def handle_subject_teacher_query(query):
+    matches = lookup_teacher_matches(
+        "", school=query["school"], grade=query["grade"], subject=query["subject"]
+    )
+    if not matches:
+        return (
+            "⚠️ 查不到符合條件的老師資料。\n\n"
+            f"學校：{query['school']}\n年級：{query['grade']}\n科目：{query['subject']}"
+        )
+
+    lines = [f"👨‍🏫 {query['school']}｜{query['grade']} {query['subject']}老師", ""]
+    total_classes = 0
+    for item in matches:
+        teacher = str(item.get("teacher", "")).strip()
+        selected = []
+        for c in item.get("classes", []):
+            subjects = [str(x).strip() for x in c.get("subjects", [])]
+            if query["subject"] not in subjects:
+                continue
+            selected.append(c)
+        if not selected:
+            continue
+        lines.append(f"【{teacher}】")
+        for c in selected:
+            lines.append(f"• {c.get('class_name','')}班：{int(c.get('students',0) or 0)}人")
+            total_classes += 1
+        lines.append("")
+    if total_classes == 0:
+        return "⚠️ 查不到符合條件的老師資料。"
+    lines.append(f"📚 共 {total_classes} 個班")
+    return "\n".join(lines).strip()
+
+
 def handle_guided_teacher_lookup(user_id,text):
+    subject_query = parse_subject_teacher_query(text)
+    if subject_query:
+        return _finish_guided_mode(user_id, handle_subject_teacher_query(subject_query))
     name=normalize_teacher_name_input(text)
     if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}",name):
         return "👨‍🏫 老師查詢\n\n我還在查老師模式。\n請直接輸入 2～4 個中文字的老師姓名。"
@@ -891,7 +956,7 @@ def get_greeting_reply():
         "很高興為你服務！\n\n"
         "你可以直接輸入：\n"
         "📚 我要訂書\n"
-        "👨‍🏫 查老師\n"
+        "👨‍🏫 查個別老師／查各科老師\n"
         "📖 查版本\n"
         "📅 查訂單\n"
         "📦 其他訂單\n\n"
@@ -917,7 +982,8 @@ def get_help_reply():
         "📚 大漢訂書小幫手\n\n"
         "請告訴我你要使用哪一個功能：\n\n"
         "📚 要訂書 → 輸入「我要訂書」\n"
-        "👨‍🏫 要查老師 → 輸入「查老師」\n"
+        "👨‍🏫 查個別老師 → 例如「謝明清有幾個班」\n"
+        "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
         "📖 要查版本 → 輸入「查版本」\n"
         "📅 要查訂單 → 輸入「查訂單」\n"
         "📦 其他訂單 → 輸入「其他訂單」\n\n"
@@ -2706,12 +2772,19 @@ def parse_school_version_query(user_id, text):
 
 
 def handle_school_version_query(query):
-    result = lookup_school_versions(
-        query["school"],
-        query.get("grade", ""),
-        query.get("subject", ""),
-        query.get("academic_period", "")
-    )
+    if not query.get("grade"):
+        result = lookup_school_versions_all_junior_grades(
+            query["school"],
+            query.get("subject", ""),
+            query.get("academic_period", "")
+        )
+    else:
+        result = lookup_school_versions(
+            query["school"],
+            query.get("grade", ""),
+            query.get("subject", ""),
+            query.get("academic_period", "")
+        )
 
     if result is None:
         return "⚠️ 教科書版本資料庫暫時查詢失敗，請稍後再試。"
@@ -3478,11 +3551,13 @@ def google_post(payload, timeout=10, retries=1):
     return None
 
 
-def lookup_teacher_matches(teacher, school=""):
+def lookup_teacher_matches(teacher, school="", grade="", subject=""):
     result = google_post({
         "action": "lookup_teacher_matches",
         "teacher": str(teacher or "").strip(),
-        "school": str(school or "").strip()
+        "school": str(school or "").strip(),
+        "grade": str(grade or "").strip(),
+        "subject": str(subject or "").strip()
     }, timeout=7, retries=1)
 
     if not result or not result.get("success"):
@@ -3685,6 +3760,24 @@ def lookup_school_classes(school, grade="", class_name=""):
             ) or 0
         )
     }
+
+
+def lookup_school_versions_all_junior_grades(school, subject="", academic_period=""):
+    combined = []
+    periods = []
+    any_success = False
+    for grade in ["七年級", "八年級", "九年級"]:
+        part = lookup_school_versions(school, grade, subject, academic_period)
+        if part is None:
+            continue
+        any_success = True
+        combined.extend(part.get("versions", []))
+        if part.get("latest_period"):
+            periods.append(str(part.get("latest_period")))
+    if not any_success:
+        return None
+    latest = academic_period or (max(periods) if periods else "")
+    return {"latest_period": latest, "versions": combined}
 
 
 def lookup_school_versions(
@@ -3931,6 +4024,10 @@ def add_lebron_flavor(message):
         "班級資料", "學生人數", "總學生人數", "班級總數", "幾個班", "多少人"
     ]):
         intro = "👑 LeBron James 幫你點完名了"
+
+    # 新訂單完成（要早於歷史訂單判斷，因完成訊息也含「訂單編號」）
+    elif "訂單已確認" in compact and ("已成功寫入" in compact or "訂單編號" in compact):
+        intro = "👑 LeBron James 這筆訂單完成助攻"
 
     # 歷史訂單／單日訂單／進度
     elif any(key in compact for key in [
