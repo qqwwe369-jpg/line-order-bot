@@ -152,6 +152,14 @@ def handle_message(user_id, user_text):
         clear_all_user_state(user_id)
         return get_main_menu_reply()
 
+    # 0.1 純本地固定指令：絕對不能碰 Google / AI
+    # 招呼與功能查詢必須在所有資料庫查詢之前直接 return。
+    if is_greeting_request(text):
+        return get_greeting_reply()
+
+    if is_help_request(text):
+        return get_help_reply()
+
     # 0.5 引導式功能入口：主選單五個指令都一定有下一步
     if is_teacher_mode_start(text):
         clear_task_states_for_new_mode(user_id)
@@ -759,8 +767,28 @@ def handle_guided_teacher_lookup(user_id,text):
     return "⚠️ 目前找不到這位老師。\n\n"+f"你輸入：{name}\n\n"+"我還在「查老師」模式。\n請直接重新輸入老師姓名，不用再打一次「查老師」。"
 
 # =========================================================
-# 功能選單
+# 招呼／功能選單（純本地，不查 Google）
 # =========================================================
+def is_greeting_request(text):
+    compact = re.sub(r"[，,。.!！?？\s]+", "", str(text or "").lower())
+    greetings = ["你好", "妳好", "您好", "哈囉", "哈啰", "嗨", "早安", "午安", "晚安", "在嗎"]
+    return any(compact == g or compact.startswith(g + "我是") for g in greetings)
+
+
+def get_greeting_reply():
+    return (
+        "你好！我是大漢訂書小幫手 👑 LeBron James 還差一個助攻\n\n"
+        "很高興為你服務！\n\n"
+        "你可以直接輸入：\n"
+        "📚 我要訂書\n"
+        "👨‍🏫 查老師\n"
+        "📖 查版本\n"
+        "📅 查訂單\n"
+        "📦 其他訂單\n\n"
+        "也可以輸入「有什麼功能」查看使用方式。"
+    )
+
+
 def is_help_request(text):
     compact = re.sub(r"\s+", "", str(text or "").lower())
     phrases = {
@@ -790,6 +818,90 @@ def get_help_reply():
 # =========================================================
 # 訂書流程
 # =========================================================
+def validate_order_teacher_input(user_id, raw_text, draft):
+    """訂書流程老師關卡：資料庫驗證成功前絕不進入書名。"""
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
+    clean = re.sub(r"老師$", "", clean).strip()
+    if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}", clean):
+        return "請輸入老師姓名，例如：蔡書玄"
+
+    school = str(draft.get("school") or "").strip()
+    matches = lookup_teacher_matches(clean, school=school)
+    if not matches and school:
+        matches = lookup_teacher_matches(clean, school="")
+
+    if len(matches) == 1:
+        item = matches[0]
+        draft["teacher"] = item["teacher"]
+        draft["school"] = item["school"]
+        draft["classes"] = []
+        order_flow_context[user_id] = draft
+        return make_order_guide_reply(draft)
+
+    if len(matches) > 1:
+        schools = unique_list([m.get("school", "") for m in matches if m.get("school")])
+        return ("🔎 資料庫找到同名老師。\n\n"
+                f"老師：{clean}\n學校：{'、'.join(schools)}\n\n"
+                "請把學校一起告訴我，確認唯一資料後才會進入下一步。")
+
+    fuzzy = resolve_fuzzy_name("teacher", clean, school=school)
+    if fuzzy.get("status") in ["auto", "confirm"] and fuzzy.get("value"):
+        pending_name_confirmations[user_id] = {
+            "field": "teacher", "purpose": "order_teacher",
+            "value": fuzzy["value"], "school": fuzzy.get("school", ""),
+            "original": clean
+        }
+        return ("🔎 老師姓名可能有錯字。\n\n"
+                f"你輸入：{clean}\n"
+                f"資料庫找到：{fuzzy['value']}" +
+                (f"（{fuzzy.get('school')}）" if fuzzy.get('school') else "") +
+                "\n\n請問你是指這位老師嗎？\n請回覆「確認」；不是的話請直接重新輸入姓名。")
+
+    return ("⚠️ 老師資料庫找不到這個姓名。\n\n"
+            f"你輸入：{clean}\n\n"
+            "我不會先把這個名字存進訂單。請重新輸入老師姓名。")
+
+
+def validate_order_book_input(user_id, raw_text, draft):
+    """訂書流程書名關卡：精確或關鍵字候選必須來自書籍資料庫。"""
+    query = clean_book_name(str(raw_text or "").strip())
+    query = re.sub(r"^(?:我要訂|要訂|訂)", "", query).strip()
+    if not query:
+        return "請輸入書名或書名關鍵字。"
+
+    publisher = get_book_publisher(query)
+    if publisher:
+        draft["book"] = query
+        order_flow_context[user_id] = draft
+        return build_order_from_draft(user_id, draft)
+
+    candidates = lookup_book_candidates_enhanced(query)
+    if not candidates:
+        return ("⚠️ 書籍資料庫找不到符合的書名。\n\n"
+                f"你輸入：{query}\n\n"
+                "老師資料已保留，請重新輸入書名或更明確的關鍵字。")
+
+    first = candidates[0]
+    score = float(first.get("score", 0) or 0)
+    if score >= 0.52:
+        pending_name_confirmations[user_id] = {
+            "field": "book", "purpose": "order_book",
+            "value": first.get("value", ""),
+            "publisher": first.get("publisher", ""), "original": query
+        }
+        extra = [c.get("value", "") for c in candidates[1:3] if c.get("value") and float(c.get("score",0) or 0) >= max(0.52, score-0.08)]
+        msg = ("🔎 我從書籍資料庫找到最接近的書。\n\n"
+               f"你輸入：{query}\n"
+               f"資料庫找到：{first.get('value','')}\n")
+        if extra:
+            msg += "其他接近結果：" + "、".join(extra) + "\n"
+        return msg + "\n請問是這一本嗎？\n請回覆「確認」；不是的話請直接重新輸入書名。"
+
+    return ("⚠️ 我目前無法確認書名。\n\n"
+            f"你輸入：{query}\n\n"
+            "老師資料已保留，請再輸入一次完整書名或更明確的關鍵字。")
+
+
 def handle_order_flow(user_id, text):
     clean = normalize_order_typo(text)
 
@@ -814,6 +926,13 @@ def handle_order_flow(user_id, text):
         "classes": [],
         "book": ""
     })
+
+    # 已進入訂書流程時，每一關都先查資料庫驗證；成功前不准往下一關。
+    if user_id in order_flow_context and not draft.get("teacher"):
+        return validate_order_teacher_input(user_id, clean, draft)
+
+    if user_id in order_flow_context and draft.get("teacher") and not draft.get("book"):
+        return validate_order_book_input(user_id, clean, draft)
 
     parsed = parse_order_message(clean)
 
@@ -3024,10 +3143,18 @@ def handle_name_confirmation(user_id, text):
             return "✅ 已確認名稱。請重新輸入剛才的訂書內容。"
 
         if pending["field"] == "teacher":
-            draft["teacher"] = pending["value"]
-            if pending.get("school"):
-                draft["school"] = pending["school"]
+            # 使用者確認錯字候選後，再做一次資料庫 exact 驗證才放行。
+            matches = lookup_teacher_matches(pending["value"], school=pending.get("school", ""))
+            if len(matches) != 1:
+                return "⚠️ 老師資料庫目前無法確認唯一資料，請重新輸入老師姓名。"
+            item = matches[0]
+            draft["teacher"] = item["teacher"]
+            draft["school"] = item["school"]
+            draft["classes"] = []
         elif pending["field"] == "book":
+            # 候選也必須確實存在書籍資料庫。
+            if not get_book_publisher(pending["value"]):
+                return "⚠️ 書籍資料庫目前無法確認這本書，請重新輸入書名。"
             draft["book"] = pending["value"]
         elif pending["field"] == "school":
             draft["school"] = pending["value"]
