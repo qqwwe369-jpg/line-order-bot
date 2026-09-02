@@ -5,10 +5,12 @@ import time
 import requests
 import json
 import copy
+import sqlite3
 from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
+APP_VERSION = "2026-09-02-confirm-state-v5"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -81,6 +83,72 @@ pending_teacher_corrections = {}
 # 引導式功能模式
 guided_mode = {}
 
+# =========================================================
+# 訂書關鍵狀態：SQLite 暫存
+# =========================================================
+# Gunicorn/Render 可能由不同 worker 接收前後兩則 LINE 訊息。
+# 只用 Python 全域 dict 時，上一句找到的候選可能在下一個 worker 看不到，
+# 造成「確認」被誤當成新的老師姓名或書名。
+_STATE_DB_PATH = os.environ.get("ORDER_STATE_DB_PATH", "/tmp/line_order_bot_state.sqlite3")
+
+def _state_db():
+    conn = sqlite3.connect(_STATE_DB_PATH, timeout=2)
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS order_state ("
+        "user_id TEXT PRIMARY KEY, draft_json TEXT, pending_json TEXT, updated_at REAL)"
+    )
+    return conn
+
+def _persist_order_state(user_id):
+    draft = order_flow_context.get(user_id)
+    pending = pending_name_confirmations.get(user_id)
+    if draft is None and pending is None:
+        try:
+            with _state_db() as conn:
+                conn.execute("DELETE FROM order_state WHERE user_id=?", (user_id,))
+        except Exception as e:
+            print("state persist delete error:", e)
+        return
+    try:
+        with _state_db() as conn:
+            conn.execute(
+                "INSERT INTO order_state(user_id,draft_json,pending_json,updated_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET draft_json=excluded.draft_json, "
+                "pending_json=excluded.pending_json, updated_at=excluded.updated_at",
+                (
+                    user_id,
+                    json.dumps(draft, ensure_ascii=False) if draft is not None else None,
+                    json.dumps(pending, ensure_ascii=False) if pending is not None else None,
+                    time.time(),
+                ),
+            )
+    except Exception as e:
+        print("state persist error:", e)
+
+def _hydrate_order_state(user_id):
+    # 每一則訊息都從共享 SQLite 補回關鍵訂書狀態，避免跨 worker 遺失。
+    try:
+        with _state_db() as conn:
+            row = conn.execute(
+                "SELECT draft_json,pending_json FROM order_state WHERE user_id=?", (user_id,)
+            ).fetchone()
+        if not row:
+            return
+        draft_json, pending_json = row
+        if draft_json:
+            order_flow_context[user_id] = json.loads(draft_json)
+        if pending_json:
+            pending_name_confirmations[user_id] = json.loads(pending_json)
+    except Exception as e:
+        print("state hydrate error:", e)
+
+def _clear_persisted_order_state(user_id):
+    try:
+        with _state_db() as conn:
+            conn.execute("DELETE FROM order_state WHERE user_id=?", (user_id,))
+    except Exception as e:
+        print("state clear error:", e)
+
 # 學校清單快取：學校名稱直接由 Google 資料庫取得。
 # 未來新增學校，只要新增到「老師班級資料」或「學校版本資料」，
 # 不需要再修改 app.py。
@@ -94,14 +162,14 @@ school_catalog_cache = {
 # =========================================================
 @app.route("/", methods=["GET"])
 def home():
-    return "LINE Order Bot is running!"
+    return f"LINE Order Bot is running! {APP_VERSION}"
 
 
 @app.route("/callback", methods=["POST"])
 def callback():
     body = request.get_json(silent=True) or {}
 
-    print("Webhook received")
+    print("Webhook received", APP_VERSION)
     print(body)
 
     for event in body.get("events", []):
@@ -143,6 +211,11 @@ def callback():
 # =========================================================
 def handle_message(user_id, user_text):
     text = normalize_text(user_text)
+    _hydrate_order_state(user_id)
+    if text in {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}:
+        _d = order_flow_context.get(user_id) or {}
+        _p = pending_name_confirmations.get(user_id) or _d.get("_pending_name_confirmation")
+        print(f"STATE confirm user={user_id} draft_teacher={_d.get('teacher','')} pending={_p}")
 
     # 0. 重來：一定最優先
     if (
@@ -159,6 +232,18 @@ def handle_message(user_id, user_text):
 
     if is_help_request(text):
         return get_help_reply()
+
+    # 本地版本查詢：方便確認 Render 是否真的部署到最新 app.py。
+    if text in {"版本", "版本號", "目前版本", "程式版本"}:
+        return f"目前機器人版本：{APP_VERSION}"
+
+    # 0.2 「確認」硬性優先：只要上一句有名稱候選，絕不能再把「確認」當姓名/書名搜尋。
+    if text in {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}:
+        draft_for_confirm = order_flow_context.get(user_id) or {}
+        if user_id in pending_name_confirmations or draft_for_confirm.get("_pending_name_confirmation"):
+            confirmed_reply = handle_name_confirmation(user_id, text)
+            if confirmed_reply is not None:
+                return confirmed_reply
 
     # 0.5 引導式功能入口：主選單五個指令都一定有下一步
     if is_teacher_mode_start(text):
@@ -243,6 +328,15 @@ def handle_message(user_id, user_text):
             return "❌ 已取消這筆「其他訂單」，Google 沒有寫入。"
 
         return handle_guided_other_order(user_id, text)
+
+    # 0.9 名稱候選確認一定要早於訂書流程。
+    # 例如：蔡書懸 -> 候選蔡書玄 -> 使用者回「確認」時，
+    # 必須先吃掉這個確認，不能把「確認」當成新的老師姓名/書名去查。
+    order_draft_for_confirm = order_flow_context.get(user_id) or {}
+    if user_id in pending_name_confirmations or order_draft_for_confirm.get("_pending_name_confirmation"):
+        fuzzy_reply = handle_name_confirmation(user_id, text)
+        if fuzzy_reply is not None:
+            return fuzzy_reply
 
     # 訂書模式鎖定：進入後不允許一般老師查詢把話題搶走。
     if user_id in order_flow_context:
@@ -513,6 +607,7 @@ def clear_all_user_state(user_id):
     pending_name_confirmations.pop(user_id, None)
     pending_teacher_corrections.pop(user_id, None)
     guided_mode.pop(user_id, None)
+    _clear_persisted_order_state(user_id)
 
 
 # =========================================================
@@ -733,6 +828,7 @@ def clear_task_states_for_new_mode(user_id):
     order_flow_context.pop(user_id,None); pending_orders.pop(user_id,None)
     pending_name_confirmations.pop(user_id,None); pending_teacher_corrections.pop(user_id,None)
     teacher_lookup_context.pop(user_id,None)
+    _clear_persisted_order_state(user_id)
 
 def normalize_teacher_name_input(text):
     clean=re.sub(r"[，,。.!！?？\s]+","",str(text or ""))
@@ -818,89 +914,113 @@ def get_help_reply():
 # =========================================================
 # 訂書流程
 # =========================================================
+def normalize_person_name(value):
+    return re.sub(r"老師$", "", re.sub(r"[\s，,。.!！?？]", "", str(value or ""))).strip()
+
+
 def validate_order_teacher_input(user_id, raw_text, draft):
-    """訂書流程老師關卡：資料庫驗證成功前絕不進入書名。"""
+    """訂書老師關卡：一次資料庫搜尋完成精確/錯字候選，避免連打 Google。"""
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
     clean = re.sub(r"老師$", "", clean).strip()
     if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}", clean):
         return "請輸入老師姓名，例如：蔡書玄"
 
     school = str(draft.get("school") or "").strip()
-    matches = lookup_teacher_matches(clean, school=school)
-    if not matches and school:
-        matches = lookup_teacher_matches(clean, school="")
+    # 只打一個 fuzzy endpoint；它本身就是從老師資料庫回候選。
+    candidates = lookup_fuzzy_candidates("teacher", clean, school=school)
+    if not candidates and school:
+        candidates = lookup_fuzzy_candidates("teacher", clean, school="")
 
-    if len(matches) == 1:
-        item = matches[0]
-        draft["teacher"] = item["teacher"]
-        draft["school"] = item["school"]
+    if not candidates:
+        return ("⚠️ 老師資料庫目前找不到符合資料。\n\n"
+                f"你輸入：{clean}\n\n"
+                "我不會先把這個名字存進訂單。請重新輸入老師姓名。")
+
+    first = candidates[0]
+    value = str(first.get("value", "") or "").strip()
+    candidate_school = str(first.get("school", "") or school).strip()
+    score = float(first.get("score", 0) or 0)
+
+    # 資料庫正式姓名與輸入完全一致：直接通過老師關卡。
+    if normalize_person_name(value) == normalize_person_name(clean):
+        draft["teacher"] = value
+        draft["school"] = candidate_school
         draft["classes"] = []
+        draft.pop("_pending_name_confirmation", None)
+        pending_name_confirmations.pop(user_id, None)
         order_flow_context[user_id] = draft
+        _persist_order_state(user_id)
         return make_order_guide_reply(draft)
 
-    if len(matches) > 1:
-        schools = unique_list([m.get("school", "") for m in matches if m.get("school")])
-        return ("🔎 資料庫找到同名老師。\n\n"
-                f"老師：{clean}\n學校：{'、'.join(schools)}\n\n"
-                "請把學校一起告訴我，確認唯一資料後才會進入下一步。")
-
-    fuzzy = resolve_fuzzy_name("teacher", clean, school=school)
-    if fuzzy.get("status") in ["auto", "confirm"] and fuzzy.get("value"):
-        pending_name_confirmations[user_id] = {
+    # 錯一字/同音/近似：一定先讓使用者確認，不能自動把錯字存進訂單。
+    if value and score >= 0.52:
+        pending = {
             "field": "teacher", "purpose": "order_teacher",
-            "value": fuzzy["value"], "school": fuzzy.get("school", ""),
+            "value": value, "school": candidate_school,
             "original": clean
         }
+        pending_name_confirmations[user_id] = pending
+        # 同步寫進訂書 draft，避免 Render 多 worker / 狀態切換時只剩訂書狀態卻遺失候選確認。
+        draft["_pending_name_confirmation"] = dict(pending)
+        order_flow_context[user_id] = draft
+        _persist_order_state(user_id)
+        print(f"STATE saved teacher candidate user={user_id} value={value} school={candidate_school}")
         return ("🔎 老師姓名可能有錯字。\n\n"
                 f"你輸入：{clean}\n"
-                f"資料庫找到：{fuzzy['value']}" +
-                (f"（{fuzzy.get('school')}）" if fuzzy.get('school') else "") +
+                f"資料庫找到：{value}" +
+                (f"（{candidate_school}）" if candidate_school else "") +
                 "\n\n請問你是指這位老師嗎？\n請回覆「確認」；不是的話請直接重新輸入姓名。")
 
-    return ("⚠️ 老師資料庫找不到這個姓名。\n\n"
+    return ("⚠️ 老師資料庫目前無法確認這個姓名。\n\n"
             f"你輸入：{clean}\n\n"
-            "我不會先把這個名字存進訂單。請重新輸入老師姓名。")
+            "我不會往下一步。請重新輸入老師姓名。")
 
 
 def validate_order_book_input(user_id, raw_text, draft):
-    """訂書流程書名關卡：精確或關鍵字候選必須來自書籍資料庫。"""
+    """訂書書名關卡：一次關鍵字搜尋，候選一定來自書籍資料庫。"""
     query = clean_book_name(str(raw_text or "").strip())
     query = re.sub(r"^(?:我要訂|要訂|訂)", "", query).strip()
     if not query:
         return "請輸入書名或書名關鍵字。"
 
-    publisher = get_book_publisher(query)
-    if publisher:
-        draft["book"] = query
-        order_flow_context[user_id] = draft
-        return build_order_from_draft(user_id, draft)
-
     candidates = lookup_book_candidates_enhanced(query)
     if not candidates:
         return ("⚠️ 書籍資料庫找不到符合的書名。\n\n"
                 f"你輸入：{query}\n\n"
-                "老師資料已保留，請重新輸入書名或更明確的關鍵字。")
+                "老師資料已保留，我不會往下一步。請重新輸入書名或更明確的關鍵字。")
 
     first = candidates[0]
+    value = str(first.get("value", "") or "").strip()
     score = float(first.get("score", 0) or 0)
-    if score >= 0.52:
-        pending_name_confirmations[user_id] = {
+
+    # 即使很像也先確認正式書名，避免同系列不同科目/冊次誤訂。
+    if value and score >= 0.52:
+        pending = {
             "field": "book", "purpose": "order_book",
-            "value": first.get("value", ""),
-            "publisher": first.get("publisher", ""), "original": query
+            "value": value,
+            "publisher": str(first.get("publisher", "") or ""),
+            "original": query
         }
-        extra = [c.get("value", "") for c in candidates[1:3] if c.get("value") and float(c.get("score",0) or 0) >= max(0.52, score-0.08)]
+        pending_name_confirmations[user_id] = pending
+        # 書名候選也同步保存在訂書 draft，確保下一句「確認」一定能找到剛才的正式書名。
+        draft["_pending_name_confirmation"] = dict(pending)
+        order_flow_context[user_id] = draft
+        _persist_order_state(user_id)
+        extra = [
+            str(c.get("value", "") or "").strip()
+            for c in candidates[1:3]
+            if c.get("value") and float(c.get("score", 0) or 0) >= max(0.52, score - 0.08)
+        ]
         msg = ("🔎 我從書籍資料庫找到最接近的書。\n\n"
                f"你輸入：{query}\n"
-               f"資料庫找到：{first.get('value','')}\n")
+               f"資料庫找到：{value}\n")
         if extra:
             msg += "其他接近結果：" + "、".join(extra) + "\n"
         return msg + "\n請問是這一本嗎？\n請回覆「確認」；不是的話請直接重新輸入書名。"
 
     return ("⚠️ 我目前無法確認書名。\n\n"
             f"你輸入：{query}\n\n"
-            "老師資料已保留，請再輸入一次完整書名或更明確的關鍵字。")
-
+            "老師資料已保留，我不會往下一步。請再輸入一次完整書名或更明確的關鍵字。")
 
 def handle_order_flow(user_id, text):
     clean = normalize_order_typo(text)
@@ -918,6 +1038,7 @@ def handle_order_flow(user_id, text):
             "classes": [],
             "book": ""
         }
+        _persist_order_state(user_id)
         return make_order_guide_reply(order_flow_context[user_id])
 
     draft = order_flow_context.get(user_id, {
@@ -926,6 +1047,23 @@ def handle_order_flow(user_id, text):
         "classes": [],
         "book": ""
     })
+
+    # 第二層保險：就算主流程的確認分流沒有吃到，訂書流程本身也絕不允許
+    # 把「確認」當成老師姓名或書名重新丟去 Google。
+    confirm_words = {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}
+    if clean in confirm_words:
+        pending = pending_name_confirmations.get(user_id) or draft.get("_pending_name_confirmation")
+        if pending:
+            pending_name_confirmations[user_id] = dict(pending)
+            reply = handle_name_confirmation(user_id, clean)
+            if reply is not None:
+                return reply
+        # 沒有候選狀態時也禁止搜尋「確認」這個名字。
+        if not draft.get("teacher"):
+            return ("⚠️ 我沒有讀到上一個老師候選。\n\n"
+                    "請重新輸入老師姓名，我會重新找一次；找到後再回覆「確認」。")
+        if draft.get("teacher") and not draft.get("book"):
+            return "請告訴我要訂哪一本書？"
 
     # 已進入訂書流程時，每一關都先查資料庫驗證；成功前不准往下一關。
     if user_id in order_flow_context and not draft.get("teacher"):
@@ -980,6 +1118,7 @@ def handle_order_flow(user_id, text):
 
 
     order_flow_context[user_id] = draft
+    _persist_order_state(user_id)
 
     # 老師＋書名已足夠：沒指定班級時，自動帶入該老師全部班級
     if draft["teacher"] and draft["book"]:
@@ -996,7 +1135,12 @@ def make_order_guide_reply(draft):
     lines = ["📚 訂書", ""]
 
     if draft.get("teacher"):
-        lines.append(f"老師：{draft['teacher']}")
+        teacher_display = str(draft.get("teacher") or "").strip()
+        school_display = str(draft.get("school") or "").strip()
+        if school_display:
+            lines.append(f"老師：{teacher_display}（{school_display}）")
+        else:
+            lines.append(f"老師：{teacher_display}")
     if draft.get("classes"):
         lines.append(f"班級：{'、'.join(draft['classes'])}")
     if draft.get("book"):
@@ -2991,54 +3135,36 @@ def book_keyword_score(query, candidate):
 
 
 def lookup_book_candidates_enhanced(query):
-    # 多種 query 送去 Google，避免正式書名的字序不同而掉出前五名。
-    normalized = normalize_book_match_text(query)
-    core = book_core_text(query)
-    variants = [str(query or "").strip(), normalized, core]
+    """書名關鍵字搜尋：優先只打 Google 一次，避免舊版十幾個 variants 逐次連線。"""
+    query = str(query or "").strip()
+    if not query:
+        return []
 
-    # 書名以「系列關鍵字＋科目＋冊次」拆開搜尋，字序不重要。
-    # 例如：麻辣自然5 -> 5 自然-麻辣講義
-    #       超級悍將數學5 -> 5 數學-超級翰將講義
-    subjects_found = []
-    for subject in ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]:
-        if subject in normalized:
-            subjects_found.append(subject)
-            variants.extend([subject, subject + core, core + subject])
+    candidates = lookup_fuzzy_candidates("book", query)
 
-    nums = re.findall(r"\d+", normalized)
-    for num in nums:
-        variants.extend([num + core, core + num])
-        for subject in subjects_found:
-            variants.extend([
-                num + subject, subject + num,
-                num + subject + core, num + core + subject,
-                subject + num + core, subject + core + num,
-                core + subject + num, core + num + subject
-            ])
-
-    # 系列名通常是最有辨識力的關鍵字（例如「麻辣」「超級翰將」），
-    # 額外單獨查一次，避免 Google 端整串相似度把正式書名排除在前五名之外。
-    if core:
-        variants.append(core)
+    # 只有整句完全沒候選，才用核心系列名補查一次；最多兩次，不再迴圈狂打 Google。
+    if not candidates:
+        core = book_core_text(query)
+        if core and core != query:
+            candidates = lookup_fuzzy_candidates("book", core)
 
     merged = {}
-    for variant in unique_list([v for v in variants if v]):
-        for item in lookup_fuzzy_candidates("book", variant):
-            value = str(item.get("value", "")).strip()
-            if not value:
-                continue
-            local_score = book_keyword_score(query, value)
-            old = merged.get(value)
-            if old is None or local_score > old["score"]:
-                merged[value] = {
-                    "value": value,
-                    "publisher": str(item.get("publisher", "")),
-                    "school": "",
-                    "score": local_score
-                }
+    for item in candidates:
+        value = str(item.get("value", "") or "").strip()
+        if not value:
+            continue
+        local_score = book_keyword_score(query, value)
+        # Google 自己的相似度可作輔助，但以本機關鍵字分數為主。
+        remote_score = float(item.get("score", 0) or 0)
+        score = max(local_score, remote_score * 0.85)
+        merged[value] = {
+            "value": value,
+            "publisher": str(item.get("publisher", "") or ""),
+            "school": "",
+            "score": score
+        }
 
     return sorted(merged.values(), key=lambda x: x["score"], reverse=True)[:10]
-
 
 def resolve_fuzzy_name(kind, query, school=""):
     """
@@ -3098,6 +3224,13 @@ def resolve_fuzzy_name(kind, query, school=""):
 
 def handle_name_confirmation(user_id, text):
     pending = pending_name_confirmations.get(user_id)
+    # 訂書流程額外把候選存在 draft 內。即使全域 pending 因 worker/流程切換遺失，
+    # 使用者下一句「確認」仍可正確接續，不會把「確認」當成新的老師或書名。
+    if not pending:
+        draft_for_pending = order_flow_context.get(user_id) or {}
+        pending = draft_for_pending.get("_pending_name_confirmation")
+        if pending:
+            pending_name_confirmations[user_id] = dict(pending)
     if not pending:
         return None
 
@@ -3142,24 +3275,24 @@ def handle_name_confirmation(user_id, text):
         if not draft:
             return "✅ 已確認名稱。請重新輸入剛才的訂書內容。"
 
+        draft.pop("_pending_name_confirmation", None)
+
         if pending["field"] == "teacher":
-            # 使用者確認錯字候選後，再做一次資料庫 exact 驗證才放行。
-            matches = lookup_teacher_matches(pending["value"], school=pending.get("school", ""))
-            if len(matches) != 1:
-                return "⚠️ 老師資料庫目前無法確認唯一資料，請重新輸入老師姓名。"
-            item = matches[0]
-            draft["teacher"] = item["teacher"]
-            draft["school"] = item["school"]
+            # 這個候選本身就是上一句由 Google 老師資料庫 fuzzy endpoint 回傳的正式資料。
+            # 使用者回「確認」後直接採用暫存候選，不再重新打 Google，避免確認又卡 7~15 秒。
+            draft["teacher"] = str(pending.get("value", "") or "").strip()
+            draft["school"] = str(pending.get("school", "") or "").strip()
             draft["classes"] = []
         elif pending["field"] == "book":
-            # 候選也必須確實存在書籍資料庫。
-            if not get_book_publisher(pending["value"]):
-                return "⚠️ 書籍資料庫目前無法確認這本書，請重新輸入書名。"
-            draft["book"] = pending["value"]
+            # 書名候選同樣已由書籍資料庫搜尋取得；確認後直接採用正式書名與出版社暫存。
+            draft["book"] = str(pending.get("value", "") or "").strip()
+            if pending.get("publisher"):
+                draft["publisher"] = str(pending.get("publisher", "") or "").strip()
         elif pending["field"] == "school":
             draft["school"] = pending["value"]
 
         order_flow_context[user_id] = draft
+        _persist_order_state(user_id)
 
         if draft.get("teacher") and draft.get("book"):
             result = build_order_from_draft(user_id, draft)
@@ -3172,6 +3305,11 @@ def handle_name_confirmation(user_id, text):
     if clean in no_words:
         was_guided_teacher=pending.get("purpose")=="guided_teacher_lookup"
         pending_name_confirmations.pop(user_id,None)
+        draft_for_pending = order_flow_context.get(user_id)
+        if draft_for_pending:
+            draft_for_pending.pop("_pending_name_confirmation", None)
+            order_flow_context[user_id] = draft_for_pending
+        _persist_order_state(user_id)
         if was_guided_teacher:
             guided_mode[user_id]="teacher_lookup"
             return "好，我不採用剛才的候選。\n\n我還在「查老師」模式，請直接重新輸入老師姓名。"
@@ -3184,6 +3322,11 @@ def handle_name_confirmation(user_id, text):
 
     # 使用者沒有回答是/不是，而是直接重打新名稱：放棄舊候選，照新訊息正常解析。
     pending_name_confirmations.pop(user_id, None)
+    draft_for_pending = order_flow_context.get(user_id)
+    if draft_for_pending:
+        draft_for_pending.pop("_pending_name_confirmation", None)
+        order_flow_context[user_id] = draft_for_pending
+    _persist_order_state(user_id)
     return None
 
 
@@ -3193,12 +3336,12 @@ def lookup_fuzzy_candidates(kind, query, school=""):
         "kind": kind,
         "query": str(query or ""),
         "school": str(school or "")
-    }, timeout=7, retries=1)
+    }, timeout=4.5, retries=1)
 
     if not result or not result.get("success"):
         return []
 
-    return result.get("candidates", [])[:5]
+    return result.get("candidates", [])[:8]
 
 
 # =========================================================
