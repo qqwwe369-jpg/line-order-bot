@@ -19,8 +19,8 @@ _google_read_cache = {}
 # 這些都是相對穩定的資料庫讀取，可安全短時間快取。
 _GOOGLE_CACHE_TTLS = {
     "list_schools": 600,
-    "lookup_teacher_matches": 300,
-    "lookup_teacher": 300,
+    "lookup_teacher_matches": 1800,
+    "lookup_teacher": 1800,
     "lookup_school_classes": 300,
     "lookup_versions": 300,
     "lookup_book": 300,
@@ -1820,26 +1820,19 @@ def handle_teacher_lookup(user_id, text):
 
 
 def handle_teacher_followup(user_id):
+    # 同一位老師的追問直接使用上一輪已查到的班級資料。
+    # 不要再次呼叫 Google Apps Script，避免原本約 6 秒的重複查詢。
     context = teacher_lookup_context.get(user_id)
     if not context:
         return None
 
-    classes = get_teacher_classes(context["school"], context["teacher"])
+    classes = copy_classes(context.get("classes", []))
     if not classes:
         return "⚠️ 老師資料庫暫時查詢失敗。"
 
-    context = {
-        "school": context["school"],
-        "teacher": context["teacher"],
-        "classes": copy_classes(classes)
-    }
-
-    teacher_lookup_context[user_id] = context
-    conversation_context[user_id] = context
-
     return make_teacher_reply(
-        context["school"],
-        context["teacher"],
+        context.get("school", ""),
+        context.get("teacher", ""),
         classes
     )
 
