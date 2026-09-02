@@ -10,7 +10,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-02-book-candidate-replace-v8"
+APP_VERSION = "2026-09-02-book-search-stable-v9"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -3409,9 +3409,18 @@ def google_post(payload, timeout=10, retries=1):
     if cache_ttl > 0 and key in _google_read_cache:
         item = _google_read_cache.get(key) or {}
         if now < float(item.get("expires_at", 0) or 0):
-            print(f"Google cache HIT: {action}")
-            return copy.deepcopy(item.get("data"))
-        _google_read_cache.pop(key, None)
+            cached_data = copy.deepcopy(item.get("data"))
+            # 模糊搜尋的「空結果」不可快取。空結果可能只是 Apps Script
+            # 暫時延遲/回傳不完整；若快取會讓明明存在的老師或書名
+            # 在數分鐘內一直被判定找不到。
+            if action == "lookup_fuzzy_candidates" and isinstance(cached_data, dict) and not cached_data.get("candidates"):
+                _google_read_cache.pop(key, None)
+                print(f"Google cache DROP empty: {action}")
+            else:
+                print(f"Google cache HIT: {action}")
+                return cached_data
+        else:
+            _google_read_cache.pop(key, None)
 
     attempts = max(1, int(retries or 1))
     started = time.perf_counter()
@@ -3439,10 +3448,13 @@ def google_post(payload, timeout=10, retries=1):
             data = response.json()
 
             if cache_ttl > 0 and isinstance(data, dict):
-                _google_read_cache[key] = {
-                    "data": copy.deepcopy(data),
-                    "expires_at": time.time() + cache_ttl
-                }
+                # 不快取模糊搜尋空結果，避免一次暫時性的空回覆污染後續查詢。
+                should_cache = not (action == "lookup_fuzzy_candidates" and not data.get("candidates"))
+                if should_cache:
+                    _google_read_cache[key] = {
+                        "data": copy.deepcopy(data),
+                        "expires_at": time.time() + cache_ttl
+                    }
 
             # 寫入／修改／取消成功後，把舊讀取快取清掉，避免看到舊資料。
             if action in {
