@@ -61,7 +61,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-06-order-note-date-v21-overhaul"
+APP_VERSION = "2026-09-06-chinese-class-name-edit-v26"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1333,7 +1333,11 @@ def parse_subject_teacher_query(text):
 
 
 def _class_matches_grade(class_name, grade):
-    name = re.sub(r"[\\s班]+", "", str(class_name or ""))
+    # 原本這裡是 r"[\\s班]+"（雙反斜線），在字元類別裡代表「一個
+    # 反斜線字元」加上「字母 s」，並不是空白字元的跳脫寫法，等於
+    # 從來沒有真的去除過空白，只是剛好去掉了「班」字。修正成正確的
+    # \s 跳脫，遇到班級名稱前後帶空白時也能正確比對。
+    name = re.sub(r"[\s班]+", "", str(class_name or ""))
     grade = str(grade or "").strip()
 
     if grade == "七年級":
@@ -1545,30 +1549,47 @@ def validate_order_teacher_input(user_id, raw_text, draft):
         return make_order_guide_reply(draft)
 
     if value and score >= 0.52:
+        # 把接近的候選整理成「1. 2. 3.」編號清單，讓使用者可以直接回
+        # 數字挑選，不用每次都重打一次完整姓名。
+        options = []
+        seen = set()
+        for c in candidates[:4]:
+            c_value = str(c.get("value", "") or "").strip()
+            c_school = str(c.get("school", "") or "").strip()
+            c_score = float(c.get("score", 0) or 0)
+            dedup_key = c_value + "||" + c_school
+
+            if not c_value or dedup_key in seen:
+                continue
+            if c_value != value and c_score < 0.52:
+                continue
+
+            seen.add(dedup_key)
+            options.append({"value": c_value, "school": c_school or school})
+
+            if len(options) >= 3:
+                break
+
         pending_name_confirmations[user_id] = {
             "field": "teacher", "purpose": "order_teacher",
-            "value": value, "school": candidate_school,
+            "options": options,
             "original": clean
         }
         order_flow_context[user_id] = draft
-        other_candidates = []
-        for c in candidates[1:4]:
-            other_value = str(c.get("value", "") or "").strip()
-            other_school = str(c.get("school", "") or "").strip()
-            other_score = float(c.get("score", 0) or 0)
-            if other_value and other_score >= 0.52 and other_value != value:
-                other_candidates.append(other_value + (f"（{other_school}）" if other_school else ""))
 
-        reply = ("🔎 老師姓名可能有錯字。\n\n"
-                 f"你輸入：{clean}\n"
-                 f"資料庫找到：{value}" +
-                 (f"（{candidate_school}）" if candidate_school else "") +
-                 "\n\n請問你是指這位老師嗎？\n"
-                 "是的請回覆「確認」。\n"
-                 "如果不是，請直接輸入正確老師姓名，我會取消這個候選並重新查資料庫。")
-        if other_candidates:
-            reply += "\n\n其他接近的老師：" + "、".join(other_candidates)
-        return reply
+        lines = ["🔎 老師姓名可能有錯字，找到以下接近的候選。", "", f"你輸入：{clean}", ""]
+        for i, opt in enumerate(options, start=1):
+            label = opt["value"] + (f"（{opt['school']}）" if opt.get("school") else "")
+            lines.append(f"{i}. {label}")
+        lines.append("")
+
+        if len(options) > 1:
+            lines.append("請直接回覆數字（例如「1」）選擇要的那一位；回覆「確認」等同選第 1 個。")
+        else:
+            lines.append("是的請回覆「確認」。")
+
+        lines.append("如果都不是，請直接輸入正確老師姓名，我會取消這個候選並重新查資料庫。")
+        return "\n".join(lines)
 
     return ("⚠️ 老師資料庫目前無法確認這個姓名。\n\n"
             f"你輸入：{clean}\n\n"
@@ -1592,24 +1613,46 @@ def validate_order_book_input(user_id, raw_text, draft):
     score = float(first.get("score", 0) or 0)
 
     if value and score >= 0.52:
+        threshold = max(0.52, score - 0.08)
+        options = []
+        seen = set()
+        for c in candidates[:4]:
+            c_value = str(c.get("value", "") or "").strip()
+            c_score = float(c.get("score", 0) or 0)
+
+            if not c_value or c_value in seen:
+                continue
+            if c_value != value and c_score < threshold:
+                continue
+
+            seen.add(c_value)
+            options.append({
+                "value": c_value,
+                "publisher": str(c.get("publisher", "") or "")
+            })
+
+            if len(options) >= 3:
+                break
+
         pending_name_confirmations[user_id] = {
             "field": "book", "purpose": "order_book",
-            "value": value,
-            "publisher": str(first.get("publisher", "") or ""),
+            "options": options,
             "original": query
         }
         order_flow_context[user_id] = draft
-        extra = [
-            str(c.get("value", "") or "").strip()
-            for c in candidates[1:3]
-            if c.get("value") and float(c.get("score", 0) or 0) >= max(0.52, score - 0.08)
-        ]
-        msg = ("🔎 我從書籍資料庫找到最接近的書。\n\n"
-               f"你輸入：{query}\n"
-               f"資料庫找到：{value}\n")
-        if extra:
-            msg += "其他接近結果：" + "、".join(extra) + "\n"
-        return msg + "\n請問是這一本嗎？\n是的請回覆「確認」。\n如果不是，請直接輸入正確書名或更明確的關鍵字，我會取消這個候選並重新查資料庫。"
+
+        lines = ["🔎 我從書籍資料庫找到以下接近的書名。", "", f"你輸入：{query}", ""]
+        for i, opt in enumerate(options, start=1):
+            lines.append(f"{i}. {opt['value']}")
+        lines.append("")
+
+        if len(options) > 1:
+            lines.append("請直接回覆數字（例如「1」）選擇要的那一本；回覆「確認」等同選第 1 個。")
+        else:
+            lines.append("是的請回覆「確認」。")
+
+        lines.append("如果都不是，請直接輸入正確書名或更明確的關鍵字，我會取消這個候選並重新查資料庫。")
+        return "\n".join(lines)
 
     return ("⚠️ 我目前無法確認書名。\n\n"
             f"你輸入：{query}\n\n"
@@ -2286,13 +2329,64 @@ def confirm_new_order(user_id):
     ]
 
 
+def _pending_order_known_class_names(order, context):
+    """
+    這筆訂單目前實際可能用到的班級名稱清單：目前訂單裡已有的班級，
+    加上這位老師名下全部班級（來自 conversation_context，訂書流程
+    一開始查老師時就存好了）。班級名稱不一定是純數字（例如 701），
+    也很常見是中文（國二乙、高一望…），所以這裡不能假設格式。
+    長度由長到短排序，避免「國二」這種短名稱在正規表示式比對時
+    搶先吃掉「國二乙」的一部分。
+    """
+    names = set()
+
+    for item in order.get("classes", []):
+        name = str(item.get("class_name", "") or "").strip()
+        if name:
+            names.add(name)
+
+    for item in context.get("classes", []):
+        name = str(item.get("class_name", "") or "").strip()
+        if name:
+            names.add(name)
+
+    return sorted(names, key=len, reverse=True)
+
+
+def _pending_order_class_pattern(class_names):
+    """
+    把已知班級名稱組成一段正規表示式片段（例如 "國二乙|國二甲|701"），
+    取代原本寫死只認 3 位數字（\\d{3}）班級代碼的規則，同時支援
+    中文班級名稱與數字班級代碼兩種學校的命名習慣。
+    保留 [789]\\d{2} 當退路，避免萬一 context 剛好沒有班級資料時，
+    數字代碼班級完全比對不到。
+    """
+    alternatives = [re.escape(name) for name in class_names]
+    alternatives.append(r"[789]\d{2}")
+    return "|".join(alternatives)
+
+
 def handle_pending_order_edit(user_id, text):
     order = pending_orders[user_id]
+    context = conversation_context.get(user_id, {})
+    class_names = _pending_order_known_class_names(order, context)
+    class_pattern = _pending_order_class_pattern(class_names)
 
     if any(word in text for word in ["只要", "保留", "就要", "只留"]):
-        wanted = extract_classes(text)
+        wanted = []
+        remaining = text
+        for name in class_names:
+            if name and name in remaining:
+                if name not in wanted:
+                    wanted.append(name)
+                # 命中後從剩餘文字裡挖掉，避免短班級名稱後續又
+                # 誤判成另一個班級名稱的一部分。
+                remaining = remaining.replace(name, " ", 1)
+        for digit_class in re.findall(r"(?<!\d)([789]\d{2})(?!\d)", remaining):
+            if digit_class not in wanted:
+                wanted.append(digit_class)
+
         if wanted:
-            context = conversation_context.get(user_id, {})
             available = {
                 str(item.get("class_name")): item
                 for item in context.get("classes", [])
@@ -2314,9 +2408,9 @@ def handle_pending_order_edit(user_id, text):
             refresh_order_total(order)
             return make_order_confirmation(order)
 
-    m = re.fullmatch(r"(?:不要|刪除|刪掉|拿掉|移除)\s*(\d{3})", text)
+    m = re.fullmatch(rf"(?:不要|刪除|刪掉|拿掉|移除)\s*({class_pattern})", text)
     if not m:
-        m = re.fullmatch(r"(\d{3})\s*(?:取消|不要|刪除|刪掉|拿掉|移除)", text)
+        m = re.fullmatch(rf"({class_pattern})\s*(?:取消|不要|刪除|刪掉|拿掉|移除)", text)
 
     if m:
         class_name = m.group(1)
@@ -2334,13 +2428,12 @@ def handle_pending_order_edit(user_id, text):
         refresh_order_total(order)
         return make_order_confirmation(order)
 
-    m = re.fullmatch(r"(?:加|加入|增加)\s*(\d{3})", text)
+    m = re.fullmatch(rf"(?:加|加入|增加)\s*({class_pattern})", text)
     if m:
         class_name = m.group(1)
         if find_order_class(order, class_name):
             return f"⚠️ {class_name} 已經在這筆訂單裡了。"
 
-        context = conversation_context.get(user_id, {})
         source = next(
             (
                 item for item in context.get("classes", [])
@@ -2358,14 +2451,13 @@ def handle_pending_order_edit(user_id, text):
         refresh_order_total(order)
         return make_order_confirmation(order)
 
-    m = re.fullmatch(r"(\d{3})\s*(?:改成|改為|換成)\s*(\d{3})", text)
+    m = re.fullmatch(rf"({class_pattern})\s*(?:改成|改為|換成)\s*({class_pattern})", text)
     if m:
         old_class, new_class = m.groups()
         old_target = find_order_class(order, old_class)
         if not old_target:
             return f"⚠️ {old_class} 目前不在這筆訂單裡。"
 
-        context = conversation_context.get(user_id, {})
         source = next(
             (
                 item for item in context.get("classes", [])
@@ -2390,7 +2482,7 @@ def handle_pending_order_edit(user_id, text):
         return make_order_confirmation(order)
 
     matches = list(re.finditer(
-        r"(?<!\d)(\d{3})(?!\d)\s*"
+        rf"(?<!\d)({class_pattern})(?!\d)\s*(?:人數)?\s*"
         r"(改成|改為|改|多|少)\s*"
         r"(\d+)\s*(?:人|本)?",
         text
@@ -2975,10 +3067,14 @@ def make_historical_order_with_offer(user_id, order):
     J 欄備註更新為「已請業務下單」。
     """
     status = str(order.get("status", "") or "").strip()
+    note = str(order.get("note", "") or "").strip()
     history_reply = make_historical_order_reply(order)
 
     # 已取消的歷史訂單不應再引導送給業務員下單。
-    if "取消" in status:
+    # 備註欄如果已經寫著「已請業務下單」，代表這張訂單的訂購單
+    # 之前就生成、標記過了，不應該每次查詢都再問一次要不要生成——
+    # 只有「還沒請業務下單」的訂單才需要問。
+    if "取消" in status or "已請業務下單" in note:
         pending_receipt_offers.pop(user_id, None)
         return history_reply
 
@@ -3025,6 +3121,8 @@ def make_historical_order_reply(order):
         message += f"\n最後修改：{order['last_modified']}"
     if order.get("modification_log"):
         message += f"\n修改紀錄：{order['modification_log']}"
+    if order.get("note"):
+        message += f"\n備註：{order['note']}"
 
     message += (
         "\n\n如果要調整，可以直接說：\n"
@@ -3531,7 +3629,8 @@ def get_school_catalog(force_refresh=False):
 
 
 def extract_grade_text(text):
-    clean = re.sub(r"[\\s，,。.!！?？]+", "", str(text or ""))
+    # 同上，原本 r"[\\s，,。.!！?？]+" 沒有真的去除空白字元。
+    clean = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
     grade_map = {
         "七年級": "七年級", "八年級": "八年級", "九年級": "九年級",
         "國一": "七年級", "國二": "八年級", "國三": "九年級",
@@ -3947,19 +4046,38 @@ def handle_name_confirmation(user_id, text):
     yes_words = {"是", "對", "對的", "沒錯", "正確", "可以", "好", "就是", "確認"}
     no_words = {"不是", "不對", "錯", "錯了", "不要", "否"}
 
+    # 有些候選（老師姓名／書名）不只一個接近的結果，這時候 pending
+    # 會帶一份 options 清單，讓使用者直接回覆數字（1／2／3…）挑選，
+    # 不用每次都重打一次完整名稱。沒有 options 的舊流程（單一候選）
+    # 維持原本「確認／是」二選一的行為，完全不受影響。
+    options = pending.get("options")
+
+    chosen = None
     if clean in yes_words:
+        chosen = options[0] if options else pending
+    elif options and re.fullmatch(r"[1-9]\d?", clean):
+        index = int(clean) - 1
+        if 0 <= index < len(options):
+            chosen = options[index]
+        else:
+            return (
+                f"⚠️ 目前只有 1～{len(options)} 個候選，請輸入正確的編號，"
+                "或直接輸入正確名稱重新查詢。"
+            )
+
+    if chosen is not None:
         pending_name_confirmations.pop(user_id, None)
 
         if pending.get("purpose") == "guided_teacher_lookup":
-            teacher=pending.get("value",""); school=pending.get("school","")
-            matches=lookup_teacher_matches(teacher,school=school)
-            if len(matches)==1: return finish_teacher_lookup(user_id,matches[0])
-            guided_mode[user_id]="teacher_lookup"
+            teacher = chosen.get("value", ""); school = chosen.get("school", "")
+            matches = lookup_teacher_matches(teacher, school=school)
+            if len(matches) == 1: return finish_teacher_lookup(user_id, matches[0])
+            guided_mode[user_id] = "teacher_lookup"
             return "⚠️ 這個名稱仍找不到唯一老師資料。\n\n我還在「查老師」模式，請直接重新輸入老師姓名。"
 
         if pending.get("purpose") == "teacher_lookup":
-            teacher = pending.get("value", "")
-            school = pending.get("school", "")
+            teacher = chosen.get("value", "")
+            school = chosen.get("school", "")
             matches = lookup_teacher_matches(teacher, school=school)
 
             if len(matches) == 1:
@@ -3985,15 +4103,15 @@ def handle_name_confirmation(user_id, text):
             return "✅ 已確認名稱。請重新輸入剛才的訂書內容。"
 
         if pending["field"] == "teacher":
-            draft["teacher"] = str(pending.get("value", "") or "").strip()
-            draft["school"] = str(pending.get("school", "") or "").strip()
+            draft["teacher"] = str(chosen.get("value", "") or "").strip()
+            draft["school"] = str(chosen.get("school", "") or "").strip()
             draft["classes"] = []
         elif pending["field"] == "book":
-            draft["book"] = str(pending.get("value", "") or "").strip()
-            if pending.get("publisher"):
-                draft["publisher"] = str(pending.get("publisher", "") or "").strip()
+            draft["book"] = str(chosen.get("value", "") or "").strip()
+            if chosen.get("publisher"):
+                draft["publisher"] = str(chosen.get("publisher", "") or "").strip()
         elif pending["field"] == "school":
-            draft["school"] = pending["value"]
+            draft["school"] = chosen["value"]
 
         order_flow_context[user_id] = draft
 
