@@ -12,7 +12,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-05-receipt-40s-no-lebron-v16"
+APP_VERSION = "2026-09-05-individual-teacher-flow-v17"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -1136,7 +1136,7 @@ def is_greeting_request(text):
 
 def get_greeting_reply():
     return (
-        "你好！我是大漢訂書小幫手 👑 LeBron James 還差一個助攻\n\n"
+        "你好！我是大漢訂書小幫手\n\n"
         "很高興為你服務！\n\n"
         "你可以直接輸入：\n"
         "📚 我要訂書\n"
@@ -1779,8 +1779,14 @@ def parse_contextual_class_book(text, context):
 
 
 def extract_teacher_and_school(text):
+    """抽出個別老師查詢中的老師與學校。
+
+    這裡同時支援「教...」與日常最常講的「有幾個班／有多少學生／查某某」等句型，
+    避免明明老師存在 Google 資料庫，卻因為句型沒有命中而掉到固定 fallback。
+    """
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(text or ""))
 
+    # 訂書句型仍保留原本解析方式。
     m = re.fullmatch(
         r"([\u4e00-\u9fff]{2,4}?)(?:老師)?(?:要|想要|想|準備|打算)?(?:訂書|下單)",
         clean
@@ -1788,6 +1794,7 @@ def extract_teacher_and_school(text):
     if m:
         return m.group(1) + "老師", ""
 
+    # 明確帶學校＋老師，例如「天母國中陳允芳老師有幾個班」。
     m = re.search(
         r"([\u4e00-\u9fff]{2,16}(?:國中|高中|國小|中學))"
         r"([\u4e00-\u9fff]{1,4})老師",
@@ -1796,6 +1803,7 @@ def extract_teacher_and_school(text):
     if m:
         return m.group(2) + "老師", m.group(1)
 
+    # 一般「某某老師...」。
     m = re.search(r"([\u4e00-\u9fff]{1,4})老師", clean)
     if m:
         name = m.group(1)
@@ -1803,9 +1811,23 @@ def extract_teacher_and_school(text):
             return "", ""
         return name + "老師", ""
 
+    # 「查陳允芳／找陳允芳／查一下陳允芳」。
+    m = re.fullmatch(
+        r"(?:查|找|查一下|找一下)([\u4e00-\u9fff]{2,4})(?:老師)?",
+        clean
+    )
+    if m:
+        return m.group(1) + "老師", ""
+
+    # 不寫「老師」也要能直接辨識個別老師查詢。
+    # 例如：陳允芳有幾個班、陳允芳有哪些班、陳允芳有多少學生、陳允芳教哪科。
     m = re.match(
         r"^([\u4e00-\u9fff]{2,4})"
-        r"(?=教(?:哪幾個班|哪幾班|哪些班|幾個班|幾班|什麼科|哪一科|哪科|哪些科))",
+        r"(?=(?:"
+        r"教(?:哪幾個班|哪幾班|哪些班|幾個班|幾班|什麼科|哪一科|哪科|哪些科)|"
+        r"有(?:幾個班|幾班|哪些班|多少學生|幾個學生|多少人|幾人)|"
+        r"(?:班級資料|班級人數|學生人數|總人數|每班幾人|每班人數|哪幾班|哪幾個班|有哪些班|幾班)"
+        r"))",
         clean
     )
     if m:
@@ -2092,6 +2114,10 @@ def handle_pending_order_edit(user_id, text):
 # 老師資料庫
 # =========================================================
 def looks_like_teacher_lookup(text):
+    """判斷是否為「個別老師」資料查詢。
+
+    這條流程只走 Google 老師班級資料庫，不交給 AI。
+    """
     if "訂單" in text or "訂書進度" in text or is_ai_writing_request(text):
         return False
 
@@ -2099,14 +2125,20 @@ def looks_like_teacher_lookup(text):
     if not teacher:
         return False
 
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(text or ""))
     words = [
         "教幾個班", "教幾班", "教哪個班", "教哪歌班", "教哪幾班", "教哪幾個班", "教哪些班",
-        "有幾個班", "有哪些班", "哪幾班", "哪幾個班",
+        "有幾個班", "有幾班", "有哪些班", "哪幾班", "哪幾個班", "幾班",
         "班級資料", "班級人數", "每班幾人", "每班人數",
-        "學生人數", "總人數", "幾個學生", "多少學生",
+        "學生人數", "總人數", "幾個學生", "多少學生", "多少人", "幾人",
         "教什麼科", "教哪一科", "教哪科", "教哪些科"
     ]
-    return any(word in text for word in words)
+
+    # 「查陳允芳／找陳允芳」本身就是個別老師查詢。
+    if re.fullmatch(r"(?:查|找|查一下|找一下)[\u4e00-\u9fff]{2,4}(?:老師)?", clean):
+        return True
+
+    return any(word in clean for word in words)
 
 
 def handle_bare_teacher_exact_lookup(user_id, text):
