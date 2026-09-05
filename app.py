@@ -12,7 +12,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-05-feature-batch-v12"
+APP_VERSION = "2026-09-05-purchase-order-note-v13"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -371,7 +371,14 @@ def _route_message(user_id, user_text):
             pending_receipt_offers.pop(user_id, None)
         elif _is_confirm_word(text):
             pending_receipt_offers.pop(user_id, None)
-            return make_purchase_order_text(offer)
+            purchase_order_text = make_purchase_order_text(offer)
+            note_ok = mark_order_note(offer.get("order_number", ""), "已請業務下單")
+            if not note_ok:
+                purchase_order_text += (
+                    "\n\n⚠️ 訂購單已生成，但 Google 備註欄寫入失敗。"
+                    "請先不要漏掉這筆，稍後可再補寫「已請業務下單」。"
+                )
+            return purchase_order_text
         elif text in RECEIPT_DECLINE_WORDS:
             pending_receipt_offers.pop(user_id, None)
             return "好的，沒有要生成訂購單。"
@@ -1837,7 +1844,7 @@ def make_order_confirmation(order):
 
 def make_purchase_order_text(offer):
     """
-    產生給廠商用的訂購單文字。
+    產生可直接傳給出版社業務員下單的訂購單文字。
     - 訂購人固定「士林大漢」
     - 日期用「使用者按下確認生成」那一刻的日期
     - 品名依原本訂單裡每個班級各列一行，不合併加總
@@ -1891,9 +1898,10 @@ def confirm_new_order(user_id):
     guided_mode.pop(user_id, None)
 
     # 訂單成功寫入後，記錄一份精簡快照，等使用者決定要不要
-    # 順便生成一張可以直接貼給廠商的訂購單。1 分鐘內沒回覆
+    # 順便生成一張可以直接傳給出版社業務員下單的訂購單。1 分鐘內沒回覆
     # 就視為不需要，見 _route_message 裡的逾時判斷。
     pending_receipt_offers[user_id] = {
+        "order_number": order_number,
         "school": order["school"],
         "publisher": order["publisher"],
         "book": order["book"],
@@ -1910,7 +1918,7 @@ def confirm_new_order(user_id):
         f"出版社：{order['publisher']}\n"
         f"總數量：{order['quantity']}本\n\n"
         f"之後可以直接問「查{order_number}」\n\n"
-        "要順便幫你產生一張可以直接貼給廠商的訂購單嗎？\n"
+        "需要幫你生成一張訂購單，讓你直接傳給出版社業務員下單嗎？\n"
         "回覆「要」或「好」即可，1 分鐘內沒有回覆就會自動取消這個提問。"
     )
 
@@ -3684,7 +3692,7 @@ def google_post(payload, timeout=10, retries=1):
                     }
 
             if action in {
-                "create_order", "update_order", "cancel_order",
+                "create_order", "update_order", "cancel_order", "set_order_note",
                 "create_other_order", "update_other_order"
             } and isinstance(data, dict) and data.get("success"):
                 clear_google_read_cache()
@@ -3785,6 +3793,16 @@ def write_to_google_sheet(order):
         return True, result.get("order_number")
 
     return False, None
+
+
+def mark_order_note(order_number, note):
+    result = google_post({
+        "action": "set_order_note",
+        "order_number": normalize_order_number(order_number),
+        "note": str(note or "").strip()
+    }, timeout=10, retries=2)
+
+    return bool(result and result.get("success") is True)
 
 
 def lookup_google_order(order_number):
