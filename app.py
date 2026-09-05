@@ -61,7 +61,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-06-chinese-class-name-edit-v26"
+APP_VERSION = "2026-09-06-guided-history-mode-fix-v27"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -722,6 +722,22 @@ def _route_message(user_id, user_text):
         if text in ["取消", "回主選單", "主選單", "離開"]:
             guided_mode.pop(user_id, None)
             return get_main_menu_reply()
+
+        # 查訂單模式現在會在查到多張訂單時繼續留在模式裡（方便連續
+        # 查好幾個日期），但如果剛好只查到一張、使用者想順手接著
+        # 調整（例如「國二乙改30」），這裡要能直接接手。這個檢查
+        # 刻意只放在 history_lookup 這個分支，不能放進共用的
+        # _guided_mode_escape_reply()：那個函式其他引導模式
+        # （查老師／查版本）也會呼叫到，如果 historical_order_context
+        # 裡剛好留著之前查過的舊訂單，會誤把跟這次引導模式完全無關
+        # 的輸入內容當成是在改那張舊訂單。
+        if user_id in historical_order_context and user_id not in pending_orders:
+            order = historical_order_context[user_id]
+            class_names = _pending_order_known_class_names(order, {})
+            if looks_like_history_edit(text, class_names):
+                guided_mode.pop(user_id, None)
+                return prepare_history_adjustment(user_id, order, text)
+
         escape_reply = _guided_mode_escape_reply(user_id, text)
         if escape_reply is not None:
             return escape_reply
@@ -904,7 +920,10 @@ def _route_message(user_id, user_text):
     # 12. 已查過歷史訂單後：701改28 / 703取消
     if (
         user_id in historical_order_context
-        and looks_like_history_edit(text)
+        and looks_like_history_edit(
+            text,
+            _pending_order_known_class_names(historical_order_context[user_id], {})
+        )
         and user_id not in pending_orders
     ):
         return prepare_history_adjustment(
@@ -1217,7 +1236,23 @@ def handle_guided_history_lookup(user_id, text):
                 f"📅 {date_text} 目前查不到訂書訂單。\n\n"
                 "我還在「查訂單」模式，可以改查其他日期、訂單編號或老師。"
             )
-        return _finish_guided_mode(user_id, make_daily_orders_reply(date_text, orders))
+
+        reply = make_daily_orders_reply(date_text, orders)
+
+        if len(orders) == 1:
+            # 記下這張訂單，方便使用者直接接著說「國二乙改30」這類
+            # 調整——這種情況由 _guided_mode_escape_reply() 接手辨識，
+            # 不在這裡就跳出模式。
+            historical_order_context[user_id] = orders[0]
+
+        # 不管查到一張還是多張，都繼續留在「查訂單」模式：如果在這裡
+        # 跳出模式，使用者接著打的下一個日期（例如「0901」這種純數字
+        # 簡寫）在模式外是查不到意思的——只有 parse_guided_date() 認得
+        # 這種簡寫，一般路由完全不認得，會直接落到最後的看不懂訊息。
+        # 之前就是因為查到「0830」有資料而跳出模式，才讓後面連續
+        # 好幾個日期都查不到反應。真的要接著改某張訂單時，
+        # _guided_mode_escape_reply() 會辨識出來並代為跳出模式。
+        return reply + "\n\n我還在「查訂單」模式，可以繼續輸入其他日期、訂單編號或老師。"
 
     m = re.fullmatch(r"(?:查)?(?:訂單)?(\d{1,6})", clean)
     if m:
@@ -1254,9 +1289,14 @@ def handle_guided_history_lookup(user_id, text):
                 f"老師：{canonical}\n\n"
                 "我還在「查訂單」模式，可以直接改輸入其他老師、日期或訂單編號。"
             )
+
+        reply = make_teacher_book_orders_reply(canonical, orders)
+
         if len(orders) == 1:
             historical_order_context[user_id] = orders[0]
-        return _finish_guided_mode(user_id, make_teacher_book_orders_reply(canonical, orders))
+
+        # 同上：不管一張還是多張，都繼續留在「查訂單」模式。
+        return reply + "\n\n我還在「查訂單」模式，可以繼續輸入其他日期、訂單編號或老師。"
 
     return get_history_lookup_guide_reply()
 
@@ -2909,13 +2949,25 @@ def parse_direct_history_adjustment(text):
     }
 
 
-def looks_like_history_edit(text):
+def looks_like_history_edit(text, class_names=None):
+    # class_names 沒帶進來時（例如 parse_direct_history_adjustment 那邊
+    # 「NNN的...」格式還沒真的把訂單抓出來、不知道實際班級名稱），
+    # 退回比較寬鬆的通用判斷：只要出現「改／取消」這類動作字眼，
+    # 就先當作可能是修改指令，交給 prepare_history_adjustment 用
+    # 訂單實際班級資料做最終判斷；真的猜錯的話，那邊會回覆看不懂，
+    # 不會誤觸發成別的功能。有帶班級名稱清單時（例如查完歷史訂單
+    # 後直接接著改），就用精確比對，中文班級名稱也能正確辨識。
+    if class_names:
+        pattern = _pending_order_class_pattern(class_names)
+    else:
+        pattern = r"\S{1,8}"
+
     quantity = re.search(
-        r"\d{3}\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
+        rf"(?:{pattern})\s*(?:人數)?\s*(?:改成|改為|改|多|少)\s*\d+\s*(?:人|本)?",
         text
     )
     remove = re.search(
-        r"\d{3}\s*(?:取消|不要|移除|刪除|拿掉)",
+        rf"(?:{pattern})\s*(?:取消|不要|移除|刪除|拿掉)",
         text
     )
     return bool(quantity or remove)
@@ -2931,16 +2983,18 @@ def prepare_history_adjustment(user_id, original_order, text):
 
     order = copy_order(original_order)
     changes = []
+    class_names = _pending_order_known_class_names(original_order, {})
+    pattern = _pending_order_class_pattern(class_names)
 
     quantity_matches = list(re.finditer(
-        r"(?<!\d)(\d{3})(?!\d)\s*"
+        rf"(?<!\d)({pattern})(?!\d)\s*(?:人數)?\s*"
         r"(改成|改為|改|多|少)\s*"
         r"(\d+)\s*(?:人|本)?",
         text
     ))
 
     remove_matches = list(re.finditer(
-        r"(?<!\d)(\d{3})(?!\d)\s*"
+        rf"(?<!\d)({pattern})(?!\d)\s*"
         r"(?:取消|不要|移除|刪除|拿掉)",
         text
     ))
