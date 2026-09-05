@@ -1,7 +1,43 @@
+"""
+=============================================================
+大漢訂書小幫手 — LINE Bot 主程式
+=============================================================
+架構速覽（給接手維護的人快速定位程式碼）：
+
+  1. 速度優化層      — 共用 HTTP Session、Google 讀取快取、平行查詢
+  2. 環境變數         — LINE / Google Apps Script 連線設定
+  3. 對話狀態          — 全域 dict 存每個 user_id 目前對話進度
+  4. SQLite 跨 worker 持久化 — 多個 gunicorn worker 共用同一份對話狀態、
+                          重送事件防護、過期資料清理
+  5. Flask 路由        — / 、 /healthz 、 /callback（LINE webhook 入口）
+  6. 主流程 _route_message — 所有文字訊息最終都會流經這個函式來分流
+  7. 引導式功能        — 查老師／查版本／查訂單／其他訂單四個模式
+  8. 訂書主流程        — 老師／書名／班級解析、模糊比對、訂單確認與修改
+  9. 老師資料庫查詢
+  10. 教科書版本查詢
+  11. 歷史訂單查詢／修改／取消
+  12. 其他訂單（非教科書品項）
+  13. Google Apps Script 溝通層（google_post）
+  14. 小工具函式（字串正規化、班級計算…）
+  15. LeBron 人設文案層
+  16. LINE 回覆
+
+新手上路指南：這是單一 Flask app，靠 Google Apps Script 當資料庫
+（老師/班級/書籍/訂單都存在 Google 試算表），LINE 傳來的每一則文字
+訊息都會先經過 _route_message() 依照使用者目前所在的「模式」分流，
+最後統一由 add_lebron_flavor() 包裝語氣後回覆。
+=============================================================
+"""
+
 from flask import Flask, request
 import os
 import re
 import time
+import hmac
+import hashlib
+import base64
+import random
+import logging
 import threading
 import concurrent.futures
 import requests
@@ -11,13 +47,64 @@ import sqlite3
 from datetime import datetime
 from difflib import SequenceMatcher
 
+# -------------------------------------------------------
+# Logging：統一輸出格式，取代原本散落各處的 print()。
+# Render / Railway 這類平台都是直接收 stdout 當 log，
+# 所以還是輸出到 stdout，只是多了時間戳記跟等級，
+# 方便之後如果要接 Sentry / 集中式 log 系統時比較好過濾。
+# -------------------------------------------------------
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("order_bot")
+
 app = Flask(__name__)
-APP_VERSION = "2026-09-05-individual-teacher-flow-v17"
+APP_VERSION = "2026-09-06-order-note-date-v21-overhaul"
+
+# 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
+# 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
+MAX_USER_TEXT_LENGTH = 1000
+
+# =========================================================
+# 簡易防濫用：同一個使用者短時間內訊息數上限
+# =========================================================
+# 純記憶體、每個 worker 各自累計，不追求絕對精準，只是防止
+# 有人（或壞掉的用戶端）短時間內狂送訊息把 Google Apps Script
+# 的每日呼叫額度用光，或把 Google Sheet 灌爆。
+RATE_LIMIT_MAX_MESSAGES = int(os.environ.get("RATE_LIMIT_MAX_MESSAGES", "20"))
+RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "10"))
+_rate_limit_hits = {}
+_rate_limit_guard = threading.Lock()
+
+
+def _is_rate_limited(user_id):
+    """簡單的滑動視窗限流。超過門檻回傳 True，外層會直接回一句提醒，
+    不會再往下打任何 Google 查詢，藉此保護後端資源。"""
+    now = time.time()
+    with _rate_limit_guard:
+        hits = _rate_limit_hits.setdefault(user_id, [])
+        hits[:] = [t for t in hits if now - t < RATE_LIMIT_WINDOW_SECONDS]
+        if len(hits) >= RATE_LIMIT_MAX_MESSAGES:
+            return True
+        hits.append(now)
+        return False
+
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
 # =========================================================
 HTTP = requests.Session()
+
+# 加大連線池：_parallel_google_calls 常常同時對 Google Apps Script
+# 開好幾條平行請求，預設的連線池（10）在同時多個使用者、每個使用者
+# 又同時打好幾支平行查詢時可能不夠用，導致部分請求要排隊等連線可用，
+# 反而多花時間。調大一點讓同網域的平行請求可以真的同時發送出去。
+_HTTP_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+HTTP.mount("https://", _HTTP_ADAPTER)
+HTTP.mount("http://", _HTTP_ADAPTER)
+
 _google_read_cache = {}
 
 # 這些都是相對穩定的資料庫讀取，可安全短時間快取。
@@ -64,7 +151,7 @@ def _parallel_google_calls(calls):
             try:
                 results[name] = future.result()
             except Exception as error:
-                print(f"parallel google call error ({name}):", error)
+                logger.error(f"parallel google call error ({name}): {error}")
                 results[name] = None
 
     return results
@@ -82,6 +169,18 @@ CHANNEL_SECRET = (
     or os.environ.get("CHANNEL_SECRET")
 )
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
+
+# 啟動時就把關鍵環境變數缺漏的狀況印清楚，比等到第一個使用者
+# 傳訊息才在深處某個函式裡默默失敗好排查很多。
+# 刻意不在這裡讓程式直接關閉／crash：Render 這類平台常常是
+# 「先部署、環境變數晚一點補上」，硬中斷開機反而更難排查。
+for _env_name, _env_value in [
+    ("LINE_CHANNEL_ACCESS_TOKEN / CHANNEL_ACCESS_TOKEN", CHANNEL_ACCESS_TOKEN),
+    ("LINE_CHANNEL_SECRET / CHANNEL_SECRET", CHANNEL_SECRET),
+    ("GOOGLE_SCRIPT_URL", GOOGLE_SCRIPT_URL),
+]:
+    if not _env_value:
+        logger.warning(f"啟動時發現環境變數未設定：{_env_name}")
 
 FIXED_FALLBACK_MESSAGE = "👑 LeBron James 正在想辦法處理中，請稍後再試一次。"
 
@@ -156,15 +255,110 @@ _SESSION_DICTS = {
 # =========================================================
 _STATE_DB_PATH = os.environ.get("ORDER_STATE_DB_PATH", "/tmp/line_order_bot_state.sqlite3")
 
+# 對話狀態超過這麼久沒有更新，視為廢棄的舊 session，
+# 清理時可以直接連同 SQLite 記錄一起丟掉，避免資料庫無限成長。
+_SESSION_STALE_SECONDS = 3 * 24 * 3600
+
+# 已處理過的 LINE message id，用來擋掉 LINE 平台重送 webhook 造成的重複處理
+# （例如處理時間過長、worker 剛好重啟等情況，LINE 會重新送同一個事件）。
+# 沒有這層保護的話，同一筆訂單有可能被重複寫入 Google 試算表兩次。
+_PROCESSED_MESSAGE_TTL_SECONDS = 24 * 3600
+
 
 def _state_db():
     """回傳一個新的 SQLite 連線。呼叫端務必自己 close()，避免連線洩漏。"""
     conn = sqlite3.connect(_STATE_DB_PATH, timeout=5)
+    # WAL 模式讓「讀」跟「寫」可以並行，多個 gunicorn worker 同時讀寫
+    # 同一個 SQLite 檔案時比預設的 rollback journal 模式更不容易卡住。
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except Exception:
+        pass
     conn.execute(
         "CREATE TABLE IF NOT EXISTS user_session ("
         "user_id TEXT PRIMARY KEY, session_json TEXT, updated_at REAL)"
     )
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS processed_message ("
+        "message_id TEXT PRIMARY KEY, processed_at REAL)"
+    )
     return conn
+
+
+def _is_duplicate_line_event(message_id):
+    """
+    檢查這個 LINE message id 是否已經處理過；沒處理過就順便標記成已處理。
+    回傳 True 代表這是重送事件，外層應該直接跳過、不要再次執行訂單邏輯。
+    """
+    if not message_id:
+        return False
+
+    conn = _state_db()
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM processed_message WHERE message_id=?", (message_id,)
+        ).fetchone()
+        if row:
+            return True
+
+        conn.execute(
+            "INSERT OR IGNORE INTO processed_message(message_id, processed_at) VALUES(?,?)",
+            (message_id, time.time())
+        )
+        conn.commit()
+        return False
+    except Exception as error:
+        logger.error(f"duplicate-event check error: {error}")
+        return False
+    finally:
+        conn.close()
+
+
+def _cleanup_stale_state(probability=0.02):
+    """
+    機會性清理：每次呼叫只有 `probability` 的機率真的去清資料庫，
+    避免每一則訊息都額外做一次全表清理拖慢回覆速度。
+    清掉太久沒更新的對話 session，以及太舊的重送防護記錄。
+    """
+    if random.random() > probability:
+        return
+
+    now = time.time()
+    conn = _state_db()
+    try:
+        conn.execute(
+            "DELETE FROM user_session WHERE updated_at < ?",
+            (now - _SESSION_STALE_SECONDS,)
+        )
+        conn.execute(
+            "DELETE FROM processed_message WHERE processed_at < ?",
+            (now - _PROCESSED_MESSAGE_TTL_SECONDS,)
+        )
+        conn.commit()
+    except Exception as error:
+        logger.error(f"state cleanup error: {error}")
+    finally:
+        conn.close()
+
+
+def _verify_line_signature(body_bytes, signature_header):
+    """
+    驗證 LINE 平台送來的請求簽章，避免任何人只要知道 /callback 網址
+    就能偽造假的 LINE 事件、觸發訂單寫入或查詢邏輯。
+    沒有設定 CHANNEL_SECRET 時（例如本機測試）直接放行，並印出警告。
+    """
+    if not CHANNEL_SECRET:
+        logger.warning("CHANNEL_SECRET 未設定，跳過簽章驗證（僅建議用於本機測試）")
+        return True
+
+    if not signature_header:
+        return False
+
+    computed = base64.b64encode(
+        hmac.new(CHANNEL_SECRET.encode("utf-8"), body_bytes, hashlib.sha256).digest()
+    ).decode("utf-8")
+
+    return hmac.compare_digest(computed, signature_header)
 
 
 def _hydrate_session(user_id):
@@ -175,7 +369,7 @@ def _hydrate_session(user_id):
             "SELECT session_json FROM user_session WHERE user_id=?", (user_id,)
         ).fetchone()
     except Exception as e:
-        print("session hydrate read error:", e)
+        logger.error(f"session hydrate read error: {e}")
         row = None
     finally:
         conn.close()
@@ -186,7 +380,7 @@ def _hydrate_session(user_id):
     try:
         data = json.loads(row[0])
     except Exception as e:
-        print("session hydrate decode error:", e)
+        logger.error(f"session hydrate decode error: {e}")
         return
 
     if not isinstance(data, dict):
@@ -213,7 +407,7 @@ def _persist_session(user_id):
             try:
                 session_json = json.dumps(payload, ensure_ascii=False)
             except Exception as e:
-                print("session persist encode error:", e)
+                logger.error(f"session persist encode error: {e}")
                 return
             conn.execute(
                 "INSERT INTO user_session(user_id, session_json, updated_at) VALUES(?,?,?) "
@@ -223,7 +417,7 @@ def _persist_session(user_id):
             )
         conn.commit()
     except Exception as e:
-        print("session persist write error:", e)
+        logger.error(f"session persist write error: {e}")
     finally:
         conn.close()
 
@@ -238,7 +432,7 @@ def _clear_session(user_id):
         conn.execute("DELETE FROM user_session WHERE user_id=?", (user_id,))
         conn.commit()
     except Exception as e:
-        print("session clear error:", e)
+        logger.error(f"session clear error: {e}")
     finally:
         conn.close()
 
@@ -273,12 +467,45 @@ def home():
     return f"LINE Order Bot is running! {APP_VERSION}"
 
 
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    """
+    給 uptime 監控／部署平台健康檢查用。
+    只檢查關鍵環境變數是否存在，不會真的打一次 Google，
+    保持這支端點又快又不會佔用 Google Apps Script 的額度。
+    """
+    problems = []
+    if not CHANNEL_ACCESS_TOKEN:
+        problems.append("LINE_CHANNEL_ACCESS_TOKEN missing")
+    if not CHANNEL_SECRET:
+        problems.append("LINE_CHANNEL_SECRET missing")
+    if not GOOGLE_SCRIPT_URL:
+        problems.append("GOOGLE_SCRIPT_URL missing")
+
+    status = "ok" if not problems else "degraded"
+    return {
+        "status": status,
+        "version": APP_VERSION,
+        "problems": problems
+    }, (200 if not problems else 503)
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
+    raw_body = request.get_data()
+    signature = request.headers.get("X-Line-Signature", "")
+
+    if not _verify_line_signature(raw_body, signature):
+        logger.warning("LINE 簽章驗證失敗，拒絕這次 webhook 請求")
+        return "Invalid signature", 400
+
     body = request.get_json(silent=True) or {}
 
-    print("Webhook received", APP_VERSION)
-    print(body)
+    logger.info(f"Webhook received {APP_VERSION}")
+    logger.debug(body)
+
+    # 機會性清理過期 session／重送記錄，放在整批事件處理前跑一次即可。
+    _cleanup_stale_state()
 
     for event in body.get("events", []):
         if event.get("type") != "message":
@@ -288,7 +515,12 @@ def callback():
         if message.get("type") != "text":
             continue
 
-        user_text = str(message.get("text", "")).strip()
+        message_id = str(message.get("id", "") or "")
+        if _is_duplicate_line_event(message_id):
+            logger.warning(f"偵測到 LINE 重送事件，略過重複處理 message_id={message_id}")
+            continue
+
+        user_text = str(message.get("text", "")).strip()[:MAX_USER_TEXT_LENGTH]
         reply_token = event.get("replyToken")
 
         source = event.get("source", {})
@@ -298,7 +530,7 @@ def callback():
         try:
             reply_message = add_lebron_flavor(handle_message(user_id, user_text))
         except Exception as error:
-            print("handle_message error:", error)
+            logger.error(f"handle_message error: {error}")
             reply_message = FIXED_FALLBACK_MESSAGE
 
         handle_elapsed = time.perf_counter() - request_started
@@ -306,7 +538,7 @@ def callback():
         reply_to_line(reply_token, reply_message)
         line_elapsed = time.perf_counter() - line_started
         total_elapsed = time.perf_counter() - request_started
-        print(
+        logger.info(
             f"PERF user={user_id} handle={handle_elapsed:.3f}s "
             f"line={line_elapsed:.3f}s total={total_elapsed:.3f}s text={user_text[:40]}"
         )
@@ -318,6 +550,15 @@ def callback():
 # 主流程
 # =========================================================
 def handle_message(user_id, user_text):
+    # 限流檢查刻意放在拿鎖／讀 session 之前：本來就要擋掉的訊息，
+    # 不需要多付一次 SQLite 讀寫的成本。
+    if _is_rate_limited(user_id):
+        logger.warning(f"rate limited user={user_id}")
+        return (
+            "⏳ 你剛剛傳訊息的速度有點快，我需要幾秒鐘喘口氣。\n"
+            "請稍等一下再傳一次。"
+        )
+
     lock = _get_user_lock(user_id)
     with lock:
         _hydrate_session(user_id)
@@ -333,7 +574,7 @@ def _route_message(user_id, user_text):
     if _is_confirm_word(text):
         _d = order_flow_context.get(user_id) or {}
         _p = pending_name_confirmations.get(user_id)
-        print(f"STATE confirm user={user_id} draft_teacher={_d.get('teacher','')} pending={_p}")
+        logger.debug(f"STATE confirm user={user_id} draft_teacher={_d.get('teacher','')} pending={_p}")
 
     # 0. 重來：一定最優先
     if (
@@ -355,8 +596,16 @@ def _route_message(user_id, user_text):
 
     if text in {"清除快取", "清快取", "重新整理資料", "重新整理快取"}:
         clear_google_read_cache()
+        # 同時通知 Apps Script 那邊也清掉「老師班級資料／學校版本資料／
+        # 書籍資料」的參照表快取（見 Code.gs 的 clear_cache action）。
+        # 這樣手動改完 Google 試算表的資料後，講一句「清除快取」
+        # 就能讓兩層快取一起立即失效，不用各自等 TTL 到期。
+        google_post({"action": "clear_cache"}, timeout=5, retries=1)
         get_school_catalog(force_refresh=True)
         return "✅ 已清除查詢快取，下一次查詢會直接讀取 Google 最新資料。"
+
+    if text in {"統計", "今日統計", "今天統計", "訂單統計", "今日訂單統計"}:
+        return get_today_order_stats_reply()
 
     # 0.15 訂購單生成提問：新訂單確認或歷史訂單查詢後才會出現。
     # 有效時間 40 秒；超過 40 秒後自動視為取消，不再讓「好／要」誤生成舊訂購單。
@@ -380,7 +629,9 @@ def _route_message(user_id, user_text):
             elif _is_confirm_word(text) or text in {"要", "我要", "需要", "幫我生成", "生成", "生成訂購單"}:
                 pending_receipt_offers.pop(user_id, None)
                 purchase_order_text = make_purchase_order_text(offer)
-                note_ok = mark_order_note(offer.get("order_number", ""), "已請業務下單")
+                taiwan_date = datetime.now().strftime("%Y/%m/%d")
+                note_text = f"已請業務下單｜{taiwan_date}"
+                note_ok = mark_order_note(offer.get("order_number", ""), note_text)
                 if not note_ok:
                     purchase_order_text += (
                         "\n\n⚠️ 訂購單已生成，但 Google 備註欄寫入失敗。"
@@ -811,7 +1062,8 @@ def get_main_menu_reply():
         "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
         "📖 要查版本 → 輸入「查版本」\n"
         "📅 要查訂單 → 輸入「查訂單」\n"
-        "📦 其他訂單 → 輸入「其他訂單」\n\n"
+        "📦 其他訂單 → 輸入「其他訂單」\n"
+        "📊 今日訂單統計 → 輸入「統計」\n\n"
         "完成一個查詢後，下一句會重新當成新的對話。"
     )
 
@@ -1047,17 +1299,68 @@ def finish_teacher_lookup(user_id,item):
 
 def parse_subject_teacher_query(text):
     clean = re.sub(r"[，,。.!！?？：:\s]+", "", str(text or ""))
-    if "老師" not in clean and "誰教" not in clean:
+    if "老師" not in clean and "誰教" not in clean and "誰上" not in clean:
         return None
+
     school = extract_school_name(clean)
     grade = extract_grade_text(clean)
-    subjects = ["國文", "英文", "數學", "自然", "生物", "理化", "地球科學", "地科", "社會", "歷史", "地理", "公民"]
-    subject = next((x for x in subjects if x in clean), "")
-    if subject == "地球科學":
-        subject = "地科"
+
+    subject_aliases = [
+        ("地球科學", "地科"),
+        ("英語", "英文"),
+        ("英文", "英文"),
+        ("國文", "國文"),
+        ("數學", "數學"),
+        ("自然", "自然"),
+        ("生物", "生物"),
+        ("理化", "理化"),
+        ("地科", "地科"),
+        ("社會", "社會"),
+        ("歷史", "歷史"),
+        ("地理", "地理"),
+        ("公民", "公民"),
+    ]
+    subject = ""
+    for alias, canonical in subject_aliases:
+        if alias in clean:
+            subject = canonical
+            break
+
     if not school or not grade or not subject:
         return None
+
     return {"school": school, "grade": grade, "subject": subject}
+
+
+def _class_matches_grade(class_name, grade):
+    name = re.sub(r"[\\s班]+", "", str(class_name or ""))
+    grade = str(grade or "").strip()
+
+    if grade == "七年級":
+        return bool(re.match(r"^(?:七|7|國一)", name))
+    if grade == "八年級":
+        return bool(re.match(r"^(?:八|8|國二)", name))
+    if grade == "九年級":
+        return bool(re.match(r"^(?:九|9|國三)", name))
+    if grade == "高一":
+        return bool(re.match(r"^(?:高一|10)", name))
+    if grade == "高二":
+        return bool(re.match(r"^(?:高二|11)", name))
+    if grade == "高三":
+        return bool(re.match(r"^(?:高三|12)", name))
+    return False
+
+
+def _subject_matches(subjects, wanted):
+    normalized = []
+    for s in subjects or []:
+        s = str(s or "").strip()
+        if s == "英語":
+            s = "英文"
+        elif s == "地球科學":
+            s = "地科"
+        normalized.append(s)
+    return wanted in normalized
 
 
 def handle_subject_teacher_query(query):
@@ -1070,25 +1373,54 @@ def handle_subject_teacher_query(query):
             f"學校：{query['school']}\n年級：{query['grade']}\n科目：{query['subject']}"
         )
 
-    lines = [f"👨‍🏫 {query['school']}｜{query['grade']} {query['subject']}老師", ""]
-    total_classes = 0
+    filtered = []
     for item in matches:
-        teacher = str(item.get("teacher", "")).strip()
         selected = []
         for c in item.get("classes", []):
-            subjects = [str(x).strip() for x in c.get("subjects", [])]
-            if query["subject"] not in subjects:
+            if not _class_matches_grade(c.get("class_name", ""), query["grade"]):
+                continue
+            if not _subject_matches(c.get("subjects", []), query["subject"]):
                 continue
             selected.append(c)
-        if not selected:
-            continue
-        lines.append(f"【{teacher}】")
-        for c in selected:
-            lines.append(f"• {c.get('class_name','')}班：{int(c.get('students',0) or 0)}人")
+
+        if selected:
+            filtered.append({
+                "teacher": str(item.get("teacher", "")).strip(),
+                "classes": selected
+            })
+
+    if not filtered:
+        return (
+            "⚠️ 查不到符合條件的老師資料。\n\n"
+            f"學校：{query['school']}\n年級：{query['grade']}\n科目：{query['subject']}"
+        )
+
+    lines = [f"👨‍🏫 {query['school']}｜{query['grade']} {query['subject']}老師", ""]
+
+    # 只有一位老師時，直接顯示姓名，再列該年級實際授課班級與人數。
+    if len(filtered) == 1:
+        item = filtered[0]
+        lines.append(f"老師：{item['teacher']}")
+        lines.append("")
+        for c in item["classes"]:
+            lines.append(
+                f"• {c.get('class_name','')}班：{int(c.get('students',0) or 0)}人"
+            )
+        lines.append("")
+        lines.append(f"📚 共 {len(item['classes'])} 個班")
+        return "\n".join(lines).strip()
+
+    total_classes = 0
+    for item in filtered:
+        lines.append(f"【{item['teacher']}】")
+        for c in item["classes"]:
+            lines.append(
+                f"• {c.get('class_name','')}班：{int(c.get('students',0) or 0)}人"
+            )
             total_classes += 1
         lines.append("")
-    if total_classes == 0:
-        return "⚠️ 查不到符合條件的老師資料。"
+
+    lines.append(f"👨‍🏫 共 {len(filtered)} 位老師")
     lines.append(f"📚 共 {total_classes} 個班")
     return "\n".join(lines).strip()
 
@@ -1170,7 +1502,8 @@ def get_help_reply():
         "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
         "📖 要查版本 → 輸入「查版本」\n"
         "📅 要查訂單 → 輸入「查訂單」\n"
-        "📦 其他訂單 → 輸入「其他訂單」\n\n"
+        "📦 其他訂單 → 輸入「其他訂單」\n"
+        "📊 今日訂單統計 → 輸入「統計」\n\n"
         "進入功能後，我會一步一步引導你完成。"
     )
 
@@ -3198,14 +3531,19 @@ def get_school_catalog(force_refresh=False):
 
 
 def extract_grade_text(text):
+    clean = re.sub(r"[\\s，,。.!！?？]+", "", str(text or ""))
     grade_map = {
         "七年級": "七年級", "八年級": "八年級", "九年級": "九年級",
         "國一": "七年級", "國二": "八年級", "國三": "九年級",
-        "7年級": "七年級", "8年級": "八年級", "9年級": "九年級"
+        "7年級": "七年級", "8年級": "八年級", "9年級": "九年級",
+        "高一": "高一", "高二": "高二", "高三": "高三",
+        "高中一年級": "高一", "高中二年級": "高二", "高中三年級": "高三",
+        "10年級": "高一", "11年級": "高二", "12年級": "高三"
     }
-    for key, value in grade_map.items():
-        if key in text:
-            return value
+    # 長字串優先，避免較短別名先吃到內容
+    for key in sorted(grade_map, key=len, reverse=True):
+        if key in clean:
+            return grade_map[key]
     return ""
 
 
@@ -3682,7 +4020,7 @@ def handle_name_confirmation(user_id, text):
 
     old_pending = dict(pending)
     pending_name_confirmations.pop(user_id, None)
-    print(
+    logger.debug(
         f"STATE candidate replaced user={user_id} "
         f"field={old_pending.get('field','')} old={old_pending.get('value','')} new_input={clean}"
     )
@@ -3711,7 +4049,7 @@ def lookup_fuzzy_candidates(kind, query, school=""):
 # =========================================================
 def google_post(payload, timeout=10, retries=1):
     if not GOOGLE_SCRIPT_URL:
-        print("GOOGLE_SCRIPT_URL missing")
+        logger.warning("GOOGLE_SCRIPT_URL missing")
         return None
 
     action = str(payload.get("action", ""))
@@ -3725,9 +4063,9 @@ def google_post(payload, timeout=10, retries=1):
             cached_data = copy.deepcopy(item.get("data"))
             if action == "lookup_fuzzy_candidates" and isinstance(cached_data, dict) and not cached_data.get("candidates"):
                 _google_read_cache.pop(key, None)
-                print(f"Google cache DROP empty: {action}")
+                logger.debug(f"Google cache DROP empty: {action}")
             else:
-                print(f"Google cache HIT: {action}")
+                logger.debug(f"Google cache HIT: {action}")
                 return cached_data
         else:
             _google_read_cache.pop(key, None)
@@ -3744,7 +4082,7 @@ def google_post(payload, timeout=10, retries=1):
             )
 
             elapsed = time.perf_counter() - started
-            print(
+            logger.info(
                 f"Google action={action} status={response.status_code} "
                 f"elapsed={elapsed:.3f}s attempt={attempt + 1}/{attempts}"
             )
@@ -3775,7 +4113,7 @@ def google_post(payload, timeout=10, retries=1):
 
         except Exception as error:
             elapsed = time.perf_counter() - started
-            print(f"Google request error: {action} elapsed={elapsed:.3f}s error={error}")
+            logger.error(f"Google request error: {action} elapsed={elapsed:.3f}s error={error}")
 
             if attempt < attempts - 1:
                 time.sleep(0.15 * (attempt + 1))
@@ -3941,10 +4279,14 @@ def lookup_book_orders_by_teacher(teacher):
 
 
 def lookup_orders_by_date(date_text):
+    # 原本 timeout=20、retries=3，最壞情況要等將近 60 秒——LINE 的
+    # reply token 官方規定「一分鐘內沒用掉就失效」，等到那麼久基本上
+    # 等於白等，使用者最後什麼回覆都收不到。改成更短的逾時、
+    # 保留一次重試，讓最壞情況也能在 reply token 過期前回覆。
     result = google_post({
         "action": "lookup_orders_by_date",
         "date": date_text
-    }, timeout=20, retries=3)
+    }, timeout=8, retries=2)
 
     if not result:
         return None
@@ -3967,11 +4309,52 @@ def lookup_orders_by_date(date_text):
     return orders
 
 
+def get_today_order_stats_reply():
+    """
+    新增功能：輸入「統計」快速看今天總共進了幾張訂單、幾本書、
+    出版社分佈。原本要看這些只能一張一張查訂單或翻 Google 試算表，
+    這裡直接彙整成一句話回覆。
+    """
+    date_text = datetime.now().strftime("%Y-%m-%d")
+    orders = lookup_orders_by_date(date_text)
+
+    if orders is None:
+        return "⚠️ 訂單統計暫時查詢失敗，請稍後再試一次。"
+
+    if not orders:
+        return f"📊 {date_text} 目前還沒有任何訂書訂單。"
+
+    total_books = sum(int(o.get("quantity", 0) or 0) for o in orders)
+
+    publisher_counts = {}
+    for o in orders:
+        publisher = str(o.get("publisher", "") or "未標示出版社").strip()
+        publisher_counts[publisher] = publisher_counts.get(publisher, 0) + 1
+
+    publisher_lines = [
+        f"• {name}：{count} 筆"
+        for name, count in sorted(publisher_counts.items(), key=lambda x: -x[1])
+    ]
+
+    lines = [
+        f"📊 {date_text} 訂單統計",
+        "",
+        f"訂單筆數：{len(orders)} 筆",
+        f"總計本數：{total_books} 本",
+        "",
+        "依出版社："
+    ] + publisher_lines
+
+    return "\n".join(lines)
+
+
 def cancel_google_order(order_number):
+    # 同上：取消訂單這種操作使用者通常在等立即回覆，
+    # 20 秒 x 3 次重試的最壞情況太接近 LINE reply token 一分鐘上限。
     result = google_post({
         "action": "cancel_order",
         "order_number": normalize_order_number(order_number)
-    }, timeout=20, retries=3)
+    }, timeout=8, retries=2)
 
     return bool(result and result.get("success") is True), result or {}
 
@@ -4297,11 +4680,11 @@ def add_lebron_flavor(message):
 # =========================================================
 def reply_to_line(reply_token, message):
     if not reply_token:
-        print("reply_token missing")
+        logger.warning("reply_token missing")
         return
 
     if not CHANNEL_ACCESS_TOKEN:
-        print("❌ LINE access token 沒有讀到")
+        logger.error("LINE access token 沒有讀到")
         return
 
     url = "https://api.line.me/v2/bot/message/reply"
@@ -4325,19 +4708,32 @@ def reply_to_line(reply_token, message):
         ]
     }
 
-    try:
-        response = HTTP.post(
-            url,
-            headers=headers,
-            json=data,
-            timeout=10
-        )
+    attempts = 2
+    for attempt in range(attempts):
+        try:
+            response = HTTP.post(
+                url,
+                headers=headers,
+                json=data,
+                timeout=10
+            )
 
-        print("LINE reply status:", response.status_code)
-        print("LINE reply response:", response.text)
+            logger.info(f"LINE reply status: {response.status_code}")
+            logger.debug(f"LINE reply response: {response.text}")
 
-    except Exception as error:
-        print("LINE reply error:", error)
+            # 429/5xx 才值得重試一次；4xx（例如 reply token 已過期或用過）
+            # 重打也不會成功，重試反而多耗一次網路來回時間。
+            if response.status_code == 429 or response.status_code >= 500:
+                if attempt < attempts - 1:
+                    time.sleep(0.3)
+                    continue
+            return
+
+        except Exception as error:
+            logger.warning(f"LINE reply error (attempt {attempt + 1}/{attempts}): {error}")
+            if attempt < attempts - 1:
+                time.sleep(0.3)
+                continue
 
 
 if __name__ == "__main__":
