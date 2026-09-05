@@ -2,6 +2,7 @@ from flask import Flask, request
 import os
 import re
 import time
+import threading
 import requests
 import json
 import copy
@@ -10,7 +11,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-02-wrapup-v10"
+APP_VERSION = "2026-09-05-session-refactor-v11"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -56,8 +57,17 @@ FIXED_FALLBACK_MESSAGE = "👑 LeBron James 正在想辦法處理中，請稍後
 
 DEFAULT_SCHOOL = os.environ.get("DEFAULT_SCHOOL", "天母國中")
 
+# 主流程裡「確認／是／對」這類同義詞，統一從這裡取用，
+# 避免同一份清單散落在程式碼裡三個地方、改一次容易漏改。
+CONFIRM_WORDS = {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}
+
+
+def _is_confirm_word(text):
+    return str(text or "").strip() in CONFIRM_WORDS
+
+
 # =========================================================
-# 對話狀態
+# 對話狀態（全部使用 user_id 當 key 的全域 dict）
 # =========================================================
 pending_orders = {}
 order_flow_context = {}
@@ -72,6 +82,7 @@ pending_other_orders = {}
 pending_other_updates = {}
 other_order_context = {}
 
+# 老師/書名/學校 同音字或錯字候選確認。
 pending_name_confirmations = {}
 
 # 老師查詢失敗後，允許使用者下一句直接重打正確姓名。
@@ -83,77 +94,141 @@ pending_teacher_corrections = {}
 # 引導式功能模式
 guided_mode = {}
 
+# 上面這些 dict 全部都是「同一個使用者的對話狀態」。
+# Gunicorn/Render 可能由不同 worker 接收前後兩則 LINE 訊息，
+# 只用 Python 全域 dict 時，某個 worker 剛寫入的狀態，
+# 另一個 worker 完全看不到，會讓對話流程被誤判成新的一句。
+# 所以全部一起納入下面的跨 worker 持久化機制，而不是只挑
+# 訂書草稿或名稱確認這兩個特別處理。
+_SESSION_DICTS = {
+    "pending_orders": pending_orders,
+    "order_flow_context": order_flow_context,
+    "conversation_context": conversation_context,
+    "teacher_lookup_context": teacher_lookup_context,
+    "historical_order_context": historical_order_context,
+    "pending_history_updates": pending_history_updates,
+    "pending_history_cancels": pending_history_cancels,
+    "pending_other_orders": pending_other_orders,
+    "pending_other_updates": pending_other_updates,
+    "other_order_context": other_order_context,
+    "pending_name_confirmations": pending_name_confirmations,
+    "pending_teacher_corrections": pending_teacher_corrections,
+    "guided_mode": guided_mode,
+}
+
 # =========================================================
-# 訂書關鍵狀態：SQLite 暫存
+# 跨 worker 對話狀態持久化：SQLite
 # =========================================================
-# Gunicorn/Render 可能由不同 worker 接收前後兩則 LINE 訊息。
-# 只用 Python 全域 dict 時，上一句找到的候選可能在下一個 worker 看不到，
-# 造成「確認」被誤當成新的老師姓名或書名。
 _STATE_DB_PATH = os.environ.get("ORDER_STATE_DB_PATH", "/tmp/line_order_bot_state.sqlite3")
 
+
 def _state_db():
-    conn = sqlite3.connect(_STATE_DB_PATH, timeout=2)
+    """回傳一個新的 SQLite 連線。呼叫端務必自己 close()，避免連線洩漏。"""
+    conn = sqlite3.connect(_STATE_DB_PATH, timeout=5)
     conn.execute(
-        "CREATE TABLE IF NOT EXISTS order_state ("
-        "user_id TEXT PRIMARY KEY, draft_json TEXT, pending_json TEXT, updated_at REAL)"
+        "CREATE TABLE IF NOT EXISTS user_session ("
+        "user_id TEXT PRIMARY KEY, session_json TEXT, updated_at REAL)"
     )
     return conn
 
-def _persist_order_state(user_id):
-    draft = order_flow_context.get(user_id)
-    pending = pending_name_confirmations.get(user_id)
-    if draft is None and pending is None:
-        try:
-            with _state_db() as conn:
-                conn.execute("DELETE FROM order_state WHERE user_id=?", (user_id,))
-        except Exception as e:
-            print("state persist delete error:", e)
+
+def _hydrate_session(user_id):
+    """每一則訊息處理前，把這個使用者所有對話狀態從 SQLite 讀回全域 dict。"""
+    conn = _state_db()
+    try:
+        row = conn.execute(
+            "SELECT session_json FROM user_session WHERE user_id=?", (user_id,)
+        ).fetchone()
+    except Exception as e:
+        print("session hydrate read error:", e)
+        row = None
+    finally:
+        conn.close()
+
+    if not row or not row[0]:
         return
+
     try:
-        with _state_db() as conn:
+        data = json.loads(row[0])
+    except Exception as e:
+        print("session hydrate decode error:", e)
+        return
+
+    if not isinstance(data, dict):
+        return
+
+    for key, target_dict in _SESSION_DICTS.items():
+        if key in data:
+            target_dict[user_id] = data[key]
+
+
+def _persist_session(user_id):
+    """每一則訊息處理完後，把這個使用者目前所有對話狀態整包寫回 SQLite。
+    若這個使用者目前所有 dict 都沒有資料，直接把該筆記錄刪除。"""
+    payload = {}
+    for key, target_dict in _SESSION_DICTS.items():
+        if user_id in target_dict:
+            payload[key] = target_dict[user_id]
+
+    conn = _state_db()
+    try:
+        if not payload:
+            conn.execute("DELETE FROM user_session WHERE user_id=?", (user_id,))
+        else:
+            try:
+                session_json = json.dumps(payload, ensure_ascii=False)
+            except Exception as e:
+                print("session persist encode error:", e)
+                return
             conn.execute(
-                "INSERT INTO order_state(user_id,draft_json,pending_json,updated_at) VALUES(?,?,?,?) "
-                "ON CONFLICT(user_id) DO UPDATE SET draft_json=excluded.draft_json, "
-                "pending_json=excluded.pending_json, updated_at=excluded.updated_at",
-                (
-                    user_id,
-                    json.dumps(draft, ensure_ascii=False) if draft is not None else None,
-                    json.dumps(pending, ensure_ascii=False) if pending is not None else None,
-                    time.time(),
-                ),
+                "INSERT INTO user_session(user_id, session_json, updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(user_id) DO UPDATE SET session_json=excluded.session_json, "
+                "updated_at=excluded.updated_at",
+                (user_id, session_json, time.time())
             )
+        conn.commit()
     except Exception as e:
-        print("state persist error:", e)
+        print("session persist write error:", e)
+    finally:
+        conn.close()
 
-def _hydrate_order_state(user_id):
-    # 每一則訊息都從共享 SQLite 補回關鍵訂書狀態，避免跨 worker 遺失。
-    try:
-        with _state_db() as conn:
-            row = conn.execute(
-                "SELECT draft_json,pending_json FROM order_state WHERE user_id=?", (user_id,)
-            ).fetchone()
-        if not row:
-            return
-        draft_json, pending_json = row
-        if draft_json:
-            restored_draft = json.loads(draft_json)
-            order_flow_context[user_id] = restored_draft
-            # 最終訂購確認也要跨 worker 保存。否則使用者下一句「確認」
-            # 可能只恢復訂書草稿，卻遺失 pending_orders，導致再次產生確認單。
-            final_order = restored_draft.get("_pending_final_order")
-            if isinstance(final_order, dict) and final_order:
-                pending_orders[user_id] = final_order
-        if pending_json:
-            pending_name_confirmations[user_id] = json.loads(pending_json)
-    except Exception as e:
-        print("state hydrate error:", e)
 
-def _clear_persisted_order_state(user_id):
+def _clear_session(user_id):
+    """立即清空這個使用者的所有對話狀態（全域 dict ＋ SQLite）。"""
+    for target_dict in _SESSION_DICTS.values():
+        target_dict.pop(user_id, None)
+
+    conn = _state_db()
     try:
-        with _state_db() as conn:
-            conn.execute("DELETE FROM order_state WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM user_session WHERE user_id=?", (user_id,))
+        conn.commit()
     except Exception as e:
-        print("state clear error:", e)
+        print("session clear error:", e)
+    finally:
+        conn.close()
+
+
+# =========================================================
+# 同一個使用者的訊息在同一個 worker 內序列化處理，
+# 避免同一個人連續快速傳兩句話時，兩個執行緒同時讀寫同一份狀態。
+#
+# 注意：這個鎖只能保證「同一個 process 內」不會互搶；
+# 如果 Render 之後改成多台機器（多個 process）水平擴展，
+# 且同一使用者的訊息剛好落在不同機器，仍然可能有極短暫的競爭。
+# 要完全避免，需要換成 Redis 之類的分散式鎖。
+# =========================================================
+_user_locks = {}
+_user_locks_guard = threading.Lock()
+
+
+def _get_user_lock(user_id):
+    with _user_locks_guard:
+        lock = _user_locks.get(user_id)
+        if lock is None:
+            lock = threading.Lock()
+            _user_locks[user_id] = lock
+        return lock
+
 
 # 學校清單快取：學校名稱直接由 Google 資料庫取得。
 # 未來新增學校，只要新增到「老師班級資料」或「學校版本資料」，
@@ -216,11 +291,22 @@ def callback():
 # 主流程
 # =========================================================
 def handle_message(user_id, user_text):
+    """對外入口：負責鎖定、讀回狀態、處理、寫回狀態。真正的路由邏輯在 _route_message。"""
+    lock = _get_user_lock(user_id)
+    with lock:
+        _hydrate_session(user_id)
+        try:
+            return _route_message(user_id, user_text)
+        finally:
+            _persist_session(user_id)
+
+
+def _route_message(user_id, user_text):
     text = normalize_text(user_text)
-    _hydrate_order_state(user_id)
-    if text in {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}:
+
+    if _is_confirm_word(text):
         _d = order_flow_context.get(user_id) or {}
-        _p = pending_name_confirmations.get(user_id) or _d.get("_pending_name_confirmation")
+        _p = pending_name_confirmations.get(user_id)
         print(f"STATE confirm user={user_id} draft_teacher={_d.get('teacher','')} pending={_p}")
 
     # 0. 重來：一定最優先
@@ -228,7 +314,7 @@ def handle_message(user_id, user_text):
         text in ["重來", "重新開始", "全部重來", "全部重設"]
         or re.fullmatch(r"(?:重來|重新開始|全部重來|全部重設)[喔哦唷啦吧啊呀]*[！!。.]?", text)
     ):
-        clear_all_user_state(user_id)
+        _clear_session(user_id)
         return get_main_menu_reply()
 
     # 0.1 純本地固定指令：絕對不能碰 Google / AI
@@ -243,10 +329,16 @@ def handle_message(user_id, user_text):
     if text in {"版本", "版本號", "目前版本", "程式版本"}:
         return f"目前機器人版本：{APP_VERSION}"
 
+    # 本地清除快取：老師／班級／書籍／版本資料庫被手動修改後，
+    # 不用等讀取快取自然過期（最長 30 分鐘），可以直接下指令清掉。
+    if text in {"清除快取", "清快取", "重新整理資料", "重新整理快取"}:
+        clear_google_read_cache()
+        get_school_catalog(force_refresh=True)
+        return "✅ 已清除查詢快取，下一次查詢會直接讀取 Google 最新資料。"
+
     # 0.2 「確認」硬性優先：只要上一句有名稱候選，絕不能再把「確認」當姓名/書名搜尋。
-    if text in {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}:
-        draft_for_confirm = order_flow_context.get(user_id) or {}
-        if user_id in pending_name_confirmations or draft_for_confirm.get("_pending_name_confirmation"):
+    if _is_confirm_word(text):
+        if user_id in pending_name_confirmations:
             confirmed_reply = handle_name_confirmation(user_id, text)
             if confirmed_reply is not None:
                 return confirmed_reply
@@ -254,9 +346,7 @@ def handle_message(user_id, user_text):
         # 名稱確認之後，第二優先就是「最終訂單確認」。
         # 這一步一定要在訂書流程鎖定之前處理，否則「確認」會重新走
         # handle_order_flow() 並再次產生同一張訂購確認。
-        final_order = pending_orders.get(user_id) or draft_for_confirm.get("_pending_final_order")
-        if isinstance(final_order, dict) and final_order:
-            pending_orders[user_id] = final_order
+        if user_id in pending_orders:
             return confirm_new_order(user_id)
 
     # 0.5 引導式功能入口：主選單五個指令都一定有下一步
@@ -346,8 +436,7 @@ def handle_message(user_id, user_text):
     # 0.9 名稱候選確認一定要早於訂書流程。
     # 例如：蔡書懸 -> 候選蔡書玄 -> 使用者回「確認」時，
     # 必須先吃掉這個確認，不能把「確認」當成新的老師姓名/書名去查。
-    order_draft_for_confirm = order_flow_context.get(user_id) or {}
-    if user_id in pending_name_confirmations or order_draft_for_confirm.get("_pending_name_confirmation"):
+    if user_id in pending_name_confirmations:
         fuzzy_reply = handle_name_confirmation(user_id, text)
         if fuzzy_reply is not None:
             return fuzzy_reply
@@ -611,26 +700,6 @@ def handle_message(user_id, user_text):
 
 
 # =========================================================
-# 狀態
-# =========================================================
-def clear_all_user_state(user_id):
-    pending_orders.pop(user_id, None)
-    order_flow_context.pop(user_id, None)
-    conversation_context.pop(user_id, None)
-    teacher_lookup_context.pop(user_id, None)
-    historical_order_context.pop(user_id, None)
-    pending_history_updates.pop(user_id, None)
-    pending_history_cancels.pop(user_id, None)
-    pending_other_orders.pop(user_id, None)
-    pending_other_updates.pop(user_id, None)
-    other_order_context.pop(user_id, None)
-    pending_name_confirmations.pop(user_id, None)
-    pending_teacher_corrections.pop(user_id, None)
-    guided_mode.pop(user_id, None)
-    _clear_persisted_order_state(user_id)
-
-
-# =========================================================
 # 引導式主選單／查老師模式
 # =========================================================
 def get_main_menu_reply():
@@ -853,10 +922,11 @@ def handle_guided_other_order(user_id, text):
 
 
 def clear_task_states_for_new_mode(user_id):
-    order_flow_context.pop(user_id,None); pending_orders.pop(user_id,None)
-    pending_name_confirmations.pop(user_id,None); pending_teacher_corrections.pop(user_id,None)
-    teacher_lookup_context.pop(user_id,None)
-    _clear_persisted_order_state(user_id)
+    order_flow_context.pop(user_id, None)
+    pending_orders.pop(user_id, None)
+    pending_name_confirmations.pop(user_id, None)
+    pending_teacher_corrections.pop(user_id, None)
+    teacher_lookup_context.pop(user_id, None)
 
 def normalize_teacher_name_input(text):
     clean=re.sub(r"[，,。.!！?？\s]+","",str(text or ""))
@@ -947,7 +1017,20 @@ def handle_guided_teacher_lookup(user_id,text):
 def is_greeting_request(text):
     compact = re.sub(r"[，,。.!！?？\s]+", "", str(text or "").lower())
     greetings = ["你好", "妳好", "您好", "哈囉", "哈啰", "嗨", "早安", "午安", "晚安", "在嗎"]
-    return any(compact == g or compact.startswith(g + "我是") for g in greetings)
+
+    if any(compact == g for g in greetings):
+        return True
+
+    # 「你好我是XXX」這種單純自我介紹才當招呼；
+    # 「你好我是要查王老師教哪幾班」不該被提早攔截成打招呼。
+    functional_words = ["老師", "訂書", "訂單", "版本", "班", "查", "訂購", "確認"]
+    for g in greetings:
+        prefix = g + "我是"
+        if compact.startswith(prefix):
+            remainder = compact[len(prefix):]
+            if len(remainder) <= 6 and not any(w in remainder for w in functional_words):
+                return True
+    return False
 
 
 def get_greeting_reply():
@@ -1026,25 +1109,18 @@ def validate_order_teacher_input(user_id, raw_text, draft):
         draft["teacher"] = value
         draft["school"] = candidate_school
         draft["classes"] = []
-        draft.pop("_pending_name_confirmation", None)
         pending_name_confirmations.pop(user_id, None)
         order_flow_context[user_id] = draft
-        _persist_order_state(user_id)
         return make_order_guide_reply(draft)
 
     # 錯一字/同音/近似：一定先讓使用者確認，不能自動把錯字存進訂單。
     if value and score >= 0.52:
-        pending = {
+        pending_name_confirmations[user_id] = {
             "field": "teacher", "purpose": "order_teacher",
             "value": value, "school": candidate_school,
             "original": clean
         }
-        pending_name_confirmations[user_id] = pending
-        # 同步寫進訂書 draft，避免 Render 多 worker / 狀態切換時只剩訂書狀態卻遺失候選確認。
-        draft["_pending_name_confirmation"] = dict(pending)
         order_flow_context[user_id] = draft
-        _persist_order_state(user_id)
-        print(f"STATE saved teacher candidate user={user_id} value={value} school={candidate_school}")
         # 候選不一定就是使用者真正想找的人。清楚告知：確認只代表採用這一位；
         # 若不是，直接輸入另一個老師姓名，系統會取消舊候選並重新查資料庫。
         other_candidates = []
@@ -1090,17 +1166,13 @@ def validate_order_book_input(user_id, raw_text, draft):
 
     # 即使很像也先確認正式書名，避免同系列不同科目/冊次誤訂。
     if value and score >= 0.52:
-        pending = {
+        pending_name_confirmations[user_id] = {
             "field": "book", "purpose": "order_book",
             "value": value,
             "publisher": str(first.get("publisher", "") or ""),
             "original": query
         }
-        pending_name_confirmations[user_id] = pending
-        # 書名候選也同步保存在訂書 draft，確保下一句「確認」一定能找到剛才的正式書名。
-        draft["_pending_name_confirmation"] = dict(pending)
         order_flow_context[user_id] = draft
-        _persist_order_state(user_id)
         extra = [
             str(c.get("value", "") or "").strip()
             for c in candidates[1:3]
@@ -1133,7 +1205,6 @@ def handle_order_flow(user_id, text):
             "classes": [],
             "book": ""
         }
-        _persist_order_state(user_id)
         return make_order_guide_reply(order_flow_context[user_id])
 
     draft = order_flow_context.get(user_id, {
@@ -1145,11 +1216,8 @@ def handle_order_flow(user_id, text):
 
     # 第二層保險：就算主流程的確認分流沒有吃到，訂書流程本身也絕不允許
     # 把「確認」當成老師姓名或書名重新丟去 Google。
-    confirm_words = {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}
-    if clean in confirm_words:
-        pending = pending_name_confirmations.get(user_id) or draft.get("_pending_name_confirmation")
-        if pending:
-            pending_name_confirmations[user_id] = dict(pending)
+    if _is_confirm_word(clean):
+        if user_id in pending_name_confirmations:
             reply = handle_name_confirmation(user_id, clean)
             if reply is not None:
                 return reply
@@ -1213,7 +1281,6 @@ def handle_order_flow(user_id, text):
 
 
     order_flow_context[user_id] = draft
-    _persist_order_state(user_id)
 
     # 老師＋書名已足夠：沒指定班級時，自動帶入該老師全部班級
     if draft["teacher"] and draft["book"]:
@@ -1452,7 +1519,18 @@ def build_order_from_draft(user_id, draft):
             )
 
     if not teacher_classes:
-        return FIXED_FALLBACK_MESSAGE
+        # 找不到班級資料時，只清空老師／學校／班級，書名保留，
+        # 讓使用者可以直接重新輸入老師姓名，而不是卡在同一個死路。
+        draft["teacher"] = ""
+        draft["school"] = ""
+        draft["classes"] = []
+        order_flow_context[user_id] = draft
+        pending_name_confirmations.pop(user_id, None)
+        return (
+            "⚠️ 老師資料庫目前找不到符合的班級資料。\n\n"
+            f"你輸入：{teacher}\n\n"
+            "書名已保留，請重新輸入正確的老師姓名。"
+        )
 
     # 未指定班級時，預設帶入老師資料庫中的全部班級，先讓使用者確認。
     if not requested_classes:
@@ -1539,12 +1617,7 @@ def build_order_from_draft(user_id, draft):
     }
 
     pending_orders[user_id] = order
-
-    # 把最終待確認訂單一起存在訂書狀態，讓 Render/Gunicorn 不同 worker
-    # 也能在下一句「確認」時直接寫入 Google，而不是重新產生確認單。
-    draft["_pending_final_order"] = copy.deepcopy(order)
     order_flow_context[user_id] = draft
-    _persist_order_state(user_id)
 
     context = {
         "teacher": teacher,
@@ -1732,7 +1805,6 @@ def confirm_new_order(user_id):
     order_flow_context.pop(user_id, None)
     pending_name_confirmations.pop(user_id, None)
     guided_mode.pop(user_id, None)
-    _clear_persisted_order_state(user_id)
 
     return (
         "✅ 訂單已確認\n\n"
@@ -3338,13 +3410,6 @@ def resolve_fuzzy_name(kind, query, school=""):
 
 def handle_name_confirmation(user_id, text):
     pending = pending_name_confirmations.get(user_id)
-    # 訂書流程額外把候選存在 draft 內。即使全域 pending 因 worker/流程切換遺失，
-    # 使用者下一句「確認」仍可正確接續，不會把「確認」當成新的老師或書名。
-    if not pending:
-        draft_for_pending = order_flow_context.get(user_id) or {}
-        pending = draft_for_pending.get("_pending_name_confirmation")
-        if pending:
-            pending_name_confirmations[user_id] = dict(pending)
     if not pending:
         return None
 
@@ -3389,8 +3454,6 @@ def handle_name_confirmation(user_id, text):
         if not draft:
             return "✅ 已確認名稱。請重新輸入剛才的訂書內容。"
 
-        draft.pop("_pending_name_confirmation", None)
-
         if pending["field"] == "teacher":
             # 這個候選本身就是上一句由 Google 老師資料庫 fuzzy endpoint 回傳的正式資料。
             # 使用者回「確認」後直接採用暫存候選，不再重新打 Google，避免確認又卡 7~15 秒。
@@ -3407,7 +3470,6 @@ def handle_name_confirmation(user_id, text):
             draft["school"] = pending["value"]
 
         order_flow_context[user_id] = draft
-        _persist_order_state(user_id)
 
         if draft.get("teacher") and draft.get("book"):
             result = build_order_from_draft(user_id, draft)
@@ -3418,15 +3480,10 @@ def handle_name_confirmation(user_id, text):
         return make_order_guide_reply(draft)
 
     if clean in no_words:
-        was_guided_teacher=pending.get("purpose")=="guided_teacher_lookup"
-        pending_name_confirmations.pop(user_id,None)
-        draft_for_pending = order_flow_context.get(user_id)
-        if draft_for_pending:
-            draft_for_pending.pop("_pending_name_confirmation", None)
-            order_flow_context[user_id] = draft_for_pending
-        _persist_order_state(user_id)
+        was_guided_teacher = pending.get("purpose") == "guided_teacher_lookup"
+        pending_name_confirmations.pop(user_id, None)
         if was_guided_teacher:
-            guided_mode[user_id]="teacher_lookup"
+            guided_mode[user_id] = "teacher_lookup"
             return "好，我不採用剛才的候選。\n\n我還在「查老師」模式，請直接重新輸入老師姓名。"
         field_name = {
             "teacher": "老師姓名",
@@ -3439,11 +3496,6 @@ def handle_name_confirmation(user_id, text):
     # 明確放棄舊候選並保留目前訂書流程，讓同一則訊息立刻重新進資料庫驗證。
     old_pending = dict(pending)
     pending_name_confirmations.pop(user_id, None)
-    draft_for_pending = order_flow_context.get(user_id)
-    if draft_for_pending:
-        draft_for_pending.pop("_pending_name_confirmation", None)
-        order_flow_context[user_id] = draft_for_pending
-    _persist_order_state(user_id)
     print(
         f"STATE candidate replaced user={user_id} "
         f"field={old_pending.get('field','')} old={old_pending.get('value','')} new_input={clean}"
