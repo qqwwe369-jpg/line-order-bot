@@ -12,7 +12,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-05-purchase-order-note-v13"
+APP_VERSION = "2026-09-05-history-purchase-order-v15"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -92,10 +92,8 @@ DEFAULT_SCHOOL = os.environ.get("DEFAULT_SCHOOL", "天母國中")
 CONFIRM_WORDS = {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}
 
 # 訂單確認寫入成功後，詢問是否要生成訂購單文字。
-# 這個等待視窗只在使用者「下一次傳訊息」時才會被檢查是否逾時
-# （沒有背景排程器持續倒數），但效果等同於「超過這個時間就視為
-# 使用者不需要了」，不會讓提問一直卡著。
-RECEIPT_OFFER_TTL_SECONDS = 60
+# 不再設定 1 分鐘逾時；只要使用者尚未開始新的功能，之後回覆
+# 「要／好／確認」仍可生成該筆訂購單。開始新的功能時會自動清除舊提問。
 RECEIPT_DECLINE_WORDS = {"不用", "不需要", "不用了", "不要", "算了"}
 
 
@@ -361,15 +359,22 @@ def _route_message(user_id, user_text):
         return "✅ 已清除查詢快取，下一次查詢會直接讀取 Google 最新資料。"
 
     # 0.15 訂購單生成提問：訂單確認寫入成功後才會出現這個狀態。
-    # 使用者回「要/好/是」→ 產生訂購單；回「不用」等 → 明確取消；
-    # 超過 1 分鐘沒回覆 → 視為不需要了，不再攔截這句話，讓它正常往下處理。
+    # 不再設定 1 分鐘逾時。只要尚未開始新的功能，之後回「要／好／確認」都有效。
+    # 若使用者開始新的功能，代表舊提問作廢，避免之後一句「好」誤生成上一張訂購單。
     if user_id in pending_receipt_offers:
         offer = pending_receipt_offers[user_id]
-        elapsed = time.time() - float(offer.get("created_at", 0) or 0)
 
-        if elapsed > RECEIPT_OFFER_TTL_SECONDS:
+        starts_new_task = (
+            is_teacher_mode_start(text)
+            or is_order_mode_start(text)
+            or is_version_mode_start(text)
+            or is_history_mode_start(text)
+            or is_other_order_mode_start(text)
+        )
+
+        if starts_new_task:
             pending_receipt_offers.pop(user_id, None)
-        elif _is_confirm_word(text):
+        elif _is_confirm_word(text) or text in {"要", "我要", "需要", "幫我生成", "生成", "生成訂購單"}:
             pending_receipt_offers.pop(user_id, None)
             purchase_order_text = make_purchase_order_text(offer)
             note_ok = mark_order_note(offer.get("order_number", ""), "已請業務下單")
@@ -382,8 +387,7 @@ def _route_message(user_id, user_text):
         elif text in RECEIPT_DECLINE_WORDS:
             pending_receipt_offers.pop(user_id, None)
             return "好的，沒有要生成訂購單。"
-        # 其他輸入：不攔截，維持 offer，讓這句話依照正常流程判斷
-        # （例如使用者其實是想開始下一筆訂單）。
+        # 其他輸入先照正常流程處理，訂購單提問仍保留。
 
     # 0.2 「確認」硬性優先：只要上一句有名稱候選，絕不能再把「確認」當姓名/書名搜尋。
     if _is_confirm_word(text):
@@ -619,7 +623,7 @@ def _route_message(user_id, user_text):
         historical_order_context[user_id] = order
         pending_history_updates.pop(user_id, None)
         pending_history_cancels.pop(user_id, None)
-        return make_historical_order_reply(order)
+        return make_historical_order_with_offer(user_id, order)
 
     # 10. 查完歷史訂單後直接說「取消這張」
     if user_id in historical_order_context and text in [
@@ -787,7 +791,7 @@ def _guided_mode_escape_reply(user_id, text):
         if not order:
             return f"⚠️ 查不到訂單 {order_number}。"
         historical_order_context[user_id] = order
-        return make_historical_order_reply(order)
+        return make_historical_order_with_offer(user_id, order)
 
     return None
 
@@ -970,7 +974,8 @@ def handle_guided_history_lookup(user_id, text):
                 "我還在「查訂單」模式，可以直接輸入另一個編號。"
             )
         historical_order_context[user_id] = order
-        return _finish_guided_mode(user_id, make_historical_order_reply(order))
+        guided_mode.pop(user_id, None)
+        return make_historical_order_with_offer(user_id, order)
 
     teacher_name = re.sub(r"(?:老師)?(?:訂單|訂書|進度|紀錄)$", "", clean)
     teacher_name = re.sub(r"老師$", "", teacher_name)
@@ -1898,8 +1903,8 @@ def confirm_new_order(user_id):
     guided_mode.pop(user_id, None)
 
     # 訂單成功寫入後，記錄一份精簡快照，等使用者決定要不要
-    # 順便生成一張可以直接傳給出版社業務員下單的訂購單。1 分鐘內沒回覆
-    # 就視為不需要，見 _route_message 裡的逾時判斷。
+    # 順便生成一張可以直接傳給出版社業務員下單的訂購單。
+    # 不設 1 分鐘逾時；開始新的功能時才會清除這個提問。
     pending_receipt_offers[user_id] = {
         "order_number": order_number,
         "school": order["school"],
@@ -1909,18 +1914,18 @@ def confirm_new_order(user_id):
         "created_at": time.time()
     }
 
-    return (
-        "✅ 訂單已確認\n\n"
-        f"訂單編號：{order_number}\n"
-        "已成功寫入 Google 試算表。\n\n"
-        f"老師：{order['teacher']}\n"
-        f"書名：{order['book']}\n"
-        f"出版社：{order['publisher']}\n"
-        f"總數量：{order['quantity']}本\n\n"
-        f"之後可以直接問「查{order_number}」\n\n"
-        "需要幫你生成一張訂購單，讓你直接傳給出版社業務員下單嗎？\n"
-        "回覆「要」或「好」即可，1 分鐘內沒有回覆就會自動取消這個提問。"
-    )
+    return [
+        (
+            "✅ 訂單已確認\n\n"
+            f"訂單編號：{order_number}\n"
+            "已成功寫入 Google 試算表。\n\n"
+            f"之後可以直接問「查{order_number}」"
+        ),
+        (
+            "需要幫你生成一張訂購單，讓你直接傳給出版社業務員下單嗎？\n"
+            "回覆「要」或「好」即可。"
+        )
+    ]
 
 
 def handle_pending_order_edit(user_id, text):
@@ -2592,6 +2597,40 @@ def make_history_update_confirmation(original_order, new_order, changes):
         "如果正確，請回覆「確認」或「確認修改」\n"
         "不要修改請回覆「取消修改」"
     )
+
+
+def make_historical_order_with_offer(user_id, order):
+    """
+    查到單一歷史訂單後，同時建立「是否生成訂購單」的待確認狀態。
+    使用者之後回「要／好／確認」時，沿用既有 make_purchase_order_text()
+    產生可傳給出版社業務員的訂購單，並由 mark_order_note() 把 Google
+    J 欄備註更新為「已請業務下單」。
+    """
+    status = str(order.get("status", "") or "").strip()
+    history_reply = make_historical_order_reply(order)
+
+    # 已取消的歷史訂單不應再引導送給業務員下單。
+    if "取消" in status:
+        pending_receipt_offers.pop(user_id, None)
+        return history_reply
+
+    pending_receipt_offers[user_id] = {
+        "order_number": order.get("order_number", ""),
+        "school": order.get("school", ""),
+        "publisher": order.get("publisher", ""),
+        "book": order.get("book", ""),
+        "classes": copy_classes(order.get("classes", [])),
+        "created_at": time.time(),
+        "source": "history_lookup",
+    }
+
+    return [
+        history_reply,
+        (
+            "需要幫你生成一張訂購單，讓你直接傳給出版社業務員下單嗎？\n"
+            "回覆「要」或「好」即可。"
+        )
+    ]
 
 
 def make_historical_order_reply(order):
@@ -4140,6 +4179,14 @@ def orders_have_same_core_data(actual_order, expected_order):
 # LeBron 固定人設層
 # =========================================================
 def add_lebron_flavor(message):
+    # 某些流程需要一次回覆兩個 LINE 訊息泡泡。第一個泡泡套 LeBron 開場，
+    # 後續泡泡保持原文，避免第二段提問再被加一次「LeBron James」。
+    if isinstance(message, (list, tuple)):
+        items = list(message)
+        if not items:
+            return []
+        return [add_lebron_flavor(items[0])] + [str(x or "").strip() for x in items[1:]]
+
     body = str(message or "").strip()
     if not body:
         body = "目前沒有可顯示的內容。"
@@ -4228,13 +4275,17 @@ def reply_to_line(reply_token, message):
         "Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN
     }
 
+    if isinstance(message, (list, tuple)):
+        message_items = [str(item or "").strip() for item in message if str(item or "").strip()]
+    else:
+        message_items = [str(message or "").strip()]
+
+    # LINE Reply API 一次最多可帶多個 message object；這裡保守限制前 5 則。
     data = {
         "replyToken": reply_token,
         "messages": [
-            {
-                "type": "text",
-                "text": str(message or "")[:4900]
-            }
+            {"type": "text", "text": item[:4900]}
+            for item in message_items[:5]
         ]
     }
 
