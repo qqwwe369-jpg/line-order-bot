@@ -12,7 +12,7 @@ from datetime import datetime
 from difflib import SequenceMatcher
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-05-history-purchase-order-v15"
+APP_VERSION = "2026-09-05-receipt-40s-no-lebron-v16"
 
 # =========================================================
 # 速度優化：共用 HTTP Session + 讀取快取
@@ -92,8 +92,8 @@ DEFAULT_SCHOOL = os.environ.get("DEFAULT_SCHOOL", "天母國中")
 CONFIRM_WORDS = {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}
 
 # 訂單確認寫入成功後，詢問是否要生成訂購單文字。
-# 不再設定 1 分鐘逾時；只要使用者尚未開始新的功能，之後回覆
-# 「要／好／確認」仍可生成該筆訂購單。開始新的功能時會自動清除舊提問。
+# 提問有效時間 40 秒；沒有背景排程器，因此逾時會在使用者下一次傳訊息時清除。
+RECEIPT_OFFER_TTL_SECONDS = 40
 RECEIPT_DECLINE_WORDS = {"不用", "不需要", "不用了", "不要", "算了"}
 
 
@@ -358,36 +358,39 @@ def _route_message(user_id, user_text):
         get_school_catalog(force_refresh=True)
         return "✅ 已清除查詢快取，下一次查詢會直接讀取 Google 最新資料。"
 
-    # 0.15 訂購單生成提問：訂單確認寫入成功後才會出現這個狀態。
-    # 不再設定 1 分鐘逾時。只要尚未開始新的功能，之後回「要／好／確認」都有效。
-    # 若使用者開始新的功能，代表舊提問作廢，避免之後一句「好」誤生成上一張訂購單。
+    # 0.15 訂購單生成提問：新訂單確認或歷史訂單查詢後才會出現。
+    # 有效時間 40 秒；超過 40 秒後自動視為取消，不再讓「好／要」誤生成舊訂購單。
     if user_id in pending_receipt_offers:
         offer = pending_receipt_offers[user_id]
+        elapsed = time.time() - float(offer.get("created_at", 0) or 0)
 
-        starts_new_task = (
-            is_teacher_mode_start(text)
-            or is_order_mode_start(text)
-            or is_version_mode_start(text)
-            or is_history_mode_start(text)
-            or is_other_order_mode_start(text)
-        )
+        if elapsed > RECEIPT_OFFER_TTL_SECONDS:
+            pending_receipt_offers.pop(user_id, None)
+        else:
+            starts_new_task = (
+                is_teacher_mode_start(text)
+                or is_order_mode_start(text)
+                or is_version_mode_start(text)
+                or is_history_mode_start(text)
+                or is_other_order_mode_start(text)
+            )
 
-        if starts_new_task:
-            pending_receipt_offers.pop(user_id, None)
-        elif _is_confirm_word(text) or text in {"要", "我要", "需要", "幫我生成", "生成", "生成訂購單"}:
-            pending_receipt_offers.pop(user_id, None)
-            purchase_order_text = make_purchase_order_text(offer)
-            note_ok = mark_order_note(offer.get("order_number", ""), "已請業務下單")
-            if not note_ok:
-                purchase_order_text += (
-                    "\n\n⚠️ 訂購單已生成，但 Google 備註欄寫入失敗。"
-                    "請先不要漏掉這筆，稍後可再補寫「已請業務下單」。"
-                )
-            return purchase_order_text
-        elif text in RECEIPT_DECLINE_WORDS:
-            pending_receipt_offers.pop(user_id, None)
-            return "好的，沒有要生成訂購單。"
-        # 其他輸入先照正常流程處理，訂購單提問仍保留。
+            if starts_new_task:
+                pending_receipt_offers.pop(user_id, None)
+            elif _is_confirm_word(text) or text in {"要", "我要", "需要", "幫我生成", "生成", "生成訂購單"}:
+                pending_receipt_offers.pop(user_id, None)
+                purchase_order_text = make_purchase_order_text(offer)
+                note_ok = mark_order_note(offer.get("order_number", ""), "已請業務下單")
+                if not note_ok:
+                    purchase_order_text += (
+                        "\n\n⚠️ 訂購單已生成，但 Google 備註欄寫入失敗。"
+                        "請先不要漏掉這筆，稍後可再補寫「已請業務下單」。"
+                    )
+                return purchase_order_text
+            elif text in RECEIPT_DECLINE_WORDS:
+                pending_receipt_offers.pop(user_id, None)
+                return "好的，沒有要生成訂購單。"
+            # 其他輸入先照正常流程處理；40 秒內提問仍保留。
 
     # 0.2 「確認」硬性優先：只要上一句有名稱候選，絕不能再把「確認」當姓名/書名搜尋。
     if _is_confirm_word(text):
@@ -1904,7 +1907,7 @@ def confirm_new_order(user_id):
 
     # 訂單成功寫入後，記錄一份精簡快照，等使用者決定要不要
     # 順便生成一張可以直接傳給出版社業務員下單的訂購單。
-    # 不設 1 分鐘逾時；開始新的功能時才會清除這個提問。
+    # 提問有效 40 秒；逾時後會在下一次收到訊息時清除。
     pending_receipt_offers[user_id] = {
         "order_number": order_number,
         "school": order["school"],
@@ -1923,7 +1926,7 @@ def confirm_new_order(user_id):
         ),
         (
             "需要幫你生成一張訂購單，讓你直接傳給出版社業務員下單嗎？\n"
-            "回覆「要」或「好」即可。"
+            "回覆「要」或「好」即可，40 秒內沒有回覆就會自動取消這個提問。"
         )
     ]
 
@@ -2628,7 +2631,7 @@ def make_historical_order_with_offer(user_id, order):
         history_reply,
         (
             "需要幫你生成一張訂購單，讓你直接傳給出版社業務員下單嗎？\n"
-            "回覆「要」或「好」即可。"
+            "回覆「要」或「好」即可，40 秒內沒有回覆就會自動取消這個提問。"
         )
     ]
 
@@ -4194,12 +4197,13 @@ def add_lebron_flavor(message):
     if body.startswith("👑 LeBron James"):
         return body
 
+    # 訂購單是要直接轉傳給出版社業務員的正式文字，絕對不要加 LeBron 人設開頭。
+    if body.startswith("請協助幫忙下訂單"):
+        return body
+
     compact = re.sub(r"\s+", "", body)
 
-    if "請協助幫忙下訂單" in compact:
-        intro = "👑 LeBron James 幫你把訂購單打好了"
-
-    elif any(key in compact for key in [
+    if any(key in compact for key in [
         "查不到", "找不到", "處理失敗", "查詢失敗", "寫入失敗",
         "更新失敗", "沒有讀到", "系統剛剛處理失敗"
     ]):
