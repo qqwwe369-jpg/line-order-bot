@@ -11,21 +11,32 @@
                           重送事件防護、過期資料清理
   5. Flask 路由        — / 、 /healthz 、 /callback（LINE webhook 入口）
   6. 主流程 _route_message — 所有文字訊息最終都會流經這個函式來分流
-  7. 引導式功能        — 查老師／查版本／查訂單／其他訂單四個模式
-  8. 訂書主流程        — 老師／書名／班級解析、模糊比對、訂單確認與修改
+  7. 引導式功能        — 查老師／查版本／查訂單／其他訂單／查人數／訂書
+                          六個模式統一使用 guided_mode 框架
+  8. 訂書主流程        — 老師／出版社／書名解析、模糊比對、訂單確認與修改
   9. 老師資料庫查詢
   10. 教科書版本查詢
   11. 歷史訂單查詢／修改／取消
   12. 其他訂單（非教科書品項）
-  13. Google Apps Script 溝通層（google_post）
-  14. 小工具函式（字串正規化、班級計算…）
-  15. LeBron 人設文案層
-  16. LINE 回覆
+  13. 學校人數查詢
+  14. Google Apps Script 溝通層（google_post）
+  15. 小工具函式（字串正規化、班級計算…）
+  16. LeBron 人設文案層
+  17. LINE 回覆
 
 新手上路指南：這是單一 Flask app，靠 Google Apps Script 當資料庫
 （老師/班級/書籍/訂單都存在 Google 試算表），LINE 傳來的每一則文字
 訊息都會先經過 _route_message() 依照使用者目前所在的「模式」分流，
 最後統一由 add_lebron_flavor() 包裝語氣後回覆。
+
+【六個引導模式統一框架】
+guided_mode 目前有六種值："teacher_lookup"、"version_lookup"、
+"history_lookup"、"other_order"、"stats_lookup"、"order_flow"。
+所有模式共用：
+  - EXIT_WORDS：統一退出詞（取消／回主選單／主選單／離開）
+  - _guided_mode_escape_reply()：模式內偵測到其他功能的明確格式時自動跳出並轉交處理
+  - 除了「其他訂單」（一次性登記）之外，完成一次動作後預設繼續留在模式內，
+    可以連續查詢，不用每次重打進入指令
 =============================================================
 """
 
@@ -61,7 +72,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-06-guided-history-mode-fix-v27"
+APP_VERSION = "2026-09-09-unified-guided-mode-v28"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -70,9 +81,6 @@ MAX_USER_TEXT_LENGTH = 1000
 # =========================================================
 # 簡易防濫用：同一個使用者短時間內訊息數上限
 # =========================================================
-# 純記憶體、每個 worker 各自累計，不追求絕對精準，只是防止
-# 有人（或壞掉的用戶端）短時間內狂送訊息把 Google Apps Script
-# 的每日呼叫額度用光，或把 Google Sheet 灌爆。
 RATE_LIMIT_MAX_MESSAGES = int(os.environ.get("RATE_LIMIT_MAX_MESSAGES", "20"))
 RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("RATE_LIMIT_WINDOW_SECONDS", "10"))
 _rate_limit_hits = {}
@@ -80,8 +88,6 @@ _rate_limit_guard = threading.Lock()
 
 
 def _is_rate_limited(user_id):
-    """簡單的滑動視窗限流。超過門檻回傳 True，外層會直接回一句提醒，
-    不會再往下打任何 Google 查詢，藉此保護後端資源。"""
     now = time.time()
     with _rate_limit_guard:
         hits = _rate_limit_hits.setdefault(user_id, [])
@@ -96,18 +102,12 @@ def _is_rate_limited(user_id):
 # 速度優化：共用 HTTP Session + 讀取快取
 # =========================================================
 HTTP = requests.Session()
-
-# 加大連線池：_parallel_google_calls 常常同時對 Google Apps Script
-# 開好幾條平行請求，預設的連線池（10）在同時多個使用者、每個使用者
-# 又同時打好幾支平行查詢時可能不夠用，導致部分請求要排隊等連線可用，
-# 反而多花時間。調大一點讓同網域的平行請求可以真的同時發送出去。
 _HTTP_ADAPTER = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
 HTTP.mount("https://", _HTTP_ADAPTER)
 HTTP.mount("http://", _HTTP_ADAPTER)
 
 _google_read_cache = {}
 
-# 這些都是相對穩定的資料庫讀取，可安全短時間快取。
 _GOOGLE_CACHE_TTLS = {
     "list_schools": 600,
     "lookup_teacher_matches": 1800,
@@ -129,14 +129,6 @@ def clear_google_read_cache():
 
 
 def _parallel_google_calls(calls):
-    """
-    calls: dict，key 是自訂名稱，value 是 (function, args_tuple, kwargs_dict)。
-    同時發送多個「彼此完全獨立、不互相依賴結果」的 Google 查詢，
-    取代原本一個接一個等待的寫法，藉此把總等待時間從「相加」
-    縮短成「取最長的那一個」。
-    只能用在真正獨立的查詢上；有先後依賴關係的查詢仍必須維持
-    原本的序列寫法，否則會用到還沒查到的資料。
-    """
     results = {}
     if not calls:
         return results
@@ -170,10 +162,6 @@ CHANNEL_SECRET = (
 )
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 
-# 啟動時就把關鍵環境變數缺漏的狀況印清楚，比等到第一個使用者
-# 傳訊息才在深處某個函式裡默默失敗好排查很多。
-# 刻意不在這裡讓程式直接關閉／crash：Render 這類平台常常是
-# 「先部署、環境變數晚一點補上」，硬中斷開機反而更難排查。
 for _env_name, _env_value in [
     ("LINE_CHANNEL_ACCESS_TOKEN / CHANNEL_ACCESS_TOKEN", CHANNEL_ACCESS_TOKEN),
     ("LINE_CHANNEL_SECRET / CHANNEL_SECRET", CHANNEL_SECRET),
@@ -186,18 +174,31 @@ FIXED_FALLBACK_MESSAGE = "👑 LeBron James 正在想辦法處理中，請稍後
 
 DEFAULT_SCHOOL = os.environ.get("DEFAULT_SCHOOL", "天母國中")
 
-# 主流程裡「確認／是／對」這類同義詞，統一從這裡取用，
-# 避免同一份清單散落在程式碼裡三個地方、改一次容易漏改。
 CONFIRM_WORDS = {"確認", "是", "對", "對的", "沒錯", "正確", "可以", "好", "就是"}
 
-# 訂單確認寫入成功後，詢問是否要生成訂購單文字。
-# 提問有效時間 40 秒；沒有背景排程器，因此逾時會在使用者下一次傳訊息時清除。
 RECEIPT_OFFER_TTL_SECONDS = 40
 RECEIPT_DECLINE_WORDS = {"不用", "不需要", "不用了", "不要", "算了"}
+
+# 六個引導模式統一使用的退出詞：不管在哪一個模式裡，打這些詞都能直接
+# 回到主選單。訂書流程（order_flow）現在也正式收編進 guided_mode，
+# 所以也共用這份清單，不再有「訂書只能打取消，其他模式可以打離開」
+# 這種不一致的情況。
+EXIT_WORDS = {"取消", "回主選單", "主選單", "離開"}
+
+# 打招呼／功能表舉例時，隨機挑一位球員名字帶入範例句，
+# 不指定 Curry；每次「你好」看到的舉例老師名字都會不一樣。
+NBA_PLAYERS = [
+    "詹姆斯", "杜蘭特", "字母哥", "東契奇", "塔圖姆",
+    "恩比德", "厄文", "哈登", "韋斯布魯克", "米契爾"
+]
 
 
 def _is_confirm_word(text):
     return str(text or "").strip() in CONFIRM_WORDS
+
+
+def _is_exit_word(text):
+    return str(text or "").strip() in EXIT_WORDS
 
 
 # =========================================================
@@ -216,23 +217,13 @@ pending_other_orders = {}
 pending_other_updates = {}
 other_order_context = {}
 
-# 老師/書名/學校 同音字或錯字候選確認。
 pending_name_confirmations = {}
-
-# 老師查詢失敗後，允許使用者下一句直接重打正確姓名。
 pending_teacher_corrections = {}
 
-# 引導式功能模式
 guided_mode = {}
 
-# 訂單確認寫入成功後，等待使用者回覆是否要生成訂購單文字。
 pending_receipt_offers = {}
 
-# 上面這些 dict 全部都是「同一個使用者的對話狀態」。
-# Gunicorn/Render 可能由不同 worker 接收前後兩則 LINE 訊息，
-# 只用 Python 全域 dict 時，某個 worker 剛寫入的狀態，
-# 另一個 worker 完全看不到，會讓對話流程被誤判成新的一句。
-# 所以全部一起納入下面的跨 worker 持久化機制。
 _SESSION_DICTS = {
     "pending_orders": pending_orders,
     "order_flow_context": order_flow_context,
@@ -254,22 +245,12 @@ _SESSION_DICTS = {
 # 跨 worker 對話狀態持久化：SQLite
 # =========================================================
 _STATE_DB_PATH = os.environ.get("ORDER_STATE_DB_PATH", "/tmp/line_order_bot_state.sqlite3")
-
-# 對話狀態超過這麼久沒有更新，視為廢棄的舊 session，
-# 清理時可以直接連同 SQLite 記錄一起丟掉，避免資料庫無限成長。
 _SESSION_STALE_SECONDS = 3 * 24 * 3600
-
-# 已處理過的 LINE message id，用來擋掉 LINE 平台重送 webhook 造成的重複處理
-# （例如處理時間過長、worker 剛好重啟等情況，LINE 會重新送同一個事件）。
-# 沒有這層保護的話，同一筆訂單有可能被重複寫入 Google 試算表兩次。
 _PROCESSED_MESSAGE_TTL_SECONDS = 24 * 3600
 
 
 def _state_db():
-    """回傳一個新的 SQLite 連線。呼叫端務必自己 close()，避免連線洩漏。"""
     conn = sqlite3.connect(_STATE_DB_PATH, timeout=5)
-    # WAL 模式讓「讀」跟「寫」可以並行，多個 gunicorn worker 同時讀寫
-    # 同一個 SQLite 檔案時比預設的 rollback journal 模式更不容易卡住。
     try:
         conn.execute("PRAGMA journal_mode=WAL")
     except Exception:
@@ -286,10 +267,6 @@ def _state_db():
 
 
 def _is_duplicate_line_event(message_id):
-    """
-    檢查這個 LINE message id 是否已經處理過；沒處理過就順便標記成已處理。
-    回傳 True 代表這是重送事件，外層應該直接跳過、不要再次執行訂單邏輯。
-    """
     if not message_id:
         return False
 
@@ -315,11 +292,6 @@ def _is_duplicate_line_event(message_id):
 
 
 def _cleanup_stale_state(probability=0.02):
-    """
-    機會性清理：每次呼叫只有 `probability` 的機率真的去清資料庫，
-    避免每一則訊息都額外做一次全表清理拖慢回覆速度。
-    清掉太久沒更新的對話 session，以及太舊的重送防護記錄。
-    """
     if random.random() > probability:
         return
 
@@ -342,11 +314,6 @@ def _cleanup_stale_state(probability=0.02):
 
 
 def _verify_line_signature(body_bytes, signature_header):
-    """
-    驗證 LINE 平台送來的請求簽章，避免任何人只要知道 /callback 網址
-    就能偽造假的 LINE 事件、觸發訂單寫入或查詢邏輯。
-    沒有設定 CHANNEL_SECRET 時（例如本機測試）直接放行，並印出警告。
-    """
     if not CHANNEL_SECRET:
         logger.warning("CHANNEL_SECRET 未設定，跳過簽章驗證（僅建議用於本機測試）")
         return True
@@ -362,7 +329,6 @@ def _verify_line_signature(body_bytes, signature_header):
 
 
 def _hydrate_session(user_id):
-    """每一則訊息處理前，把這個使用者所有對話狀態從 SQLite 讀回全域 dict。"""
     conn = _state_db()
     try:
         row = conn.execute(
@@ -392,8 +358,6 @@ def _hydrate_session(user_id):
 
 
 def _persist_session(user_id):
-    """每一則訊息處理完後，把這個使用者目前所有對話狀態整包寫回 SQLite。
-    若這個使用者目前所有 dict 都沒有資料，直接把該筆記錄刪除。"""
     payload = {}
     for key, target_dict in _SESSION_DICTS.items():
         if user_id in target_dict:
@@ -423,7 +387,6 @@ def _persist_session(user_id):
 
 
 def _clear_session(user_id):
-    """立即清空這個使用者的所有對話狀態（全域 dict ＋ SQLite）。"""
     for target_dict in _SESSION_DICTS.values():
         target_dict.pop(user_id, None)
 
@@ -453,7 +416,6 @@ def _get_user_lock(user_id):
         return lock
 
 
-# 學校清單快取：學校名稱直接由 Google 資料庫取得。
 school_catalog_cache = {
     "schools": [],
     "expires_at": 0
@@ -469,11 +431,6 @@ def home():
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    """
-    給 uptime 監控／部署平台健康檢查用。
-    只檢查關鍵環境變數是否存在，不會真的打一次 Google，
-    保持這支端點又快又不會佔用 Google Apps Script 的額度。
-    """
     problems = []
     if not CHANNEL_ACCESS_TOKEN:
         problems.append("LINE_CHANNEL_ACCESS_TOKEN missing")
@@ -504,7 +461,6 @@ def callback():
     logger.info(f"Webhook received {APP_VERSION}")
     logger.debug(body)
 
-    # 機會性清理過期 session／重送記錄，放在整批事件處理前跑一次即可。
     _cleanup_stale_state()
 
     for event in body.get("events", []):
@@ -550,8 +506,6 @@ def callback():
 # 主流程
 # =========================================================
 def handle_message(user_id, user_text):
-    # 限流檢查刻意放在拿鎖／讀 session 之前：本來就要擋掉的訊息，
-    # 不需要多付一次 SQLite 讀寫的成本。
     if _is_rate_limited(user_id):
         logger.warning(f"rate limited user={user_id}")
         return (
@@ -596,10 +550,6 @@ def _route_message(user_id, user_text):
 
     if text in {"清除快取", "清快取", "重新整理資料", "重新整理快取"}:
         clear_google_read_cache()
-        # 同時通知 Apps Script 那邊也清掉「老師班級資料／學校版本資料／
-        # 書籍資料」的參照表快取（見 Code.gs 的 clear_cache action）。
-        # 這樣手動改完 Google 試算表的資料後，講一句「清除快取」
-        # 就能讓兩層快取一起立即失效，不用各自等 TTL 到期。
         google_post({"action": "clear_cache"}, timeout=5, retries=1)
         get_school_catalog(force_refresh=True)
         return "✅ 已清除查詢快取，下一次查詢會直接讀取 Google 最新資料。"
@@ -608,7 +558,6 @@ def _route_message(user_id, user_text):
         return get_today_order_stats_reply()
 
     # 0.15 訂購單生成提問：新訂單確認或歷史訂單查詢後才會出現。
-    # 有效時間 40 秒；超過 40 秒後自動視為取消，不再讓「好／要」誤生成舊訂購單。
     if user_id in pending_receipt_offers:
         offer = pending_receipt_offers[user_id]
         elapsed = time.time() - float(offer.get("created_at", 0) or 0)
@@ -622,6 +571,7 @@ def _route_message(user_id, user_text):
                 or is_version_mode_start(text)
                 or is_history_mode_start(text)
                 or is_other_order_mode_start(text)
+                or is_stats_mode_start(text)
             )
 
             if starts_new_task:
@@ -641,7 +591,6 @@ def _route_message(user_id, user_text):
             elif text in RECEIPT_DECLINE_WORDS:
                 pending_receipt_offers.pop(user_id, None)
                 return "好的，沒有要生成訂購單。"
-            # 其他輸入先照正常流程處理；40 秒內提問仍保留。
 
     # 0.2 「確認」硬性優先：只要上一句有名稱候選，絕不能再把「確認」當姓名/書名搜尋。
     if _is_confirm_word(text):
@@ -653,21 +602,25 @@ def _route_message(user_id, user_text):
         if user_id in pending_orders:
             return confirm_new_order(user_id)
 
-    # 0.5 引導式功能入口：主選單五個指令都一定有下一步
+    # 0.5 引導式功能入口：主選單六個指令都一定有下一步
     if is_teacher_mode_start(text):
         clear_task_states_for_new_mode(user_id)
         guided_mode[user_id] = "teacher_lookup"
         return (
             "👨‍🏫 老師查詢\n\n"
-            "請直接輸入老師姓名。\n"
+            "請直接輸入老師姓名，或輸入「學校＋年級＋科目」查詢該科老師。\n"
+            f"例如：{random.choice(NBA_PLAYERS)}、華興七年級歷史老師\n\n"
             "如果有同音字或打錯一個字，我會先幫你找最接近的老師。"
         )
 
     if is_order_mode_start(text):
-        guided_mode.pop(user_id, None)
-        pending_teacher_corrections.pop(user_id, None)
-        pending_name_confirmations.pop(user_id, None)
-        return handle_order_flow(user_id, text)
+        clear_task_states_for_new_mode(user_id)
+        guided_mode[user_id] = "order_flow"
+        order_flow_context[user_id] = {
+            "teacher": "", "school": "", "classes": [],
+            "publisher": "", "book": ""
+        }
+        return make_order_guide_reply(order_flow_context[user_id])
 
     if is_version_mode_start(text):
         clear_task_states_for_new_mode(user_id)
@@ -694,8 +647,34 @@ def _route_message(user_id, user_text):
             "我會先整理成確認畫面，等你回覆「確認」後才寫入 Google。"
         )
 
-    if guided_mode.get(user_id) == "teacher_lookup":
-        if text in ["取消", "回主選單", "主選單", "離開"]:
+    if is_stats_mode_start(text):
+        clear_task_states_for_new_mode(user_id)
+        guided_mode[user_id] = "stats_lookup"
+        return get_stats_lookup_guide_reply()
+
+    # ---------------------------------------------------
+    # 引導模式分流：六個模式共用退出詞跟跳脫偵測
+    # ---------------------------------------------------
+    current_mode = guided_mode.get(user_id)
+
+    if current_mode == "order_flow":
+        if _is_exit_word(text):
+            clear_task_states_for_new_mode(user_id)
+            guided_mode.pop(user_id, None)
+            return get_main_menu_reply()
+        if user_id in pending_name_confirmations:
+            fuzzy_reply = handle_name_confirmation(user_id, text)
+            if fuzzy_reply is not None:
+                return fuzzy_reply
+        escape_reply = _guided_mode_escape_reply(user_id, text)
+        if escape_reply is not None:
+            return escape_reply
+        order_reply = handle_order_flow(user_id, text)
+        if order_reply is not None:
+            return order_reply
+
+    if current_mode == "teacher_lookup":
+        if _is_exit_word(text):
             guided_mode.pop(user_id, None)
             pending_teacher_corrections.pop(user_id, None)
             pending_name_confirmations.pop(user_id, None)
@@ -709,8 +688,8 @@ def _route_message(user_id, user_text):
             return escape_reply
         return handle_guided_teacher_lookup(user_id, text)
 
-    if guided_mode.get(user_id) == "version_lookup":
-        if text in ["取消", "回主選單", "主選單", "離開"]:
+    if current_mode == "version_lookup":
+        if _is_exit_word(text):
             guided_mode.pop(user_id, None)
             return get_main_menu_reply()
         escape_reply = _guided_mode_escape_reply(user_id, text)
@@ -718,19 +697,20 @@ def _route_message(user_id, user_text):
             return escape_reply
         return handle_guided_version_lookup(user_id, text)
 
-    if guided_mode.get(user_id) == "history_lookup":
-        if text in ["取消", "回主選單", "主選單", "離開"]:
+    if current_mode == "stats_lookup":
+        if _is_exit_word(text):
+            guided_mode.pop(user_id, None)
+            return get_main_menu_reply()
+        escape_reply = _guided_mode_escape_reply(user_id, text)
+        if escape_reply is not None:
+            return escape_reply
+        return handle_guided_stats_lookup(user_id, text)
+
+    if current_mode == "history_lookup":
+        if _is_exit_word(text):
             guided_mode.pop(user_id, None)
             return get_main_menu_reply()
 
-        # 查訂單模式現在會在查到多張訂單時繼續留在模式裡（方便連續
-        # 查好幾個日期），但如果剛好只查到一張、使用者想順手接著
-        # 調整（例如「國二乙改30」），這裡要能直接接手。這個檢查
-        # 刻意只放在 history_lookup 這個分支，不能放進共用的
-        # _guided_mode_escape_reply()：那個函式其他引導模式
-        # （查老師／查版本）也會呼叫到，如果 historical_order_context
-        # 裡剛好留著之前查過的舊訂單，會誤把跟這次引導模式完全無關
-        # 的輸入內容當成是在改那張舊訂單。
         if user_id in historical_order_context and user_id not in pending_orders:
             order = historical_order_context[user_id]
             class_names = _pending_order_known_class_names(order, {})
@@ -743,7 +723,7 @@ def _route_message(user_id, user_text):
             return escape_reply
         return handle_guided_history_lookup(user_id, text)
 
-    if guided_mode.get(user_id) == "other_order":
+    if current_mode == "other_order":
         if text in ["回主選單", "主選單", "離開"]:
             pending_other_orders.pop(user_id, None)
             guided_mode.pop(user_id, None)
@@ -779,7 +759,7 @@ def _route_message(user_id, user_text):
         if order_reply is not None:
             return order_reply
 
-    # 1. 名稱容錯確認（老師／書名／學校）
+    # 1. 名稱容錯確認（老師／書名／學校／出版社）
     fuzzy_reply = handle_name_confirmation(user_id, text)
     if fuzzy_reply is not None:
         return fuzzy_reply
@@ -958,6 +938,11 @@ def _route_message(user_id, user_text):
     if subject_teacher_query:
         return handle_subject_teacher_query(subject_teacher_query)
 
+    # 14.7 學校／年級人數查詢（新功能）
+    stats_query = parse_school_stats_query(user_id, text)
+    if stats_query:
+        return handle_school_stats_query(stats_query)
+
     # 15. 老師資料庫：優先於學校統計
     if looks_like_teacher_lookup(text):
         return handle_teacher_lookup(user_id, text)
@@ -969,11 +954,6 @@ def _route_message(user_id, user_text):
     version_query = parse_school_version_query(user_id, text)
     if version_query:
         return handle_school_version_query(version_query)
-
-    # 17. 學校／年級／班級學生人數
-    stats_query = parse_school_stats_query(user_id, text)
-    if stats_query:
-        return handle_school_stats_query(stats_query)
 
     # 18. 其他訂單
     other_query = parse_other_order_query(text)
@@ -1036,7 +1016,7 @@ def _route_message(user_id, user_text):
 def _guided_mode_escape_reply(user_id, text):
     """
     在引導模式（guided_mode）中，如果使用者輸入的內容明顯符合
-    『查老師 / 查各科老師 / 查版本 / 查訂單編號』這類其他功能
+    『查老師 / 查各科老師 / 查版本 / 查人數 / 查訂單編號』這類其他功能
     既有的格式，直接跳出目前的引導模式並依該功能處理，
     而不是死板地卡在原模式一直要求正確格式。
 
@@ -1047,6 +1027,11 @@ def _guided_mode_escape_reply(user_id, text):
     if subject_query:
         guided_mode.pop(user_id, None)
         return handle_subject_teacher_query(subject_query)
+
+    stats_query = parse_school_stats_query(user_id, text)
+    if stats_query:
+        guided_mode.pop(user_id, None)
+        return handle_school_stats_query(stats_query)
 
     if looks_like_teacher_lookup(text):
         guided_mode.pop(user_id, None)
@@ -1081,6 +1066,7 @@ def get_main_menu_reply():
         "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
         "📖 要查版本 → 輸入「查版本」\n"
         "📅 要查訂單 → 輸入「查訂單」\n"
+        "📊 要查人數 → 例如「天母七年級人數」\n"
         "📦 其他訂單 → 輸入「其他訂單」\n"
         "📊 今日訂單統計 → 輸入「統計」\n\n"
         "完成一個查詢後，下一句會重新當成新的對話。"
@@ -1122,6 +1108,14 @@ def is_other_order_mode_start(text):
     }
 
 
+def is_stats_mode_start(text):
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+    return compact in {
+        "查人數", "我要查人數", "人數查詢", "查學生人數",
+        "查詢人數", "我要查學生人數"
+    }
+
+
 def get_history_lookup_guide_reply():
     return (
         "📅 訂單查詢\n\n"
@@ -1132,6 +1126,15 @@ def get_history_lookup_guide_reply():
         "• 訂單編號 → 例如「001」\n"
         "• 老師 → 例如「王老師」\n\n"
         "查不到時我會繼續留在「查訂單」模式。"
+    )
+
+
+def get_stats_lookup_guide_reply():
+    return (
+        "📊 學生人數查詢\n\n"
+        "請輸入「學校＋年級」。\n"
+        "例如：天母七年級、華興高一\n\n"
+        "查完一次後我會繼續留在「查人數」模式，可以連續查下一個年級。"
     )
 
 
@@ -1187,7 +1190,25 @@ def handle_guided_version_lookup(user_id, text):
             + (f"\n科目：{subject}" if subject else "")
             + "\n\n我還在「查版本」模式，可以直接換一個學校、年級或科目。"
         )
-    return _finish_guided_mode(user_id, handle_school_version_query(query))
+
+    reply = handle_school_version_query(query)
+    return reply + "\n\n我還在「查版本」模式，可以繼續輸入下一個學校／年級，或打「主選單」離開。"
+
+
+def handle_guided_stats_lookup(user_id, text):
+    query = parse_school_stats_query(user_id, str(text or "").strip(), require_keyword=False)
+    if not query:
+        return (
+            "📊 學生人數查詢\n\n"
+            "我還在「查人數」模式。\n"
+            "請輸入「學校＋年級」，例如：天母七年級、華興高一。"
+        )
+
+    reply = handle_school_stats_query(query)
+    if reply.startswith("⚠️"):
+        return reply + "\n\n我還在「查人數」模式，可以直接換一個學校或年級再試一次。"
+
+    return reply + "\n\n我還在「查人數」模式，可以繼續輸入下一個學校／年級，或打「主選單」離開。"
 
 
 def parse_guided_date(text):
@@ -1240,18 +1261,8 @@ def handle_guided_history_lookup(user_id, text):
         reply = make_daily_orders_reply(date_text, orders)
 
         if len(orders) == 1:
-            # 記下這張訂單，方便使用者直接接著說「國二乙改30」這類
-            # 調整——這種情況由 _guided_mode_escape_reply() 接手辨識，
-            # 不在這裡就跳出模式。
             historical_order_context[user_id] = orders[0]
 
-        # 不管查到一張還是多張，都繼續留在「查訂單」模式：如果在這裡
-        # 跳出模式，使用者接著打的下一個日期（例如「0901」這種純數字
-        # 簡寫）在模式外是查不到意思的——只有 parse_guided_date() 認得
-        # 這種簡寫，一般路由完全不認得，會直接落到最後的看不懂訊息。
-        # 之前就是因為查到「0830」有資料而跳出模式，才讓後面連續
-        # 好幾個日期都查不到反應。真的要接著改某張訂單時，
-        # _guided_mode_escape_reply() 會辨識出來並代為跳出模式。
         return reply + "\n\n我還在「查訂單」模式，可以繼續輸入其他日期、訂單編號或老師。"
 
     m = re.fullmatch(r"(?:查)?(?:訂單)?(\d{1,6})", clean)
@@ -1295,7 +1306,6 @@ def handle_guided_history_lookup(user_id, text):
         if len(orders) == 1:
             historical_order_context[user_id] = orders[0]
 
-        # 同上：不管一張還是多張，都繼續留在「查訂單」模式。
         return reply + "\n\n我還在「查訂單」模式，可以繼續輸入其他日期、訂單編號或老師。"
 
     return get_history_lookup_guide_reply()
@@ -1332,9 +1342,12 @@ def normalize_teacher_name_input(text):
 
 def finish_teacher_lookup(user_id,item):
     reply=make_teacher_reply(item["school"],item["teacher"],item["classes"])
-    guided_mode.pop(user_id,None); pending_teacher_corrections.pop(user_id,None)
+    pending_teacher_corrections.pop(user_id,None)
     pending_name_confirmations.pop(user_id,None); teacher_lookup_context.pop(user_id,None)
     conversation_context.pop(user_id,None)
+    if guided_mode.get(user_id) == "teacher_lookup":
+        return reply + "\n\n我還在「查老師」模式，可以繼續輸入下一位老師姓名，或打「主選單」離開。"
+    guided_mode.pop(user_id,None)
     return reply
 
 def parse_subject_teacher_query(text):
@@ -1373,10 +1386,6 @@ def parse_subject_teacher_query(text):
 
 
 def _class_matches_grade(class_name, grade):
-    # 原本這裡是 r"[\\s班]+"（雙反斜線），在字元類別裡代表「一個
-    # 反斜線字元」加上「字母 s」，並不是空白字元的跳脫寫法，等於
-    # 從來沒有真的去除過空白，只是剛好去掉了「班」字。修正成正確的
-    # \s 跳脫，遇到班級名稱前後帶空白時也能正確比對。
     name = re.sub(r"[\s班]+", "", str(class_name or ""))
     grade = str(grade or "").strip()
 
@@ -1441,7 +1450,6 @@ def handle_subject_teacher_query(query):
 
     lines = [f"👨‍🏫 {query['school']}｜{query['grade']} {query['subject']}老師", ""]
 
-    # 只有一位老師時，直接顯示姓名，再列該年級實際授課班級與人數。
     if len(filtered) == 1:
         item = filtered[0]
         lines.append(f"老師：{item['teacher']}")
@@ -1472,7 +1480,8 @@ def handle_subject_teacher_query(query):
 def handle_guided_teacher_lookup(user_id,text):
     subject_query = parse_subject_teacher_query(text)
     if subject_query:
-        return _finish_guided_mode(user_id, handle_subject_teacher_query(subject_query))
+        reply = handle_subject_teacher_query(subject_query)
+        return reply + "\n\n我還在「查老師」模式，可以繼續查下一位老師，或打「主選單」離開。"
     name=normalize_teacher_name_input(text)
     if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}",name):
         return "👨‍🏫 老師查詢\n\n我還在查老師模式。\n請直接輸入 2～4 個中文字的老師姓名。"
@@ -1511,16 +1520,17 @@ def is_greeting_request(text):
 
 
 def get_greeting_reply():
+    player = random.choice(NBA_PLAYERS)
     return (
-        "你好！我是大漢訂書小幫手\n\n"
-        "很高興為你服務！\n\n"
-        "你可以直接輸入：\n"
-        "📚 我要訂書\n"
-        "👨‍🏫 查個別老師／查各科老師\n"
-        "📖 查版本\n"
-        "📅 查訂單\n"
-        "📦 其他訂單\n\n"
-        "也可以輸入「有什麼功能」查看使用方式。"
+        "嗨嗨～我是大漢訂書小幫手 📚\n"
+        "今天想幹嘛，直接跟我說就行，我馬上上場！\n\n"
+        f"👨‍🏫 想查個別老師 → 例如「{player}有幾個班」\n"
+        "👨‍🏫 想查各科老師 → 例如「華興七年級歷史老師」\n"
+        "📊 想查人數 → 例如「天母七年級人數」\n"
+        "📚 想訂書 → 打「我要訂書」\n"
+        "📖 想查版本 → 打「查版本」\n"
+        "📅 想查訂單 → 打「查訂單」\n\n"
+        "想看完整功能表，打「有什麼功能」就好～"
     )
 
 
@@ -1538,14 +1548,16 @@ def is_help_request(text):
 
 
 def get_help_reply():
+    player = random.choice(NBA_PLAYERS)
     return (
         "📚 大漢訂書小幫手\n\n"
         "請告訴我你要使用哪一個功能：\n\n"
         "📚 要訂書 → 輸入「我要訂書」\n"
-        "👨‍🏫 查個別老師 → 例如「謝明清有幾個班」\n"
+        f"👨‍🏫 查個別老師 → 例如「{player}有幾個班」\n"
         "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
         "📖 要查版本 → 輸入「查版本」\n"
         "📅 要查訂單 → 輸入「查訂單」\n"
+        "📊 要查人數 → 例如「天母七年級人數」\n"
         "📦 其他訂單 → 輸入「其他訂單」\n"
         "📊 今日訂單統計 → 輸入「統計」\n\n"
         "進入功能後，我會一步一步引導你完成。"
@@ -1589,8 +1601,6 @@ def validate_order_teacher_input(user_id, raw_text, draft):
         return make_order_guide_reply(draft)
 
     if value and score >= 0.52:
-        # 把接近的候選整理成「1. 2. 3.」編號清單，讓使用者可以直接回
-        # 數字挑選，不用每次都重打一次完整姓名。
         options = []
         seen = set()
         for c in candidates[:4]:
@@ -1636,17 +1646,84 @@ def validate_order_teacher_input(user_id, raw_text, draft):
             "我不會往下一步。請重新輸入老師姓名。")
 
 
+def validate_order_publisher_input(user_id, raw_text, draft):
+    """
+    訂書流程第二步：出版社。出版社清單很多、常常變動，不能寫死清單，
+    所以跟老師／書名一樣走 lookup_fuzzy_candidates（kind="publisher"）
+    模糊比對。Apps Script 那邊需要新增支援 kind="publisher" 的分支，
+    從書籍分頁的「出版社」欄位取不重複清單來比對。
+    """
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
+    clean = normalize_order_typo(clean)
+    if not clean:
+        return "請輸入出版社名稱，例如：康軒、翰林、南一"
+
+    candidates = lookup_fuzzy_candidates("publisher", clean)
+    if not candidates:
+        return ("⚠️ 出版社資料庫目前找不到符合資料。\n\n"
+                f"你輸入：{clean}\n\n"
+                "書名／老師資料已保留，請重新輸入出版社名稱。")
+
+    first = candidates[0]
+    value = str(first.get("value", "") or "").strip()
+    score = float(first.get("score", 0) or 0)
+
+    if value == clean:
+        draft["publisher"] = value
+        pending_name_confirmations.pop(user_id, None)
+        order_flow_context[user_id] = draft
+        return make_order_guide_reply(draft)
+
+    if value and score >= 0.52:
+        options = []
+        seen = set()
+        for c in candidates[:4]:
+            c_value = str(c.get("value", "") or "").strip()
+            c_score = float(c.get("score", 0) or 0)
+            if not c_value or c_value in seen:
+                continue
+            if c_value != value and c_score < 0.52:
+                continue
+            seen.add(c_value)
+            options.append({"value": c_value})
+            if len(options) >= 3:
+                break
+
+        pending_name_confirmations[user_id] = {
+            "field": "publisher", "purpose": "order_publisher",
+            "options": options,
+            "original": clean
+        }
+        order_flow_context[user_id] = draft
+
+        lines = ["🔎 出版社名稱可能有錯字，找到以下接近的候選。", "", f"你輸入：{clean}", ""]
+        for i, opt in enumerate(options, start=1):
+            lines.append(f"{i}. {opt['value']}")
+        lines.append("")
+        if len(options) > 1:
+            lines.append("請直接回覆數字（例如「1」）選擇要的那一家；回覆「確認」等同選第 1 個。")
+        else:
+            lines.append("是的請回覆「確認」。")
+        lines.append("如果都不是，請直接輸入正確出版社名稱，我會取消這個候選並重新查資料庫。")
+        return "\n".join(lines)
+
+    return ("⚠️ 出版社資料庫目前無法確認這個名稱。\n\n"
+            f"你輸入：{clean}\n\n"
+            "請重新輸入出版社名稱。")
+
+
 def validate_order_book_input(user_id, raw_text, draft):
     query = clean_book_name(str(raw_text or "").strip())
     query = re.sub(r"^(?:我要訂|要訂|訂)", "", query).strip()
     if not query:
         return "請輸入書名或書名關鍵字。"
 
-    candidates = lookup_book_candidates_enhanced(query)
+    publisher = str(draft.get("publisher") or "").strip()
+    candidates = lookup_book_candidates_enhanced(query, publisher=publisher)
     if not candidates:
         return ("⚠️ 書籍資料庫找不到符合的書名。\n\n"
                 f"你輸入：{query}\n\n"
-                "老師資料已保留，我不會往下一步。請重新輸入書名或更明確的關鍵字。")
+                "老師／出版社資料已保留，我不會往下一步。請重新輸入書名或更明確的關鍵字。")
 
     first = candidates[0]
     value = str(first.get("value", "") or "").strip()
@@ -1696,7 +1773,7 @@ def validate_order_book_input(user_id, raw_text, draft):
 
     return ("⚠️ 我目前無法確認書名。\n\n"
             f"你輸入：{query}\n\n"
-            "老師資料已保留，我不會往下一步。請再輸入一次完整書名或更明確的關鍵字。")
+            "老師／出版社資料已保留，我不會往下一步。請再輸入一次完整書名或更明確的關鍵字。")
 
 def handle_order_flow(user_id, text):
     clean = normalize_order_typo(text)
@@ -1707,10 +1784,12 @@ def handle_order_flow(user_id, text):
     ]
 
     if clean in start_phrases:
+        guided_mode[user_id] = "order_flow"
         order_flow_context[user_id] = {
             "teacher": "",
             "school": "",
             "classes": [],
+            "publisher": "",
             "book": ""
         }
         return make_order_guide_reply(order_flow_context[user_id])
@@ -1719,6 +1798,7 @@ def handle_order_flow(user_id, text):
         "teacher": "",
         "school": "",
         "classes": [],
+        "publisher": "",
         "book": ""
     })
 
@@ -1730,13 +1810,23 @@ def handle_order_flow(user_id, text):
         if not draft.get("teacher"):
             return ("⚠️ 我沒有讀到上一個老師候選。\n\n"
                     "請重新輸入老師姓名，我會重新找一次；找到後再回覆「確認」。")
-        if draft.get("teacher") and not draft.get("book"):
+        if draft.get("teacher") and not draft.get("publisher"):
+            return "請告訴我是哪一家出版社？"
+        if draft.get("teacher") and draft.get("publisher") and not draft.get("book"):
             return "請告訴我要訂哪一本書？"
 
     if user_id in order_flow_context and not draft.get("teacher"):
         return validate_order_teacher_input(user_id, clean, draft)
 
-    if user_id in order_flow_context and draft.get("teacher") and not draft.get("book"):
+    if user_id in order_flow_context and draft.get("teacher") and not draft.get("publisher"):
+        return validate_order_publisher_input(user_id, clean, draft)
+
+    if (
+        user_id in order_flow_context
+        and draft.get("teacher")
+        and draft.get("publisher")
+        and not draft.get("book")
+    ):
         return validate_order_book_input(user_id, clean, draft)
 
     parsed = parse_order_message(clean)
@@ -1763,6 +1853,9 @@ def handle_order_flow(user_id, text):
 
     if parsed.get("classes"):
         draft["classes"] = unique_list(parsed["classes"])
+
+    if parsed.get("publisher"):
+        draft["publisher"] = parsed["publisher"]
 
     if parsed.get("book"):
         draft["book"] = parsed["book"]
@@ -1804,8 +1897,8 @@ def make_order_guide_reply(draft):
             lines.append(f"老師：{teacher_display}（{school_display}）")
         else:
             lines.append(f"老師：{teacher_display}")
-    if draft.get("classes"):
-        lines.append(f"班級：{'、'.join(draft['classes'])}")
+    if draft.get("publisher"):
+        lines.append(f"出版社：{draft['publisher']}")
     if draft.get("book"):
         lines.append(f"書名：{draft['book']}")
 
@@ -1814,10 +1907,10 @@ def make_order_guide_reply(draft):
 
     if not draft.get("teacher"):
         lines.append("請告訴我是哪一位老師？")
+    elif not draft.get("publisher"):
+        lines.append("請告訴我是哪一家出版社？")
     elif not draft.get("book"):
         lines.append("請告訴我要訂哪一本書？")
-    else:
-        lines.append("請告訴我要訂哪些班級？")
 
     return "\n".join(lines)
 
@@ -1854,6 +1947,7 @@ def parse_order_message(text):
         "teacher": teacher,
         "school": school,
         "classes": classes,
+        "publisher": "",
         "book": book
     }
 
@@ -1962,11 +2056,6 @@ def build_order_from_draft(user_id, draft):
     book = clean_book_name(draft["book"])
     publisher = str(draft.get("publisher", "") or "").strip()
 
-    # 老師的班級資料、書籍出版社，這兩項第一次嘗試時彼此完全獨立，
-    # 用平行處理同時發送，取代原本「查完老師才查書」的序列寫法，
-    # 省下其中一次 Google 呼叫的等待時間。
-    # 如果書名已經由候選確認過（draft 裡已經有 publisher），
-    # 就不需要再多打一次書籍資料庫。
     if publisher:
         exact_matches = lookup_teacher_matches(teacher, school=school)
     else:
@@ -2098,6 +2187,7 @@ def build_order_from_draft(user_id, draft):
 
     pending_orders[user_id] = order
     order_flow_context[user_id] = draft
+    guided_mode.pop(user_id, None)
 
     context = {
         "teacher": teacher,
@@ -2190,19 +2280,14 @@ def parse_contextual_class_book(text, context):
         "teacher": context.get("teacher", ""),
         "school": context.get("school", ""),
         "classes": classes,
+        "publisher": "",
         "book": book
     }
 
 
 def extract_teacher_and_school(text):
-    """抽出個別老師查詢中的老師與學校。
-
-    這裡同時支援「教...」與日常最常講的「有幾個班／有多少學生／查某某」等句型，
-    避免明明老師存在 Google 資料庫，卻因為句型沒有命中而掉到固定 fallback。
-    """
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(text or ""))
 
-    # 訂書句型仍保留原本解析方式。
     m = re.fullmatch(
         r"([\u4e00-\u9fff]{2,4}?)(?:老師)?(?:要|想要|想|準備|打算)?(?:訂書|下單)",
         clean
@@ -2210,7 +2295,6 @@ def extract_teacher_and_school(text):
     if m:
         return m.group(1) + "老師", ""
 
-    # 明確帶學校＋老師，例如「天母國中陳允芳老師有幾個班」。
     m = re.search(
         r"([\u4e00-\u9fff]{2,16}(?:國中|高中|國小|中學))"
         r"([\u4e00-\u9fff]{1,4})老師",
@@ -2219,7 +2303,6 @@ def extract_teacher_and_school(text):
     if m:
         return m.group(2) + "老師", m.group(1)
 
-    # 一般「某某老師...」。
     m = re.search(r"([\u4e00-\u9fff]{1,4})老師", clean)
     if m:
         name = m.group(1)
@@ -2227,7 +2310,6 @@ def extract_teacher_and_school(text):
             return "", ""
         return name + "老師", ""
 
-    # 「查陳允芳／找陳允芳／查一下陳允芳」。
     m = re.fullmatch(
         r"(?:查|找|查一下|找一下)([\u4e00-\u9fff]{2,4})(?:老師)?",
         clean
@@ -2235,8 +2317,6 @@ def extract_teacher_and_school(text):
     if m:
         return m.group(1) + "老師", ""
 
-    # 不寫「老師」也要能直接辨識個別老師查詢。
-    # 例如：陳允芳有幾個班、陳允芳有哪些班、陳允芳有多少學生、陳允芳教哪科。
     m = re.match(
         r"^([\u4e00-\u9fff]{2,4})"
         r"(?=(?:"
@@ -2289,14 +2369,6 @@ def make_order_confirmation(order):
 
 
 def make_purchase_order_text(offer):
-    """
-    產生可直接傳給出版社業務員下單的訂購單文字。
-    - 訂購人固定「士林大漢」
-    - 日期用「使用者按下確認生成」那一刻的日期
-    - 品名依原本訂單裡每個班級各列一行，不合併加總
-    - 備註固定「麻煩教用貨單集中」
-    - 外箱備註完全等於學校欄位
-    """
     date_str = datetime.now().strftime("%Y/%m/%d")
     school = str(offer.get("school", "") or "")
     publisher = str(offer.get("publisher", "") or "")
@@ -2343,9 +2415,6 @@ def confirm_new_order(user_id):
     pending_name_confirmations.pop(user_id, None)
     guided_mode.pop(user_id, None)
 
-    # 訂單成功寫入後，記錄一份精簡快照，等使用者決定要不要
-    # 順便生成一張可以直接傳給出版社業務員下單的訂購單。
-    # 提問有效 40 秒；逾時後會在下一次收到訊息時清除。
     pending_receipt_offers[user_id] = {
         "order_number": order_number,
         "school": order["school"],
@@ -2370,14 +2439,6 @@ def confirm_new_order(user_id):
 
 
 def _pending_order_known_class_names(order, context):
-    """
-    這筆訂單目前實際可能用到的班級名稱清單：目前訂單裡已有的班級，
-    加上這位老師名下全部班級（來自 conversation_context，訂書流程
-    一開始查老師時就存好了）。班級名稱不一定是純數字（例如 701），
-    也很常見是中文（國二乙、高一望…），所以這裡不能假設格式。
-    長度由長到短排序，避免「國二」這種短名稱在正規表示式比對時
-    搶先吃掉「國二乙」的一部分。
-    """
     names = set()
 
     for item in order.get("classes", []):
@@ -2394,13 +2455,6 @@ def _pending_order_known_class_names(order, context):
 
 
 def _pending_order_class_pattern(class_names):
-    """
-    把已知班級名稱組成一段正規表示式片段（例如 "國二乙|國二甲|701"），
-    取代原本寫死只認 3 位數字（\\d{3}）班級代碼的規則，同時支援
-    中文班級名稱與數字班級代碼兩種學校的命名習慣。
-    保留 [789]\\d{2} 當退路，避免萬一 context 剛好沒有班級資料時，
-    數字代碼班級完全比對不到。
-    """
     alternatives = [re.escape(name) for name in class_names]
     alternatives.append(r"[789]\d{2}")
     return "|".join(alternatives)
@@ -2419,8 +2473,6 @@ def handle_pending_order_edit(user_id, text):
             if name and name in remaining:
                 if name not in wanted:
                     wanted.append(name)
-                # 命中後從剩餘文字裡挖掉，避免短班級名稱後續又
-                # 誤判成另一個班級名稱的一部分。
                 remaining = remaining.replace(name, " ", 1)
         for digit_class in re.findall(r"(?<!\d)([789]\d{2})(?!\d)", remaining):
             if digit_class not in wanted:
@@ -2579,10 +2631,6 @@ def handle_pending_order_edit(user_id, text):
 # 老師資料庫
 # =========================================================
 def looks_like_teacher_lookup(text):
-    """判斷是否為「個別老師」資料查詢。
-
-    這條流程只走 Google 老師班級資料庫，不交給 AI。
-    """
     if "訂單" in text or "訂書進度" in text or is_ai_writing_request(text):
         return False
 
@@ -2599,7 +2647,6 @@ def looks_like_teacher_lookup(text):
         "教什麼科", "教哪一科", "教哪科", "教哪些科"
     ]
 
-    # 「查陳允芳／找陳允芳」本身就是個別老師查詢。
     if re.fullmatch(r"(?:查|找|查一下|找一下)[\u4e00-\u9fff]{2,4}(?:老師)?", clean):
         return True
 
@@ -2950,13 +2997,6 @@ def parse_direct_history_adjustment(text):
 
 
 def looks_like_history_edit(text, class_names=None):
-    # class_names 沒帶進來時（例如 parse_direct_history_adjustment 那邊
-    # 「NNN的...」格式還沒真的把訂單抓出來、不知道實際班級名稱），
-    # 退回比較寬鬆的通用判斷：只要出現「改／取消」這類動作字眼，
-    # 就先當作可能是修改指令，交給 prepare_history_adjustment 用
-    # 訂單實際班級資料做最終判斷；真的猜錯的話，那邊會回覆看不懂，
-    # 不會誤觸發成別的功能。有帶班級名稱清單時（例如查完歷史訂單
-    # 後直接接著改），就用精確比對，中文班級名稱也能正確辨識。
     if class_names:
         pattern = _pending_order_class_pattern(class_names)
     else:
@@ -3114,20 +3154,10 @@ def make_history_update_confirmation(original_order, new_order, changes):
 
 
 def make_historical_order_with_offer(user_id, order):
-    """
-    查到單一歷史訂單後，同時建立「是否生成訂購單」的待確認狀態。
-    使用者之後回「要／好／確認」時，沿用既有 make_purchase_order_text()
-    產生可傳給出版社業務員的訂購單，並由 mark_order_note() 把 Google
-    J 欄備註更新為「已請業務下單」。
-    """
     status = str(order.get("status", "") or "").strip()
     note = str(order.get("note", "") or "").strip()
     history_reply = make_historical_order_reply(order)
 
-    # 已取消的歷史訂單不應再引導送給業務員下單。
-    # 備註欄如果已經寫著「已請業務下單」，代表這張訂單的訂購單
-    # 之前就生成、標記過了，不應該每次查詢都再問一次要不要生成——
-    # 只有「還沒請業務下單」的訂單才需要問。
     if "取消" in status or "已請業務下單" in note:
         pending_receipt_offers.pop(user_id, None)
         return history_reply
@@ -3364,14 +3394,22 @@ def confirm_history_cancel(user_id):
 # =========================================================
 # 學校學生資料
 # =========================================================
-def parse_school_stats_query(user_id, text):
+def parse_school_stats_query(user_id, text, require_keyword=True):
+    """
+    「查人數」功能：解析「學校＋年級」這類問句（例如「天母七年級人數」
+    「華興高一人數」），也相容原本「多少人／幾個班」等既有問法。
+    require_keyword=False 時（guided_mode="stats_lookup" 內使用），
+    只要能抓到學校，就算沒有出現任何關鍵字也視為有效查詢，
+    讓使用者在「查人數」模式裡可以直接打「天母七年級」而不用多打「人數」兩個字。
+    """
     clean = text.strip()
 
     query_words = [
-        "多少人", "幾人", "幾個人", "學生人數", "總人數",
+        "多少人", "幾人", "幾個人", "學生人數", "總人數", "人數",
         "幾個班", "多少班", "有哪些班", "哪幾班", "哪幾個班"
     ]
-    if not any(word in clean for word in query_words):
+    has_keyword = any(word in clean for word in query_words)
+    if require_keyword and not has_keyword:
         return None
     if "老師" in clean:
         return None
@@ -3395,7 +3433,7 @@ def parse_school_stats_query(user_id, text):
         intent = "classes"
     elif any(word in clean for word in ["幾個班", "多少班"]):
         intent = "class_count"
-    elif any(word in clean for word in ["多少人", "幾人", "幾個人", "學生人數", "總人數"]):
+    elif any(word in clean for word in ["多少人", "幾人", "幾個人", "學生人數", "總人數", "人數"]):
         intent = "students"
 
     return {
@@ -3407,6 +3445,12 @@ def parse_school_stats_query(user_id, text):
 
 
 def handle_school_stats_query(query):
+    """
+    「查人數」完整版回覆：總人數 + 各班明細。
+    共用原本 lookup_school_classes()（依學校／年級／班級查班級人數），
+    只是把回覆格式統一成「總人數在前、各班明細在後」，
+    符合「天母七年級人數」這類問法要的完整版格式。
+    """
     result = lookup_school_classes(
         query["school"],
         query.get("grade", ""),
@@ -3423,7 +3467,6 @@ def handle_school_stats_query(query):
     if query.get("class_name"):
         item = classes[0]
         return (
-            ""
             "🏫 班級資料\n"
             f"學校：{query['school']}\n"
             f"班級：{item['class_name']}班\n"
@@ -3440,7 +3483,6 @@ def handle_school_stats_query(query):
     ]
 
     return (
-        ""
         f"🏫 {title}\n"
         f"班級總數：{result['class_count']}個班\n"
         f"學生總人數：{result['total_students']}人\n\n"
@@ -3555,8 +3597,6 @@ def handle_school_version_query(query):
     )
 
     if not query.get("grade"):
-        # 多年級合併查詢：依年級分組顯示，年級標題獨立一行，
-        # 底下科目不再重複標年級，組間用空行分隔。
         grade_order = ["七年級", "八年級", "九年級"]
         grouped = {}
         for item in versions:
@@ -3577,7 +3617,6 @@ def handle_school_version_query(query):
 
         return header + "\n\n" + "\n\n".join(blocks)
 
-    # 單一年級、多科目：維持原本的清單格式
     lines = [f"• {item['subject']}：{item['version']}" for item in versions]
     return header + "\n\n" + "\n".join(lines)
 
@@ -3633,7 +3672,7 @@ def extract_school_name(text):
         school_hint
     )
     school_hint = re.sub(
-        r"(?:有多少人|多少人|幾人|幾個人|學生人數|總人數|"
+        r"(?:有多少人|多少人|幾人|幾個人|學生人數|總人數|人數|"
         r"有幾個班|幾個班|多少班|有哪些班|哪幾班|哪幾個班|"
         r"版本|哪一版|哪個版本|什麼版本|教科書|查詢|查)",
         "",
@@ -3683,7 +3722,6 @@ def get_school_catalog(force_refresh=False):
 
 
 def extract_grade_text(text):
-    # 同上，原本 r"[\\s，,。.!！?？]+" 沒有真的去除空白字元。
     clean = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
     grade_map = {
         "七年級": "七年級", "八年級": "八年級", "九年級": "九年級",
@@ -3693,7 +3731,6 @@ def extract_grade_text(text):
         "高中一年級": "高一", "高中二年級": "高二", "高中三年級": "高三",
         "10年級": "高一", "11年級": "高二", "12年級": "高三"
     }
-    # 長字串優先，避免較短別名先吃到內容
     for key in sorted(grade_map, key=len, reverse=True):
         if key in clean:
             return grade_map[key]
@@ -3926,12 +3963,6 @@ _CN_NUM_MAP = {
 
 
 def _normalize_book_volume(text):
-    """
-    冊次寫法正規化：
-    - 「上冊／下冊／中冊」→「上／下／中」
-    - 「第X冊」或「X冊」（X 為中文數字）→ 阿拉伯數字
-    讓「英文上冊」跟「英文上」、「第一冊」跟「1」能被視為同一件事。
-    """
     text = re.sub(r"(上|下|中)冊", r"\1", text)
 
     def _cn_to_num(m):
@@ -3952,7 +3983,6 @@ def normalize_book_match_text(value):
         "康玄": "康軒",
         "韓林": "翰林",
         "寒林": "翰林",
-        # 「英語」視為「英文」的同義詞，讓兩種寫法都能對上。
         "英語": "英文",
     }
     for wrong, correct in aliases.items():
@@ -4014,17 +4044,17 @@ def book_keyword_score(query, candidate):
     return min(score, 1.0)
 
 
-def lookup_book_candidates_enhanced(query):
+def lookup_book_candidates_enhanced(query, publisher=""):
     query = str(query or "").strip()
     if not query:
         return []
 
-    candidates = lookup_fuzzy_candidates("book", query)
+    candidates = lookup_fuzzy_candidates("book", query, publisher=publisher)
 
     if not candidates:
         core = book_core_text(query)
         if core and core != query:
-            candidates = lookup_fuzzy_candidates("book", core)
+            candidates = lookup_fuzzy_candidates("book", core, publisher=publisher)
 
     merged = {}
     for item in candidates:
@@ -4100,10 +4130,6 @@ def handle_name_confirmation(user_id, text):
     yes_words = {"是", "對", "對的", "沒錯", "正確", "可以", "好", "就是", "確認"}
     no_words = {"不是", "不對", "錯", "錯了", "不要", "否"}
 
-    # 有些候選（老師姓名／書名）不只一個接近的結果，這時候 pending
-    # 會帶一份 options 清單，讓使用者直接回覆數字（1／2／3…）挑選，
-    # 不用每次都重打一次完整名稱。沒有 options 的舊流程（單一候選）
-    # 維持原本「確認／是」二選一的行為，完全不受影響。
     options = pending.get("options")
 
     chosen = None
@@ -4160,6 +4186,8 @@ def handle_name_confirmation(user_id, text):
             draft["teacher"] = str(chosen.get("value", "") or "").strip()
             draft["school"] = str(chosen.get("school", "") or "").strip()
             draft["classes"] = []
+        elif pending["field"] == "publisher":
+            draft["publisher"] = str(chosen.get("value", "") or "").strip()
         elif pending["field"] == "book":
             draft["book"] = str(chosen.get("value", "") or "").strip()
             if chosen.get("publisher"):
@@ -4186,7 +4214,8 @@ def handle_name_confirmation(user_id, text):
         field_name = {
             "teacher": "老師姓名",
             "book": "書名",
-            "school": "學校名稱"
+            "school": "學校名稱",
+            "publisher": "出版社名稱"
         }.get(pending.get("field"), "名稱")
         return f"好，沒有採用。請重新輸入正確的{field_name}。"
 
@@ -4199,20 +4228,24 @@ def handle_name_confirmation(user_id, text):
     return None
 
 
-def lookup_fuzzy_candidates(kind, query, school=""):
+def lookup_fuzzy_candidates(kind, query, school="", publisher=""):
+    """
+    kind 支援 "teacher"／"book"／"school"／"publisher" 四種。
+    publisher 參數只有 kind="book" 時會用到：如果有帶，Apps Script
+    那邊應該先把書籍清單篩選成「只有這個出版社底下的書」再模糊比對，
+    讓「先選出版社、再選書名」時，書名候選範圍會縮小、比對更準確。
+    """
     result = google_post({
         "action": "lookup_fuzzy_candidates",
         "kind": kind,
         "query": str(query or ""),
-        "school": str(school or "")
+        "school": str(school or ""),
+        "publisher": str(publisher or "")
     }, timeout=4.5, retries=1)
 
     if not result or not result.get("success"):
         return []
 
-    # 從 20 筆原始候選裡取用，避免正確答案在 Google 端第一輪
-    # 純字串比對時就被排到 20 名以外而看不見；Python 端會再用
-    # book_keyword_score 之類更聰明的邏輯重新排序。
     return result.get("candidates", [])[:20]
 
 
@@ -4451,10 +4484,6 @@ def lookup_book_orders_by_teacher(teacher):
 
 
 def lookup_orders_by_date(date_text):
-    # 原本 timeout=20、retries=3，最壞情況要等將近 60 秒——LINE 的
-    # reply token 官方規定「一分鐘內沒用掉就失效」，等到那麼久基本上
-    # 等於白等，使用者最後什麼回覆都收不到。改成更短的逾時、
-    # 保留一次重試，讓最壞情況也能在 reply token 過期前回覆。
     result = google_post({
         "action": "lookup_orders_by_date",
         "date": date_text
@@ -4482,11 +4511,6 @@ def lookup_orders_by_date(date_text):
 
 
 def get_today_order_stats_reply():
-    """
-    新增功能：輸入「統計」快速看今天總共進了幾張訂單、幾本書、
-    出版社分佈。原本要看這些只能一張一張查訂單或翻 Google 試算表，
-    這裡直接彙整成一句話回覆。
-    """
     date_text = datetime.now().strftime("%Y-%m-%d")
     orders = lookup_orders_by_date(date_text)
 
@@ -4521,8 +4545,6 @@ def get_today_order_stats_reply():
 
 
 def cancel_google_order(order_number):
-    # 同上：取消訂單這種操作使用者通常在等立即回覆，
-    # 20 秒 x 3 次重試的最壞情況太接近 LINE reply token 一分鐘上限。
     result = google_post({
         "action": "cancel_order",
         "order_number": normalize_order_number(order_number)
@@ -4769,8 +4791,6 @@ def orders_have_same_core_data(actual_order, expected_order):
 # LeBron 固定人設層
 # =========================================================
 def add_lebron_flavor(message):
-    # 某些流程需要一次回覆兩個 LINE 訊息泡泡。第一個泡泡套 LeBron 開場，
-    # 後續泡泡保持原文，避免第二段提問再被加一次「LeBron James」。
     if isinstance(message, (list, tuple)):
         items = list(message)
         if not items:
@@ -4784,7 +4804,6 @@ def add_lebron_flavor(message):
     if body.startswith("👑 LeBron James"):
         return body
 
-    # 訂購單是要直接轉傳給出版社業務員的正式文字，絕對不要加 LeBron 人設開頭。
     if body.startswith("請協助幫忙下訂單"):
         return body
 
@@ -4812,11 +4831,17 @@ def add_lebron_flavor(message):
     ]):
         intro = "👑 LeBron James 幫你把陣容調整好了"
 
+    elif "出版社" in compact and ("候選" in compact or "可能有錯字" in compact):
+        intro = "👑 LeBron James 幫你認清東家了"
+
     elif "訂購確認" in compact or "訂書確認" in compact:
         intro = "👑 LeBron James 幫你把這張單整理好了"
 
     elif any(key in compact for key in ["教科書版本", "版本資料", "版本："]):
         intro = "👑 LeBron James 幫你把版本查好了"
+
+    elif "🏫" in compact and ("總人數" in compact or "班級總數" in compact):
+        intro = "👑 LeBron James 幫你點完名了"
 
     elif any(key in compact for key in [
         "班級資料", "學生人數", "總學生人數", "班級總數", "幾個班", "多少人"
@@ -4832,7 +4857,7 @@ def add_lebron_flavor(message):
         intro = "👑 LeBron James 幫你把紀錄翻出來了"
 
     elif any(key in compact for key in [
-        "大漢訂書小幫手", "我可以幫你", "功能", "直接用平常講話"
+        "大漢訂書小幫手", "我可以幫你", "功能", "直接用平常講話", "今天想幹嘛"
     ]):
         intro = "👑 LeBron James 幫你把戰術板打開了"
 
@@ -4871,7 +4896,6 @@ def reply_to_line(reply_token, message):
     else:
         message_items = [str(message or "").strip()]
 
-    # LINE Reply API 一次最多可帶多個 message object；這裡保守限制前 5 則。
     data = {
         "replyToken": reply_token,
         "messages": [
@@ -4893,8 +4917,6 @@ def reply_to_line(reply_token, message):
             logger.info(f"LINE reply status: {response.status_code}")
             logger.debug(f"LINE reply response: {response.text}")
 
-            # 429/5xx 才值得重試一次；4xx（例如 reply token 已過期或用過）
-            # 重打也不會成功，重試反而多耗一次網路來回時間。
             if response.status_code == 429 or response.status_code >= 500:
                 if attempt < attempts - 1:
                     time.sleep(0.3)
