@@ -72,7 +72,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-09-unified-guided-mode-v28"
+APP_VERSION = "2026-09-09-teacher-fastpath-note-fix-v29"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -577,16 +577,18 @@ def _route_message(user_id, user_text):
             if starts_new_task:
                 pending_receipt_offers.pop(user_id, None)
             elif _is_confirm_word(text) or text in {"要", "我要", "需要", "幫我生成", "生成", "生成訂購單"}:
-                pending_receipt_offers.pop(user_id, None)
                 purchase_order_text = make_purchase_order_text(offer)
                 taiwan_date = datetime.now().strftime("%Y/%m/%d")
                 note_text = f"已請業務下單｜{taiwan_date}"
                 note_ok = mark_order_note(offer.get("order_number", ""), note_text)
                 if not note_ok:
-                    purchase_order_text += (
-                        "\n\n⚠️ 訂購單已生成，但 Google 備註欄寫入失敗。"
-                        "請先不要漏掉這筆，稍後可再補寫「已請業務下單」。"
+                    # 使用者已經拿到訂購單，不再多塞一段錯誤文案；
+                    # 錯誤只記錄在 Render log，避免 LINE 畫面出現多餘警告。
+                    logger.warning(
+                        "set_order_note failed order=%s",
+                        offer.get("order_number", "")
                     )
+                pending_receipt_offers.pop(user_id, None)
                 return purchase_order_text
             elif text in RECEIPT_DECLINE_WORDS:
                 pending_receipt_offers.pop(user_id, None)
@@ -1572,79 +1574,186 @@ def normalize_person_name(value):
 
 
 def validate_order_teacher_input(user_id, raw_text, draft):
+    """
+    訂書流程老師輸入：
+    1. 先做精準老師查詢；資料庫已存在的正確姓名直接採用，不再多問「請輸入 1」。
+    2. 精準查不到才做模糊比對。
+    3. 明顯只有一個高可信候選（例如三字姓名只錯一字）直接自動採用；
+       只有真的有兩個以上接近人選時才讓使用者選 1/2/3。
+    """
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
     clean = re.sub(r"老師$", "", clean).strip()
     if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}", clean):
         return "請輸入老師姓名，例如：蔡書玄"
 
     school = str(draft.get("school") or "").strip()
-    candidates = lookup_fuzzy_candidates("teacher", clean, school=school)
-    if not candidates and school:
-        candidates = lookup_fuzzy_candidates("teacher", clean, school="")
 
-    if not candidates:
-        return ("⚠️ 老師資料庫目前找不到符合資料。\n\n"
-                f"你輸入：{clean}\n\n"
-                "我不會先把這個名字存進訂單。請重新輸入老師姓名。")
+    # A. 精準查詢優先：正確姓名不應該先繞去模糊搜尋。
+    exact_matches = lookup_teacher_matches(clean, school=school)
 
-    first = candidates[0]
-    value = str(first.get("value", "") or "").strip()
-    candidate_school = str(first.get("school", "") or school).strip()
-    score = float(first.get("score", 0) or 0)
+    # 如果帶學校卻沒有找到，再跨校精準找一次。
+    if not exact_matches and school:
+        exact_matches = lookup_teacher_matches(clean, school="")
 
-    if normalize_person_name(value) == normalize_person_name(clean):
-        draft["teacher"] = value
-        draft["school"] = candidate_school
+    # 只保留姓名真的完全一致的結果，避免 Google 端日後查詢規則改動造成誤收。
+    exact_matches = [
+        item for item in (exact_matches or [])
+        if normalize_person_name(item.get("teacher", "")) == normalize_person_name(clean)
+    ]
+
+    if len(exact_matches) == 1:
+        item = exact_matches[0]
+        draft["teacher"] = str(item.get("teacher", "") or "").strip()
+        draft["school"] = str(item.get("school", "") or school).strip()
+        draft["teacher_classes"] = copy_classes(item.get("classes", []))
         draft["classes"] = []
         pending_name_confirmations.pop(user_id, None)
         order_flow_context[user_id] = draft
         return make_order_guide_reply(draft)
 
+    if len(exact_matches) > 1:
+        schools = unique_list([
+            str(item.get("school", "") or "").strip()
+            for item in exact_matches
+            if str(item.get("school", "") or "").strip()
+        ])
+        return (
+            "🔎 找到同名老師。\n\n"
+            f"老師：{clean}\n"
+            f"學校：{'、'.join(schools)}\n\n"
+            "請輸入「學校＋老師姓名」，我再幫你確認。"
+        )
+
+    # B. 精準查不到才做模糊比對。
+    candidates = lookup_fuzzy_candidates("teacher", clean, school=school)
+    if not candidates and school:
+        candidates = lookup_fuzzy_candidates("teacher", clean, school="")
+
+    if not candidates:
+        return (
+            "⚠️ 老師資料庫目前找不到符合資料。\n\n"
+            f"你輸入：{clean}\n\n"
+            "我不會先把這個名字存進訂單。請重新輸入老師姓名。"
+        )
+
+    # 去除同一位老師＋同一學校的重複候選。
+    deduped = []
+    seen = set()
+    for c in candidates:
+        c_value = str(c.get("value", "") or "").strip()
+        c_school = str(c.get("school", "") or "").strip()
+        if not c_value:
+            continue
+        key = normalize_person_name(c_value) + "||" + c_school
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(c)
+
+    if not deduped:
+        return (
+            "⚠️ 老師資料庫目前找不到符合資料。\n\n"
+            f"你輸入：{clean}"
+        )
+
+    first = deduped[0]
+    value = str(first.get("value", "") or "").strip()
+    candidate_school = str(first.get("school", "") or school).strip()
+    score = float(first.get("score", 0) or 0)
+    second_score = float(deduped[1].get("score", 0) or 0) if len(deduped) > 1 else 0.0
+    gap = score - second_score
+
+    # 防守：若 fuzzy 回來其實就是完全相同姓名，也直接採用。
+    if normalize_person_name(value) == normalize_person_name(clean):
+        exact = lookup_teacher_matches(value, school=candidate_school)
+        if len(exact) == 1:
+            item = exact[0]
+            draft["teacher"] = str(item.get("teacher", "") or value).strip()
+            draft["school"] = str(item.get("school", "") or candidate_school).strip()
+            draft["teacher_classes"] = copy_classes(item.get("classes", []))
+        else:
+            draft["teacher"] = value
+            draft["school"] = candidate_school
+            draft["teacher_classes"] = []
+        draft["classes"] = []
+        pending_name_confirmations.pop(user_id, None)
+        order_flow_context[user_id] = draft
+        return make_order_guide_reply(draft)
+
+    # 高可信且明顯領先第二名：直接自動採用，不要求多打一個「1」。
+    # 三字姓名錯一字通常會落在約 0.66，這裡讓唯一明顯候選直接過。
+    if value and score >= 0.64 and (len(deduped) == 1 or gap >= 0.12):
+        exact = lookup_teacher_matches(value, school=candidate_school)
+        if len(exact) == 1:
+            item = exact[0]
+            draft["teacher"] = str(item.get("teacher", "") or value).strip()
+            draft["school"] = str(item.get("school", "") or candidate_school).strip()
+            draft["teacher_classes"] = copy_classes(item.get("classes", []))
+            draft["classes"] = []
+            pending_name_confirmations.pop(user_id, None)
+            order_flow_context[user_id] = draft
+            return make_order_guide_reply(draft)
+
+    # 真的有歧義才列候選讓使用者選。
     if value and score >= 0.52:
         options = []
-        seen = set()
-        for c in candidates[:4]:
+        for c in deduped[:4]:
             c_value = str(c.get("value", "") or "").strip()
             c_school = str(c.get("school", "") or "").strip()
             c_score = float(c.get("score", 0) or 0)
-            dedup_key = c_value + "||" + c_school
 
-            if not c_value or dedup_key in seen:
+            if not c_value:
                 continue
             if c_value != value and c_score < 0.52:
                 continue
 
-            seen.add(dedup_key)
             options.append({"value": c_value, "school": c_school or school})
-
             if len(options) >= 3:
                 break
 
+        if len(options) == 1:
+            # 只有一個候選時，不叫使用者再打 1；直接採用並查班級。
+            opt = options[0]
+            exact = lookup_teacher_matches(opt["value"], school=opt.get("school", ""))
+            if len(exact) == 1:
+                item = exact[0]
+                draft["teacher"] = str(item.get("teacher", "") or opt["value"]).strip()
+                draft["school"] = str(item.get("school", "") or opt.get("school", "")).strip()
+                draft["teacher_classes"] = copy_classes(item.get("classes", []))
+                draft["classes"] = []
+                pending_name_confirmations.pop(user_id, None)
+                order_flow_context[user_id] = draft
+                return make_order_guide_reply(draft)
+
         pending_name_confirmations[user_id] = {
-            "field": "teacher", "purpose": "order_teacher",
+            "field": "teacher",
+            "purpose": "order_teacher",
             "options": options,
             "original": clean
         }
         order_flow_context[user_id] = draft
 
-        lines = ["🔎 老師姓名可能有錯字，找到以下接近的候選。", "", f"你輸入：{clean}", ""]
+        lines = [
+            "🔎 老師姓名可能有錯字，找到以下接近的候選。",
+            "",
+            f"你輸入：{clean}",
+            ""
+        ]
         for i, opt in enumerate(options, start=1):
-            label = opt["value"] + (f"（{opt['school']}）" if opt.get("school") else "")
+            label = opt["value"] + (
+                f"（{opt['school']}）" if opt.get("school") else ""
+            )
             lines.append(f"{i}. {label}")
+
         lines.append("")
-
-        if len(options) > 1:
-            lines.append("請直接回覆數字（例如「1」）選擇要的那一位；回覆「確認」等同選第 1 個。")
-        else:
-            lines.append("是的請回覆「確認」。")
-
-        lines.append("如果都不是，請直接輸入正確老師姓名，我會取消這個候選並重新查資料庫。")
+        lines.append("請直接回覆數字選擇；如果都不是，直接重新輸入正確老師姓名。")
         return "\n".join(lines)
 
-    return ("⚠️ 老師資料庫目前無法確認這個姓名。\n\n"
-            f"你輸入：{clean}\n\n"
-            "我不會往下一步。請重新輸入老師姓名。")
-
+    return (
+        "⚠️ 老師資料庫目前無法確認這個姓名。\n\n"
+        f"你輸入：{clean}\n\n"
+        "我不會往下一步。請重新輸入老師姓名。"
+    )
 
 def validate_order_publisher_input(user_id, raw_text, draft):
     """
@@ -2066,7 +2175,10 @@ def build_order_from_draft(user_id, draft):
         exact_matches = parallel_results.get("teacher_matches") or []
         publisher = str(parallel_results.get("publisher") or "").strip()
 
-    teacher_classes = []
+    teacher_classes = copy_classes(draft.get("teacher_classes", []))
+    if teacher_classes:
+        # 老師輸入階段已經查過班級，這裡直接沿用，不再重複打 Google。
+        exact_matches = []
     if len(exact_matches) == 1:
         exact = exact_matches[0]
         teacher = exact["teacher"]
@@ -4235,13 +4347,14 @@ def lookup_fuzzy_candidates(kind, query, school="", publisher=""):
     那邊應該先把書籍清單篩選成「只有這個出版社底下的書」再模糊比對，
     讓「先選出版社、再選書名」時，書名候選範圍會縮小、比對更準確。
     """
+    fuzzy_timeout = 6.0 if kind == "teacher" else 5.0
     result = google_post({
         "action": "lookup_fuzzy_candidates",
         "kind": kind,
         "query": str(query or ""),
         "school": str(school or ""),
         "publisher": str(publisher or "")
-    }, timeout=4.5, retries=1)
+    }, timeout=fuzzy_timeout, retries=1)
 
     if not result or not result.get("success"):
         return []
@@ -4417,7 +4530,7 @@ def mark_order_note(order_number, note):
         "action": "set_order_note",
         "order_number": normalize_order_number(order_number),
         "note": str(note or "").strip()
-    }, timeout=10, retries=2)
+    }, timeout=5, retries=1)
 
     return bool(result and result.get("success") is True)
 
