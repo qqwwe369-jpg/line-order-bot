@@ -72,7 +72,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-09-teacher-fastpath-note-fix-v29"
+APP_VERSION = "2026-09-15-google-call-budget-v30"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -147,6 +147,56 @@ def _parallel_google_calls(calls):
                 results[name] = None
 
     return results
+
+
+# =========================================================
+# 請求時間預算：避免單一則訊息因為連續好幾次 Google 呼叫疊加，
+# 把整個 gunicorn worker 拖到逾時被強制殺掉（WORKER TIMEOUT）。
+#
+# 背景：Google Apps Script 偶爾會慢到 8~10 秒才回應。舊版程式在
+# 找不到資料、或第一次查詢帶了學校條件卻沒結果時，常常會自動再打
+# 一次 Google（例如老師查詢先用學校篩選查一次，找不到再跨校查一次；
+# guided_mode 的跳脫偵測也可能再觸發一次獨立查詢）。正常狀況下這些
+# 疊加沒事，但只要 Apps Script 剛好變慢，疊加起來的等待時間就可能
+# 超過 gunicorn 的 worker timeout，整個 worker process 被強制殺掉，
+# 那一則訊息完全收不到任何回覆（LINE 端看起來就是已讀不回）。
+#
+# 這裡在 google_post() 這個唯一的出口統一做管控：同一則使用者訊息
+# 處理期間，如果已經花費的時間或已經打的 Google 次數超過門檻，
+# 後面的 Google 呼叫直接跳過、視同失敗（回傳 None），讓上層既有的
+# 「查不到／處理失敗」邏輯自然接手，而不是繼續傻等下去。
+#
+# 門檻刻意設在明顯小於 gunicorn worker timeout 的位置（建議 worker
+# timeout 至少設 60 秒，這裡預設 20 秒），確保就算真的踩到上限，
+# 剩下的處理時間＋LINE 回覆時間仍然留有安全緩衝。
+# =========================================================
+REQUEST_TIME_BUDGET_SECONDS = float(os.environ.get("REQUEST_TIME_BUDGET_SECONDS", "20"))
+REQUEST_MAX_GOOGLE_CALLS = int(os.environ.get("REQUEST_MAX_GOOGLE_CALLS", "8"))
+
+_request_budget_state = threading.local()
+
+
+def _start_request_budget():
+    _request_budget_state.started_at = time.perf_counter()
+    _request_budget_state.google_calls = 0
+
+
+def _register_google_call():
+    _request_budget_state.google_calls = getattr(_request_budget_state, "google_calls", 0) + 1
+
+
+def _request_budget_exceeded():
+    started_at = getattr(_request_budget_state, "started_at", None)
+    if started_at is None:
+        return False
+
+    elapsed = time.perf_counter() - started_at
+    calls = getattr(_request_budget_state, "google_calls", 0)
+
+    return (
+        elapsed > REQUEST_TIME_BUDGET_SECONDS
+        or calls >= REQUEST_MAX_GOOGLE_CALLS
+    )
 
 
 # =========================================================
@@ -506,6 +556,10 @@ def callback():
 # 主流程
 # =========================================================
 def handle_message(user_id, user_text):
+    # 每一則訊息一開始就重置請求時間／次數預算，確保上一則訊息的
+    # 計數不會殘留影響到這一則（同一個 gunicorn worker 會處理多則訊息）。
+    _start_request_budget()
+
     if _is_rate_limited(user_id):
         logger.warning(f"rate limited user={user_id}")
         return (
@@ -3811,7 +3865,7 @@ def get_school_catalog(force_refresh=False):
 
     result = google_post(
         {"action": "list_schools"},
-        timeout=7,
+        timeout=10,
         retries=1
     )
 
@@ -4347,7 +4401,7 @@ def lookup_fuzzy_candidates(kind, query, school="", publisher=""):
     那邊應該先把書籍清單篩選成「只有這個出版社底下的書」再模糊比對，
     讓「先選出版社、再選書名」時，書名候選範圍會縮小、比對更準確。
     """
-    fuzzy_timeout = 6.0 if kind == "teacher" else 5.0
+    fuzzy_timeout = 8.0 if kind == "teacher" else 6.0
     result = google_post({
         "action": "lookup_fuzzy_candidates",
         "kind": kind,
@@ -4387,6 +4441,16 @@ def google_post(payload, timeout=10, retries=1):
                 return cached_data
         else:
             _google_read_cache.pop(key, None)
+
+    # 請求時間／次數預算：同一則使用者訊息如果已經花了太久，或已經
+    # 打了太多次 Google，這裡直接跳過、視同失敗，避免疊加到把整個
+    # gunicorn worker 拖過 timeout。詳見上方 REQUEST_TIME_BUDGET_SECONDS
+    # 說明。快取命中不受影響（上面已經提早 return）。
+    if _request_budget_exceeded():
+        logger.warning(f"Google call skipped (request time/call budget exceeded): action={action}")
+        return None
+
+    _register_google_call()
 
     attempts = max(1, int(retries or 1))
     started = time.perf_counter()
@@ -4449,7 +4513,7 @@ def lookup_teacher_matches(teacher, school="", grade="", subject=""):
         "school": str(school or "").strip(),
         "grade": str(grade or "").strip(),
         "subject": str(subject or "").strip()
-    }, timeout=7, retries=1)
+    }, timeout=9, retries=1)
 
     if not result or not result.get("success"):
         return []
@@ -4600,7 +4664,7 @@ def lookup_orders_by_date(date_text):
     result = google_post({
         "action": "lookup_orders_by_date",
         "date": date_text
-    }, timeout=8, retries=2)
+    }, timeout=9, retries=2)
 
     if not result:
         return None
@@ -4672,7 +4736,7 @@ def lookup_school_classes(school, grade="", class_name=""):
         "school": school,
         "grade": grade,
         "class_name": class_name
-    }, timeout=7, retries=1)
+    }, timeout=9, retries=1)
 
     if not result or not result.get("success"):
         return None
@@ -4728,7 +4792,7 @@ def lookup_school_versions(
             "grade": grade,
             "subject": subject,
             "academic_period": academic_period
-        }, timeout=7, retries=1)
+        }, timeout=9, retries=1)
 
     result = do_lookup(school)
 
@@ -5044,6 +5108,17 @@ def reply_to_line(reply_token, message):
 
 
 if __name__ == "__main__":
+    # 注意：正式環境（Render）是透過 gunicorn 啟動 Start Command，
+    # 不會執行到這裡；這裡只有本機用 `python app.py` 測試時會用到。
+    #
+    # 【重要】請確認 Render 的 Start Command 有帶足夠長的 --timeout，
+    # 例如：
+    #     gunicorn app:app --workers 2 --timeout 60
+    # Google Apps Script 偶爾會慢到 8~10 秒才回應，如果 gunicorn 的
+    # worker timeout 太短（預設 30 秒），遇到連續幾次查詢疊加時，
+    # worker 可能會被強制殺掉（WORKER TIMEOUT），導致該則訊息完全
+    # 收不到任何回覆。搭配上面新增的請求時間預算機制，兩者一起可以
+    # 大幅降低這種情況發生的機率。
     port = int(os.environ.get("PORT", 5000))
     app.run(
         host="0.0.0.0",
