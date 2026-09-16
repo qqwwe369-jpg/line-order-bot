@@ -75,7 +75,7 @@ from difflib import SequenceMatcher
 from reportlab.lib.pagesizes import A5
 from reportlab.lib.units import mm
 from reportlab.lib import colors
-from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfbase import pdfmetrics
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.lib.styles import ParagraphStyle
@@ -5055,13 +5055,31 @@ def orders_have_same_core_data(actual_order, expected_order):
 # 之後要加「機器人直接寄信」，改 build_purchase_order_reply() 就好，
 # 不用動這裡的排版邏輯。詳見檔案最上面的說明區塊。
 # =========================================================
-CJK_FONT_NAME = "MHei-Light"
-pdfmetrics.registerFont(UnicodeCIDFont(CJK_FONT_NAME))
+CJK_FONT_NAME = "AppCJKFont"
+# 這裡改用「嵌入字型檔」而不是 reportlab 內建的 CID 字型（例如
+# MSung-Light）：內建 CID 字型不會把字型資料包進 PDF 裡，而是假設
+# 打開 PDF 的軟體本身就有對應的繁中字型，很多手機上的 PDF 檢視器
+# 其實沒有，容易變成空白或方框。改成嵌入字型後，不管用哪個裝置、
+# 哪個 App 打開，字都保證顯示正確。
+# 字型檔（fonts/cjk-tc.ttf）需要跟 app.py 一起放進你的 repo，
+# 部署到 Render 才讀得到；這是一個已經去除多餘字符、縮小過的繁中
+# 開源字型（文泉驛正黑的子集版），僅供內嵌進產生的 PDF 使用。
+_CJK_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fonts", "cjk-tc.ttf")
+_CJK_FONT_READY = False
+try:
+    pdfmetrics.registerFont(TTFont(CJK_FONT_NAME, _CJK_FONT_PATH))
+    _CJK_FONT_READY = True
+except Exception as error:
+    logger.error(f"CJK font register failed ({_CJK_FONT_PATH}): {error}")
 
 
 def generate_purchase_order_pdf(offer):
     """把訂購單內容畫成 A5（約 A4 一半）大小的 PDF，回傳 (token, path)；
     失敗回傳 (None, None)。"""
+    if not _CJK_FONT_READY:
+        logger.error("purchase order pdf skipped: CJK font not registered")
+        return None, None
+
     token = uuid.uuid4().hex
     path = os.path.join(PURCHASE_ORDER_DIR, f"{token}.pdf")
 
