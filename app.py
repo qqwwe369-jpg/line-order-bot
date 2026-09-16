@@ -94,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-17-order-class-edit-v33"
+APP_VERSION = "2026-09-17-order-safe-write-v34"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -4715,7 +4715,7 @@ def lookup_teacher_matches(teacher, school="", grade="", subject=""):
         "school": str(school or "").strip(),
         "grade": str(grade or "").strip(),
         "subject": str(subject or "").strip()
-    }, timeout=9, retries=1)
+    }, timeout=5, retries=1)
 
     if not result or not result.get("success"):
         return []
@@ -4775,7 +4775,60 @@ def get_book_publisher(book):
     return None
 
 
+def _order_matches_pending(actual, expected):
+    """確認 Google 裡的訂單是否就是目前這張待確認訂單。"""
+    if not actual or not expected:
+        return False
+
+    for key in ("teacher", "school", "book", "publisher"):
+        if str(actual.get(key, "") or "").strip() != str(expected.get(key, "") or "").strip():
+            return False
+
+    actual_classes = {
+        str(item.get("class_name", "") or "").strip(): int(item.get("students", 0) or 0)
+        for item in actual.get("classes", [])
+        if str(item.get("class_name", "") or "").strip()
+    }
+    expected_classes = {
+        str(item.get("class_name", "") or "").strip(): int(item.get("students", 0) or 0)
+        for item in expected.get("classes", [])
+        if str(item.get("class_name", "") or "").strip()
+    }
+    return actual_classes == expected_classes
+
+
+def _verify_recent_created_order(order):
+    """
+    create_order 若 timeout，不重送 create_order。
+    改查今天的訂單，確認 Google 是否其實已經寫入成功，避免重複訂單。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    result = google_post({
+        "action": "lookup_orders_by_date",
+        "date": today
+    }, timeout=12, retries=1)
+
+    if not result or not result.get("success"):
+        return None
+
+    matches = []
+    for actual in result.get("orders", []):
+        actual = dict(actual)
+        actual["classes"] = copy_classes(actual.get("classes", []))
+        if _order_matches_pending(actual, order):
+            number = normalize_order_number(actual.get("order_number", ""))
+            if number:
+                matches.append(number)
+
+    if not matches:
+        return None
+
+    # 同內容若本來就有舊單，以最新（最大編號）為本次建立的候選。
+    return max(matches, key=lambda x: int(re.sub(r"\D", "", x) or 0))
+
+
 def write_to_google_sheet(order):
+    # 寫入只送一次。timeout 後絕對不自動重送，避免 Google 已寫入卻產生重複訂單。
     result = google_post({
         "action": "create_order",
         "teacher": order["teacher"],
@@ -4783,10 +4836,22 @@ def write_to_google_sheet(order):
         "book": order["book"],
         "publisher": order["publisher"],
         "classes": order.get("classes", [])
-    })
+    }, timeout=15, retries=1)
 
     if result and result.get("success") is True:
-        return True, result.get("order_number")
+        return True, normalize_order_number(result.get("order_number", ""))
+
+    # Google Apps Script 常見情況：已經完成 append，但 HTTP 回覆超時。
+    # 稍等一下後查今天訂單；查到完全相同內容就視為成功。
+    time.sleep(0.8)
+    verified_order_number = _verify_recent_created_order(order)
+    if verified_order_number:
+        logger.warning(
+            "create_order response missing/timeout, but verified order exists: %s",
+            verified_order_number
+        )
+        clear_google_read_cache()
+        return True, verified_order_number
 
     return False, None
 
