@@ -9,7 +9,8 @@
   3. 對話狀態          — 全域 dict 存每個 user_id 目前對話進度
   4. SQLite 跨 worker 持久化 — 多個 gunicorn worker 共用同一份對話狀態、
                           重送事件防護、過期資料清理
-  5. Flask 路由        — / 、 /healthz 、 /callback（LINE webhook 入口）
+  5. Flask 路由        — / 、 /healthz 、 /callback（LINE webhook 入口）、
+                          /purchase-order/<token>.pdf（訂購單 PDF 下載）
   6. 主流程 _route_message — 所有文字訊息最終都會流經這個函式來分流
   7. 引導式功能        — 查老師／查版本／查訂單／其他訂單／查人數／訂書
                           六個模式統一使用 guided_mode 框架
@@ -21,8 +22,9 @@
   13. 學校人數查詢
   14. Google Apps Script 溝通層（google_post）
   15. 小工具函式（字串正規化、班級計算…）
-  16. LeBron 人設文案層
-  17. LINE 回覆
+  16. 訂購單 PDF（供 email 給出版社）
+  17. LeBron 人設文案層
+  18. LINE 回覆
 
 新手上路指南：這是單一 Flask app，靠 Google Apps Script 當資料庫
 （老師/班級/書籍/訂單都存在 Google 試算表），LINE 傳來的每一則文字
@@ -37,10 +39,21 @@ guided_mode 目前有六種值："teacher_lookup"、"version_lookup"、
   - _guided_mode_escape_reply()：模式內偵測到其他功能的明確格式時自動跳出並轉交處理
   - 除了「其他訂單」（一次性登記）之外，完成一次動作後預設繼續留在模式內，
     可以連續查詢，不用每次重打進入指令
+
+【訂購單交付方式（2026-09 新增）】
+訂單確認完成後，使用者可以選擇讓機器人生成一張 PDF 版的訂購單，
+用來 email 給出版社（取代原本純文字、傳給業務轉單的做法）。
+這一塊刻意拆成兩層，之後如果要升級成「機器人直接寄信給出版社」，
+只要改 build_purchase_order_reply()，不用動 generate_purchase_order_pdf()：
+  - generate_purchase_order_pdf()：只負責畫出 PDF 檔案本身
+  - build_purchase_order_reply()：決定 PDF 產生後要怎麼「交」給使用者，
+    由環境變數 PURCHASE_ORDER_DELIVERY_MODE 控制：
+      "link"  → 目前唯一實作，回傳一個下載連結給使用者自己存檔、手動 email
+      "email" → 尚未實作的切換點，未來要加「機器人直接寄信」時從這裡接
 =============================================================
 """
 
-from flask import Flask, request
+from flask import Flask, request, send_file
 import os
 import re
 import time
@@ -55,8 +68,17 @@ import requests
 import json
 import copy
 import sqlite3
+import uuid
 from datetime import datetime
 from difflib import SequenceMatcher
+
+from reportlab.lib.pagesizes import A5
+from reportlab.lib.units import mm
+from reportlab.lib import colors
+from reportlab.pdfbase.cidfonts import UnicodeCIDFont
+from reportlab.pdfbase import pdfmetrics
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.lib.styles import ParagraphStyle
 
 # -------------------------------------------------------
 # Logging：統一輸出格式，取代原本散落各處的 print()。
@@ -72,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-15-google-call-budget-v30"
+APP_VERSION = "2026-09-16-purchase-order-pdf-v31"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -229,6 +251,30 @@ CONFIRM_WORDS = {"確認", "是", "對", "對的", "沒錯", "正確", "可以",
 RECEIPT_OFFER_TTL_SECONDS = 40
 RECEIPT_DECLINE_WORDS = {"不用", "不需要", "不用了", "不要", "算了"}
 
+# =========================================================
+# 訂購單 PDF 設定
+#
+# 交付方式先只做「產生 PDF → 給下載連結，使用者自己存檔後手動
+# email 給出版社」；之後如果要升級成「機器人直接寄信」，把
+# PURCHASE_ORDER_DELIVERY_MODE 切成 "email"，並在
+# build_purchase_order_reply() 裡接上真正寄信的函式即可，
+# 詳見檔案最上面的說明區塊。
+# =========================================================
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").strip()  # 建議設成 Render 服務網址，例如 https://your-app.onrender.com
+PURCHASE_ORDER_DIR = os.environ.get("PURCHASE_ORDER_DIR", "/tmp/purchase_orders")
+os.makedirs(PURCHASE_ORDER_DIR, exist_ok=True)
+
+# 下載連結有效期限：預設 3 天。想要 7 天就把環境變數設成 604800（7*24*3600）。
+# 注意：Render 免費方案重新部署（deploy）會清空 /tmp，屆時連結會提前失效，
+# 這點跟 TTL 設定無關，純粹是平台限制。
+PURCHASE_ORDER_LINK_TTL_SECONDS = int(
+    os.environ.get("PURCHASE_ORDER_LINK_TTL_SECONDS", str(3 * 24 * 3600))
+)
+
+# 交付方式切換點："link" = 給下載連結（目前唯一實作）
+# "email" = 機器人直接寄信給出版社（尚未實作，保留切換點，見上方說明）
+PURCHASE_ORDER_DELIVERY_MODE = os.environ.get("PURCHASE_ORDER_DELIVERY_MODE", "link")
+
 # 六個引導模式統一使用的退出詞：不管在哪一個模式裡，打這些詞都能直接
 # 回到主選單。訂書流程（order_flow）現在也正式收編進 guided_mode，
 # 所以也共用這份清單，不再有「訂書只能打取消，其他模式可以打離開」
@@ -341,6 +387,24 @@ def _is_duplicate_line_event(message_id):
         conn.close()
 
 
+def _cleanup_stale_purchase_order_pdfs():
+    """過期訂購單 PDF 清理。跟 SQLite 那份清理共用同一個機率觸發，
+    不用另外開排程；反正只要偶爾清一次就好，不用每則訊息都掃。"""
+    now = time.time()
+    try:
+        for filename in os.listdir(PURCHASE_ORDER_DIR):
+            if not filename.endswith(".pdf"):
+                continue
+            path = os.path.join(PURCHASE_ORDER_DIR, filename)
+            try:
+                if now - os.path.getmtime(path) > PURCHASE_ORDER_LINK_TTL_SECONDS:
+                    os.remove(path)
+            except Exception:
+                continue
+    except Exception as error:
+        logger.error(f"purchase order pdf cleanup error: {error}")
+
+
 def _cleanup_stale_state(probability=0.02):
     if random.random() > probability:
         return
@@ -361,6 +425,8 @@ def _cleanup_stale_state(probability=0.02):
         logger.error(f"state cleanup error: {error}")
     finally:
         conn.close()
+
+    _cleanup_stale_purchase_order_pdfs()
 
 
 def _verify_line_signature(body_bytes, signature_header):
@@ -497,6 +563,22 @@ def healthz():
     }, (200 if not problems else 503)
 
 
+@app.route("/purchase-order/<token>.pdf")
+def serve_purchase_order_pdf(token):
+    if not re.fullmatch(r"[a-f0-9]{32}", token):
+        return "Not found", 404
+    path = os.path.join(PURCHASE_ORDER_DIR, f"{token}.pdf")
+    if not os.path.exists(path):
+        return "這個連結已經過期或不存在，請回到 LINE 重新產生訂購單 PDF。", 404
+    if time.time() - os.path.getmtime(path) > PURCHASE_ORDER_LINK_TTL_SECONDS:
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+        return "這個連結已經過期，請回到 LINE 重新產生訂購單 PDF。", 404
+    return send_file(path, mimetype="application/pdf", download_name="訂購單.pdf")
+
+
 @app.route("/callback", methods=["POST"])
 def callback():
     raw_body = request.get_data()
@@ -631,7 +713,6 @@ def _route_message(user_id, user_text):
             if starts_new_task:
                 pending_receipt_offers.pop(user_id, None)
             elif _is_confirm_word(text) or text in {"要", "我要", "需要", "幫我生成", "生成", "生成訂購單"}:
-                purchase_order_text = make_purchase_order_text(offer)
                 taiwan_date = datetime.now().strftime("%Y/%m/%d")
                 note_text = f"已請業務下單｜{taiwan_date}"
                 note_ok = mark_order_note(offer.get("order_number", ""), note_text)
@@ -643,7 +724,7 @@ def _route_message(user_id, user_text):
                         offer.get("order_number", "")
                     )
                 pending_receipt_offers.pop(user_id, None)
-                return purchase_order_text
+                return build_purchase_order_reply(offer)
             elif text in RECEIPT_DECLINE_WORDS:
                 pending_receipt_offers.pop(user_id, None)
                 return "好的，沒有要生成訂購單。"
@@ -2535,6 +2616,8 @@ def make_order_confirmation(order):
 
 
 def make_purchase_order_text(offer):
+    """純文字版訂購單，目前保留備用（例如未來想切回文字版時還能用）。
+    現行流程已改用 generate_purchase_order_pdf() 產生 PDF。"""
     date_str = datetime.now().strftime("%Y/%m/%d")
     school = str(offer.get("school", "") or "")
     publisher = str(offer.get("publisher", "") or "")
@@ -2598,7 +2681,7 @@ def confirm_new_order(user_id):
             f"之後可以直接問「查{order_number}」"
         ),
         (
-            "需要幫你生成一張訂購單，讓你直接傳給出版社業務員下單嗎？\n"
+            "需要幫你生成一份訂購單 PDF，讓你可以存下來 email 給出版社嗎？\n"
             "回覆「要」或「好」即可，40 秒內沒有回覆就會自動取消這個提問。"
         )
     ]
@@ -3341,7 +3424,7 @@ def make_historical_order_with_offer(user_id, order):
     return [
         history_reply,
         (
-            "需要幫你生成一張訂購單，讓你直接傳給出版社業務員下單嗎？\n"
+            "需要幫你生成一份訂購單 PDF，讓你可以存下來 email 給出版社嗎？\n"
             "回覆「要」或「好」即可，40 秒內沒有回覆就會自動取消這個提問。"
         )
     ]
@@ -4965,6 +5048,123 @@ def orders_have_same_core_data(actual_order, expected_order):
 
 
 # =========================================================
+# 訂購單 PDF
+#
+# 拆成兩層：generate_purchase_order_pdf() 只管畫 PDF；
+# build_purchase_order_reply() 決定怎麼交付（目前只有下載連結）。
+# 之後要加「機器人直接寄信」，改 build_purchase_order_reply() 就好，
+# 不用動這裡的排版邏輯。詳見檔案最上面的說明區塊。
+# =========================================================
+CJK_FONT_NAME = "MHei-Light"
+pdfmetrics.registerFont(UnicodeCIDFont(CJK_FONT_NAME))
+
+
+def generate_purchase_order_pdf(offer):
+    """把訂購單內容畫成 A5（約 A4 一半）大小的 PDF，回傳 (token, path)；
+    失敗回傳 (None, None)。"""
+    token = uuid.uuid4().hex
+    path = os.path.join(PURCHASE_ORDER_DIR, f"{token}.pdf")
+
+    date_str = datetime.now().strftime("%Y/%m/%d")
+    school = str(offer.get("school", "") or "")
+    publisher = str(offer.get("publisher", "") or "")
+    book = str(offer.get("book", "") or "")
+    classes = offer.get("classes", [])
+
+    doc = SimpleDocTemplate(
+        path, pagesize=A5,
+        topMargin=14 * mm, bottomMargin=14 * mm,
+        leftMargin=14 * mm, rightMargin=14 * mm
+    )
+
+    title_style = ParagraphStyle("title", fontName=CJK_FONT_NAME, fontSize=14, leading=20, spaceAfter=10)
+    base_style = ParagraphStyle("base", fontName=CJK_FONT_NAME, fontSize=10, leading=16)
+    small_style = ParagraphStyle("small", fontName=CJK_FONT_NAME, fontSize=9, leading=13)
+
+    elements = [
+        Paragraph("請協助幫忙下訂單", title_style),
+        Paragraph("訂購人：士林大漢", base_style),
+        Paragraph(f"日期：{date_str}", base_style),
+        Paragraph(f"學校：{school}", base_style),
+        Paragraph(f"出版社：{publisher}", base_style),
+        Spacer(1, 8),
+    ]
+
+    table_data = [["書名", "班級", "數量"]]
+    for item in classes:
+        class_name = str(item.get("class_name", "") or "")
+        students = int(item.get("students", 0) or 0)
+        table_data.append([book, class_name, f"{students}本"])
+
+    table = Table(table_data, colWidths=[62 * mm, 22 * mm, 22 * mm])
+    table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), CJK_FONT_NAME),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
+        ("ALIGN", (2, 0), (2, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 10))
+    elements.append(Paragraph("備註：麻煩教用貨單集中", small_style))
+    elements.append(Paragraph(f"外箱備註：{school}", small_style))
+    elements.append(Spacer(1, 10))
+    elements.append(Paragraph("以上訂單　麻煩幫我處理", base_style))
+    elements.append(Paragraph("感謝！！！", base_style))
+
+    try:
+        doc.build(elements)
+    except Exception as error:
+        logger.error(f"purchase order pdf build error: {error}")
+        return None, None
+
+    return token, path
+
+
+def _purchase_order_ttl_display():
+    ttl_days = PURCHASE_ORDER_LINK_TTL_SECONDS / 86400
+    if ttl_days >= 1 and float(ttl_days).is_integer():
+        return f"{int(ttl_days)} 天"
+    ttl_hours = PURCHASE_ORDER_LINK_TTL_SECONDS / 3600
+    return f"{int(ttl_hours)} 小時"
+
+
+def build_purchase_order_reply(offer):
+    """
+    產生 PDF 後決定怎麼交付。目前只有 "link" 模式：給下載連結，
+    使用者自己存檔後手動 email 給出版社。
+
+    之後要新增「機器人直接寄信給出版社」時：
+    1. 需要一份「出版社 -> email」對照表（建議另開 Google 試算表分頁，
+       Apps Script 加一個 action="lookup_publisher_email" 供這裡查表）。
+    2. 需要 SMTP 寄件帳密（建議申請專用 email 帳號，不要用私人信箱），
+       放在環境變數，不要寫死在程式碼裡。
+    3. 寫一個 send_purchase_order_email(offer, pdf_path) 函式負責寄信，
+       在下面 PURCHASE_ORDER_DELIVERY_MODE == "email" 分支呼叫它；
+       寄信成功才回傳「已寄出」訊息，失敗要 fallback 回連結模式，
+       避免使用者誤以為已經寄出去了。
+    """
+    token, path = generate_purchase_order_pdf(offer)
+    if not token:
+        return "❌ 訂購單 PDF 產生失敗，請稍後再試一次。"
+
+    if PURCHASE_ORDER_DELIVERY_MODE == "email":
+        # TODO：尚未實作，見上方函式說明。目前先 fallback 回連結模式。
+        logger.warning("email delivery mode not implemented yet, falling back to link")
+
+    base_url = (PUBLIC_BASE_URL or request.url_root).rstrip("/")
+    download_url = f"{base_url}/purchase-order/{token}.pdf"
+
+    return (
+        "📄 訂購單 PDF 已經產生好了\n\n"
+        f"{download_url}\n\n"
+        "點開後存到手機/電腦，再用信箱 App 把這個 PDF 附加上去 email 給出版社。\n"
+        f"這個連結 {_purchase_order_ttl_display()}內有效，過期要回來重新產生一次。"
+    )
+
+
+# =========================================================
 # LeBron 固定人設層
 # =========================================================
 def add_lebron_flavor(message):
@@ -4982,6 +5182,9 @@ def add_lebron_flavor(message):
         return body
 
     if body.startswith("請協助幫忙下訂單"):
+        return body
+
+    if body.startswith("📄 訂購單 PDF 已經產生好了"):
         return body
 
     compact = re.sub(r"\s+", "", body)
