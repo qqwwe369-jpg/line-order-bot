@@ -94,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-17-order-class-edit-v32"
+APP_VERSION = "2026-09-17-order-class-edit-v33"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -635,7 +635,7 @@ def callback():
         try:
             reply_message = add_lebron_flavor(handle_message(user_id, user_text))
         except Exception as error:
-            logger.error(f"handle_message error: {error}")
+            logger.exception(f"handle_message error: {error}")
             reply_message = FIXED_FALLBACK_MESSAGE
 
         handle_elapsed = time.perf_counter() - request_started
@@ -2814,35 +2814,55 @@ def handle_pending_order_edit(user_id, text):
             refresh_order_total(order)
             return make_order_confirmation(order)
 
-    # 一次列出多個班級名稱＋取消／不要（例如「國一丁己戊甲庚取消」）。
-    # 只有在整句「扣掉取消詞之後」完全由已知班級名稱組成時才觸發，
-    # 避免跟書名、其他句子誤判。
+    # 一次取消一個或多個班級。
+    # 支援：
+    #   國一丁取消
+    #   取消國一丁
+    #   國一丁國一己取消
+    #   國一丁己戊甲庚取消
+    #   取消國一丁己戊甲庚
+    #
+    # v32 的問題：雖然已經寫了 _expand_class_shorthand()，
+    # 但這裡實際上沒有呼叫它，所以「國一丁己戊甲庚」無法展開。
     remove_verbs = ("取消", "不要", "刪除", "刪掉", "拿掉", "移除")
-    matched_verb = next(
-        (v for v in remove_verbs if text.endswith(v) and text != v), None
-    )
-    if matched_verb and class_names:
-        remaining = text[: -len(matched_verb)]
-        found = []
-        for name in class_names:  # class_names 已依長度由長到短排序，避免子字串誤判
-            while name and name in remaining:
-                remaining = remaining.replace(name, "", 1)
-                found.append(name)
-        if found and not remaining.strip():
+    matched_verb = None
+    remaining = ""
+
+    for verb in remove_verbs:
+        if text.endswith(verb) and text != verb:
+            matched_verb = verb
+            remaining = text[:-len(verb)].strip()
+            break
+        if text.startswith(verb) and text != verb:
+            matched_verb = verb
+            remaining = text[len(verb):].strip()
+            break
+
+    if matched_verb and class_names and remaining:
+        found = _expand_class_shorthand(remaining, class_names)
+
+        if found:
             unique_found = unique_list(found)
-            missing = [name for name in unique_found if not find_order_class(order, name)]
+            missing = [
+                name for name in unique_found
+                if not find_order_class(order, name)
+            ]
             if missing:
                 return "⚠️ 目前訂單裡沒有 " + "、".join(missing) + "。"
-            if len(order["classes"]) <= len(unique_found):
+
+            if len(order.get("classes", [])) <= len(unique_found):
                 return (
                     "⚠️ 這樣會把訂單裡所有班級都取消。\n"
                     "如果要取消整張訂單，請直接輸入「取消」。"
                 )
+
+            remove_set = set(unique_found)
             order["classes"] = [
-                item for item in order["classes"]
-                if str(item["class_name"]) not in unique_found
+                item for item in order.get("classes", [])
+                if str(item.get("class_name", "")) not in remove_set
             ]
             refresh_order_total(order)
+
             return (
                 "✅ 已取消：" + "、".join(unique_found) + "\n\n"
                 + make_order_confirmation(order)
