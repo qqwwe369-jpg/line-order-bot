@@ -94,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-16-purchase-order-pdf-v31"
+APP_VERSION = "2026-09-17-order-class-edit-v32"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -445,6 +445,21 @@ def _verify_line_signature(body_bytes, signature_header):
 
 
 def _hydrate_session(user_id):
+    """
+    把這個 user_id 的對話狀態，從 SQLite 同步回這個 worker 的記憶體。
+
+    關鍵：這裡必須是「同步」而不是「疊加」——資料庫裡沒有的欄位，
+    本地端也要清掉。Render 常常會開多個 gunicorn worker（多個獨立
+    process），同一個使用者連續兩則訊息完全可能被分派到不同 worker
+    處理。如果某個 worker 在早幾則訊息時，本地暫存過一份還沒填完的
+    訂書草稿（例如 order_flow_context），之後這筆草稿在「另一個」
+    worker 上被正常完成、清掉、寫回資料庫，這個 worker 本地那份舊
+    草稿並不會自動消失。如果下一則訊息又剛好分派回這個 worker，
+    若 hydrate 只會「加」不會「減」，就會誤用這份早已過期的舊草稿，
+    導致使用者明明已經完成訂書、要修改班級，卻被誤判成還在輸入書名
+    這類詭異行為。所以這裡明確地：資料庫有的欄位覆蓋本地，資料庫
+    沒有的欄位，本地也要用 pop 清掉，確保跟資料庫保持一致。
+    """
     conn = _state_db()
     try:
         row = conn.execute(
@@ -456,21 +471,23 @@ def _hydrate_session(user_id):
     finally:
         conn.close()
 
-    if not row or not row[0]:
-        return
-
-    try:
-        data = json.loads(row[0])
-    except Exception as e:
-        logger.error(f"session hydrate decode error: {e}")
-        return
-
-    if not isinstance(data, dict):
-        return
+    data = {}
+    if row and row[0]:
+        try:
+            parsed = json.loads(row[0])
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception as e:
+            logger.error(f"session hydrate decode error: {e}")
+            # 解碼失敗時不清空本地狀態，避免因為單次暫時性錯誤
+            # 就把使用者手上還在進行的流程整個洗掉。
+            return
 
     for key, target_dict in _SESSION_DICTS.items():
         if key in data:
             target_dict[user_id] = data[key]
+        else:
+            target_dict.pop(user_id, None)
 
 
 def _persist_session(user_id):
@@ -803,6 +820,15 @@ def _route_message(user_id, user_text):
             fuzzy_reply = handle_name_confirmation(user_id, text)
             if fuzzy_reply is not None:
                 return fuzzy_reply
+
+        # 已經產生「訂購確認」後，使用者下一句若是在修改班級，
+        # 必須優先交給 pending order edit。不能再送回 handle_order_flow，
+        # 否則像「國一丁取消」「國一丁己戊甲庚取消」會被誤當成書名。
+        if user_id in pending_orders:
+            pending_reply = handle_pending_order_edit(user_id, text)
+            if pending_reply is not None:
+                return pending_reply
+
         escape_reply = _guided_mode_escape_reply(user_id, text)
         if escape_reply is not None:
             return escape_reply
@@ -2709,6 +2735,45 @@ def _pending_order_class_pattern(class_names):
     return "|".join(alternatives)
 
 
+def _expand_class_shorthand(remaining, class_names):
+    """
+    把「取消詞」拿掉之後剩下的文字，展開成一份完整班級名稱清單。
+    支援兩種寫法：
+    1. 完整班級名稱直接串在一起：例如「國一丁國一己」。
+    2. 省略共同字首的簡寫：例如班級是「國一丁／國一己／國一戊」，
+       使用者常會直接打「國一丁己戊」，只打一次「國一」。
+    只要能把 remaining 完全解析、沒有殘留對不上的字元，才會回傳結果；
+    有任何解析不了的部分就回傳 None，交給呼叫端走其他既有邏輯或回覆
+    看不懂。
+    """
+    # 1. 完整班級名稱直接比對。
+    working = remaining
+    found = []
+    for name in class_names:
+        while name and name in working:
+            working = working.replace(name, "", 1)
+            found.append(name)
+    if found and not working.strip():
+        return found
+
+    # 2. 省略共同字首的簡寫：以「班級名稱去掉最後一個字」當共同字首，
+    #    比對 remaining 開頭是否吻合，吻合的話後面每個字各自對應一個班級。
+    prefixes = {}
+    for name in class_names:
+        if len(name) >= 2:
+            prefixes.setdefault(name[:-1], set()).add(name[-1])
+
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        if not remaining.startswith(prefix):
+            continue
+        suffix_chars = prefixes[prefix]
+        rest = remaining[len(prefix):]
+        if rest and all(ch in suffix_chars for ch in rest):
+            return [prefix + ch for ch in rest]
+
+    return None
+
+
 def handle_pending_order_edit(user_id, text):
     order = pending_orders[user_id]
     context = conversation_context.get(user_id, {})
@@ -2748,6 +2813,40 @@ def handle_pending_order_edit(user_id, text):
             ]
             refresh_order_total(order)
             return make_order_confirmation(order)
+
+    # 一次列出多個班級名稱＋取消／不要（例如「國一丁己戊甲庚取消」）。
+    # 只有在整句「扣掉取消詞之後」完全由已知班級名稱組成時才觸發，
+    # 避免跟書名、其他句子誤判。
+    remove_verbs = ("取消", "不要", "刪除", "刪掉", "拿掉", "移除")
+    matched_verb = next(
+        (v for v in remove_verbs if text.endswith(v) and text != v), None
+    )
+    if matched_verb and class_names:
+        remaining = text[: -len(matched_verb)]
+        found = []
+        for name in class_names:  # class_names 已依長度由長到短排序，避免子字串誤判
+            while name and name in remaining:
+                remaining = remaining.replace(name, "", 1)
+                found.append(name)
+        if found and not remaining.strip():
+            unique_found = unique_list(found)
+            missing = [name for name in unique_found if not find_order_class(order, name)]
+            if missing:
+                return "⚠️ 目前訂單裡沒有 " + "、".join(missing) + "。"
+            if len(order["classes"]) <= len(unique_found):
+                return (
+                    "⚠️ 這樣會把訂單裡所有班級都取消。\n"
+                    "如果要取消整張訂單，請直接輸入「取消」。"
+                )
+            order["classes"] = [
+                item for item in order["classes"]
+                if str(item["class_name"]) not in unique_found
+            ]
+            refresh_order_total(order)
+            return (
+                "✅ 已取消：" + "、".join(unique_found) + "\n\n"
+                + make_order_confirmation(order)
+            )
 
     m = re.fullmatch(rf"(?:不要|刪除|刪掉|拿掉|移除)\s*({class_pattern})", text)
     if not m:
