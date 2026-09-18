@@ -94,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-smart-order-v37"
+APP_VERSION = "2026-09-19-smart-order-v38-final"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1738,8 +1738,12 @@ def handle_class_teacher_query(query):
     if query.get("subject"):
         lines.extend([f"科目：{query['subject']}", ""])
 
-    for item in sorted(found, key=lambda x: (",".join(x["subjects"]), x["teacher"])):
-        subject_text = "、".join(item["subjects"]) if item["subjects"] else "科目未標示"
+    for item in sorted(found, key=lambda x: (
+        min([subject_sort_key(s)[0] for s in x["subjects"]] or [999]),
+        x["teacher"]
+    )):
+        sorted_subjects = sorted(item["subjects"], key=subject_sort_key)
+        subject_text = "、".join(sorted_subjects) if sorted_subjects else "科目未標示"
         lines.append(f"• {subject_text}：{item['teacher']}")
 
     lines.extend(["", f"👨‍🏫 共找到 {len(found)} 位老師"])
@@ -2304,6 +2308,25 @@ def validate_order_book_input(user_id, raw_text, draft):
     else:
         value, score = "", 0.0
 
+    # v38：若第一名高度可信且明顯領先，直接採用正式書名，
+    # 例如「段考王英文3」→「段考王英語(3)」，不必再多選一次。
+    if value and score >= 0.64:
+        second_score = float(candidates[1].get("score", 0) or 0) if len(candidates) > 1 else 0.0
+        if len(candidates) == 1 or (score - second_score) >= 0.12:
+            draft["book"] = value
+            candidate_publisher = str(first.get("publisher", "") or "").strip()
+            if candidate_publisher:
+                draft["publisher"] = candidate_publisher
+            pending_name_confirmations.pop(user_id, None)
+            order_flow_context[user_id] = draft
+
+            if draft.get("teacher") and draft.get("book"):
+                result = build_order_from_draft(user_id, draft)
+                if user_id in pending_orders:
+                    order_flow_context.pop(user_id, None)
+                return result
+            return make_order_guide_reply(draft)
+
     db_options = []
     if value and score >= 0.52:
         threshold = max(0.52, score - 0.08)
@@ -2376,6 +2399,28 @@ def handle_order_flow(user_id, text):
         }
         return make_order_guide_reply(order_flow_context[user_id])
 
+    # v38：明確「某老師要訂書」但尚未提供書名，直接建立訂書狀態，
+    # 不把整句誤當出版社，也不必交給 AI。
+    if user_id not in order_flow_context and ("訂書" in clean or "下單" in clean):
+        teacher_guess, school_guess = extract_teacher_and_school(clean)
+        if teacher_guess:
+            remainder = str(clean)
+            remainder = remainder.replace(str(teacher_guess), "")
+            remainder = re.sub(r"老師", "", remainder)
+            remainder = re.sub(r"(?:要|想要|幫我|麻煩|請|那邊|這邊|的|訂書|下單|但我忘記書名了|忘記書名了|忘記書名|書名忘了)", "", remainder)
+            remainder = re.sub(r"[，,。.!！?？\s]+", "", remainder)
+            if not remainder:
+                guided_mode[user_id] = "order_flow"
+                draft0 = {
+                    "teacher": "",
+                    "school": school_guess or "",
+                    "classes": [],
+                    "publisher": "",
+                    "book": ""
+                }
+                order_flow_context[user_id] = draft0
+                return validate_order_teacher_input(user_id, teacher_guess, draft0)
+
     draft = order_flow_context.get(user_id, {
         "teacher": "",
         "school": "",
@@ -2392,24 +2437,27 @@ def handle_order_flow(user_id, text):
         if not draft.get("teacher"):
             return ("⚠️ 我沒有讀到上一個老師候選。\n\n"
                     "請重新輸入老師姓名，我會重新找一次；找到後再回覆「確認」。")
-        if draft.get("teacher") and not draft.get("publisher"):
-            return "請告訴我是哪一家出版社？"
-        if draft.get("teacher") and draft.get("publisher") and not draft.get("book"):
+        if draft.get("teacher") and not draft.get("book"):
             return "請告訴我要訂哪一本書？"
+        if draft.get("teacher") and draft.get("book") and not draft.get("publisher"):
+            return "這本書目前無法從資料庫確認出版社，請告訴我出版社。"
 
     if user_id in order_flow_context and not draft.get("teacher"):
         return validate_order_teacher_input(user_id, clean, draft)
 
-    if user_id in order_flow_context and draft.get("teacher") and not draft.get("publisher"):
-        return validate_order_publisher_input(user_id, clean, draft)
+    # v38：知道老師後先收「書名」。書名若存在資料庫，直接自動帶出版社，
+    # 不再要求使用者先知道出版社。
+    if user_id in order_flow_context and draft.get("teacher") and not draft.get("book"):
+        return validate_order_book_input(user_id, clean, draft)
 
+    # 只有「使用原本輸入」且資料庫真的無法帶出出版社時，才追問出版社。
     if (
         user_id in order_flow_context
         and draft.get("teacher")
-        and draft.get("publisher")
-        and not draft.get("book")
+        and draft.get("book")
+        and not draft.get("publisher")
     ):
-        return validate_order_book_input(user_id, clean, draft)
+        return validate_order_publisher_input(user_id, clean, draft)
 
     parsed = parse_order_message(clean)
 
@@ -2489,10 +2537,10 @@ def make_order_guide_reply(draft):
 
     if not draft.get("teacher"):
         lines.append("請告訴我是哪一位老師？")
-    elif not draft.get("publisher"):
-        lines.append("請告訴我出版社；如果你先知道書名，也可以直接輸入書名。")
     elif not draft.get("book"):
         lines.append("請告訴我要訂哪一本書？")
+    elif not draft.get("publisher"):
+        lines.append("這本書目前無法從資料庫確認出版社，請告訴我出版社。")
 
     return "\n".join(lines)
 
@@ -2760,6 +2808,8 @@ def build_order_from_draft(user_id, draft):
         order_flow_context[user_id] = draft
         pending_name_confirmations.pop(user_id, None)
         return FIXED_FALLBACK_MESSAGE
+
+    selected = sort_class_items(selected)
 
     order = {
         "teacher": teacher,
@@ -3400,13 +3450,57 @@ def unique_list(items):
     return result
 
 
+_SUBJECT_ORDER = {
+    "國文": 10, "英文": 20, "英語": 20, "數學": 30,
+    "自然": 40, "生物": 41, "理化": 42, "地科": 43, "地球科學": 43,
+    "社會": 50, "歷史": 51, "地理": 52, "公民": 53,
+}
+_CLASS_LETTER_ORDER = {c: i for i, c in enumerate("甲乙丙丁戊己庚辛壬癸", start=1)}
+
+
+def subject_sort_key(value):
+    s = str(value or "").strip()
+    return (_SUBJECT_ORDER.get(s, 999), s)
+
+
+def class_sort_key(value):
+    s = str(value or "").strip()
+
+    # 純數字班：701、702、703... 自然數字排序。
+    if re.fullmatch(r"\d+", s):
+        return (0, int(s), 0, s)
+
+    # 國一甲 / 國二乙 / 國三丙
+    grade_map = {"國一": 1, "七年級": 1, "國二": 2, "八年級": 2, "國三": 3, "九年級": 3,
+                 "高一": 4, "高二": 5, "高三": 6}
+    for label, grade in grade_map.items():
+        if s.startswith(label):
+            tail = s[len(label):].replace("班", "").strip()
+            if tail in _CLASS_LETTER_ORDER:
+                return (1, grade, _CLASS_LETTER_ORDER[tail], s)
+            if tail.isdigit():
+                return (1, grade, int(tail), s)
+            return (1, grade, 999, s)
+
+    # 一般「甲班、乙班」。
+    tail = s.replace("班", "").strip()
+    if tail in _CLASS_LETTER_ORDER:
+        return (2, 0, _CLASS_LETTER_ORDER[tail], s)
+
+    return (9, 999, 999, s)
+
+
+def sort_class_items(items):
+    return sorted(list(items or []), key=lambda x: class_sort_key(x.get("class_name", "")))
+
+
 # =========================================================
 # 新訂單確認／修改
 # =========================================================
 def make_order_confirmation(order):
     class_lines = [
         f"{item['class_name']}：{int(item['students'])}本"
-        for item in order.get("classes", [])
+        for item in sort_class_items(order.get("classes", []))
     ]
 
     return (
@@ -5198,18 +5292,22 @@ def _apply_smart_school_order(user_id, data, source_label="口語"):
         "book": str(data.get("book", "") or "").strip(),
     }
 
-    # AI 只提供線索；老師若有輸入，仍先交給既有資料庫精準/模糊機制。
+    # AI 只提供線索；老師仍要交給既有資料庫正規化。
     order_flow_context[user_id] = draft
     guided_mode[user_id] = "order_flow"
 
     if not draft["teacher"]:
         return f"📷 {source_label}內容已收到。\\n\\n我還缺老師姓名，請直接告訴我是哪一位老師？"
-    if not draft["publisher"]:
-        return make_order_guide_reply(draft)
-    if not draft["book"]:
-        return make_order_guide_reply(draft)
 
-    # 有足夠欄位後仍走原本 build_order_from_draft，班級/人數/書名都由既有資料庫流程核對。
+    # 資訊不完整時先把老師 canonicalize，例如「張建國老師」→「張建國」，
+    # 並取得學校/班級；接著只追問缺少的書名。
+    if not draft["book"]:
+        raw_teacher = draft["teacher"]
+        draft["teacher"] = ""
+        order_flow_context[user_id] = draft
+        return validate_order_teacher_input(user_id, raw_teacher, draft)
+
+    # 有足夠欄位後仍走原本 build_order_from_draft；出版社可由書籍資料庫自動帶出。
     result = build_order_from_draft(user_id, draft)
     if user_id in pending_orders:
         order_flow_context.pop(user_id, None)
@@ -6203,16 +6301,18 @@ def copy_classes(classes):
             if single_subject:
                 subjects = list(subjects or []) + [single_subject]
 
+            normalized_subjects = unique_list(
+                [str(s or "").strip() for s in subjects if str(s or "").strip()]
+            )
+            normalized_subjects = sorted(normalized_subjects, key=subject_sort_key)
             result.append({
                 "class_name": str(item.get("class_name", "")),
                 "students": int(item.get("students", 0) or 0),
-                "subjects": unique_list(
-                    [str(s or "").strip() for s in subjects if str(s or "").strip()]
-                )
+                "subjects": normalized_subjects
             })
         except Exception:
             continue
-    return result
+    return sort_class_items(result)
 
 
 def calculate_total(classes):
