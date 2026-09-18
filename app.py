@@ -94,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-17-order-safe-write-v34"
+APP_VERSION = "2026-09-19-smart-order-v35"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -234,6 +234,12 @@ CHANNEL_SECRET = (
     or os.environ.get("CHANNEL_SECRET")
 )
 GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
+
+# 智慧理解層：只有原本規則接不住、或收到圖片時才使用。
+# 沒有設定 OPENAI_API_KEY 時，原本所有功能仍照常運作。
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini").strip()
+AI_TIMEOUT_SECONDS = float(os.environ.get("AI_TIMEOUT_SECONDS", "12"))
 
 for _env_name, _env_value in [
     ("LINE_CHANNEL_ACCESS_TOKEN / CHANNEL_ACCESS_TOKEN", CHANNEL_ACCESS_TOKEN),
@@ -618,7 +624,8 @@ def callback():
             continue
 
         message = event.get("message", {})
-        if message.get("type") != "text":
+        message_type = str(message.get("type", "") or "")
+        if message_type not in {"text", "image"}:
             continue
 
         message_id = str(message.get("id", "") or "")
@@ -626,15 +633,20 @@ def callback():
             logger.warning(f"偵測到 LINE 重送事件，略過重複處理 message_id={message_id}")
             continue
 
-        user_text = str(message.get("text", "")).strip()[:MAX_USER_TEXT_LENGTH]
         reply_token = event.get("replyToken")
-
         source = event.get("source", {})
         user_id = source.get("userId", "unknown")
+        user_text = (
+            str(message.get("text", "")).strip()[:MAX_USER_TEXT_LENGTH]
+            if message_type == "text" else "[圖片訂單]"
+        )
 
         request_started = time.perf_counter()
         try:
-            reply_message = add_lebron_flavor(handle_message(user_id, user_text))
+            if message_type == "image":
+                reply_message = add_lebron_flavor(handle_image_message(user_id, message_id))
+            else:
+                reply_message = add_lebron_flavor(handle_message(user_id, user_text))
         except Exception as error:
             logger.exception(f"handle_message error: {error}")
             reply_message = FIXED_FALLBACK_MESSAGE
@@ -768,8 +780,8 @@ def _route_message(user_id, user_text):
         guided_mode[user_id] = "teacher_lookup"
         return (
             "👨‍🏫 老師查詢\n\n"
-            "請直接輸入老師姓名，或輸入「學校＋年級＋科目」查詢該科老師。\n"
-            f"例如：{random.choice(NBA_PLAYERS)}、華興七年級歷史老師\n\n"
+            "請直接輸入老師姓名，或用「學校＋年級＋科目／學校＋班級」查老師。\n"
+            f"例如：{random.choice(NBA_PLAYERS)}、華興七年級歷史老師、天母701老師\n\n"
             "如果有同音字或打錯一個字，我會先幫你找最接近的老師。"
         )
 
@@ -1128,6 +1140,11 @@ def _route_message(user_id, user_text):
     if is_ai_writing_request(text):
         return FIXED_FALLBACK_MESSAGE
 
+    # 14.4 學校＋指定班級老師：例如「天母701老師」「華興國一甲老師」。
+    class_teacher_query = parse_class_teacher_query(text)
+    if class_teacher_query:
+        return handle_class_teacher_query(class_teacher_query)
+
     # 14.5 學校＋年級＋科目老師：直接查老師班級資料庫。
     subject_teacher_query = parse_subject_teacher_query(text)
     if subject_teacher_query:
@@ -1201,7 +1218,14 @@ def _route_message(user_id, user_text):
     if order_reply is not None:
         return order_reply
 
-    # 20. 其他內容：固定卡關訊息，不再交給 AI
+    # 19.5 智慧理解最後容錯：
+    # 原本所有固定功能、guided_mode、資料庫規則都已經先跑完。
+    # AI 只能在這裡協助理解「原本接不住的訂書口語」，不能搶走既有功能。
+    smart_reply = handle_smart_order_fallback(user_id, text)
+    if smart_reply is not None:
+        return smart_reply
+
+    # 20. 其他內容：仍維持固定卡關訊息
     return FIXED_FALLBACK_MESSAGE
 
 
@@ -1218,6 +1242,11 @@ def _guided_mode_escape_reply(user_id, text):
     只有真的比對得上既有格式時才會跳出；比對不上的話回傳
     None，維持原本引導模式的提示與行為不變。
     """
+    class_query = parse_class_teacher_query(text)
+    if class_query:
+        guided_mode.pop(user_id, None)
+        return handle_class_teacher_query(class_query)
+
     subject_query = parse_subject_teacher_query(text)
     if subject_query:
         guided_mode.pop(user_id, None)
@@ -1260,6 +1289,7 @@ def get_main_menu_reply():
         "📚 補習班訂書 → 輸入「補習班訂書」\n"
         "👨‍🏫 查個別老師 → 例如「謝明清有幾個班」\n"
         "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
+        "👨‍🏫 查班級老師 → 例如「天母701老師」\n"
         "📖 要查版本 → 輸入「查版本」\n"
         "📅 要查訂單 → 輸入「查訂單」\n"
         "📊 要查人數 → 例如「天母七年級人數」\n"
@@ -1547,6 +1577,132 @@ def finish_teacher_lookup(user_id,item):
     guided_mode.pop(user_id,None)
     return reply
 
+
+def _normalize_class_lookup_name(value):
+    clean = re.sub(r"[\s班]+", "", str(value or ""))
+    # 701/702... 保持原樣
+    if re.fullmatch(r"\d{3}", clean):
+        return clean
+    # 國一甲/七甲 等文字班名保持資料庫常用形式
+    return clean
+
+
+def parse_class_teacher_query(text):
+    """學校＋班級 → 查這個班有哪些老師；可再加科目縮小範圍。"""
+    clean = re.sub(r"[，,。.!！?？：:\s]+", "", str(text or ""))
+    if not any(k in clean for k in ["老師", "誰教", "誰上", "任課"]):
+        return None
+
+    school = extract_school_name(clean)
+    if not school:
+        return None
+
+    subject_aliases = [
+        ("地球科學", "地科"), ("英語", "英文"), ("英文", "英文"),
+        ("國文", "國文"), ("數學", "數學"), ("自然", "自然"),
+        ("生物", "生物"), ("理化", "理化"), ("地科", "地科"),
+        ("社會", "社會"), ("歷史", "歷史"), ("地理", "地理"), ("公民", "公民"),
+    ]
+    subject = ""
+    for alias, canonical in subject_aliases:
+        if alias in clean:
+            subject = canonical
+            break
+
+    # 數字班：701、802、903...
+    m = re.search(r"(?<!\d)([789]\d{2})(?:班)?(?!\d)", clean)
+    class_name = m.group(1) if m else ""
+
+    # 中文班：國一甲、國二信、高一愛、七年甲、七甲...
+    if not class_name:
+        patterns = [
+            r"((?:國[一二三]|高[一二三])(?:年級)?[甲乙丙丁戊己庚辛壬癸信望愛慧忠孝仁和]{1,3})(?:班)?",
+            r"((?:七|八|九)(?:年級)?[甲乙丙丁戊己庚辛壬癸信望愛慧忠孝仁和]{1,3})(?:班)?",
+        ]
+        for pattern in patterns:
+            m = re.search(pattern, clean)
+            if m:
+                class_name = m.group(1)
+                break
+
+    if not class_name:
+        return None
+
+    return {
+        "school": school,
+        "class_name": _normalize_class_lookup_name(class_name),
+        "subject": subject,
+    }
+
+
+def _class_name_equivalent(a, b):
+    def norm(v):
+        v = re.sub(r"[\s班]+", "", str(v or ""))
+        aliases = {
+            "七年級": "國一", "七年": "國一", "七": "國一",
+            "八年級": "國二", "八年": "國二", "八": "國二",
+            "九年級": "國三", "九年": "國三", "九": "國三",
+        }
+        for old, new in aliases.items():
+            if v.startswith(old) and not re.fullmatch(r"\d{3}", v):
+                v = new + v[len(old):]
+                break
+        return v
+    return norm(a) == norm(b)
+
+
+def handle_class_teacher_query(query):
+    # lookup_teacher_matches 原本就能以 school 篩選並回傳老師＋班級。
+    matches = lookup_teacher_matches("", school=query["school"])
+    if not matches:
+        return (
+            "⚠️ 查不到這個學校的老師資料。\n\n"
+            f"學校：{query['school']}\n班級：{query['class_name']}"
+        )
+
+    found = []
+    for item in matches:
+        for c in item.get("classes", []):
+            if not _class_name_equivalent(c.get("class_name", ""), query["class_name"]):
+                continue
+            subjects = unique_list(c.get("subjects", []))
+            if query.get("subject") and not _subject_matches(subjects, query["subject"]):
+                continue
+            found.append({
+                "teacher": str(item.get("teacher", "")).strip(),
+                "subjects": subjects,
+                "students": int(c.get("students", 0) or 0),
+                "class_name": str(c.get("class_name", "")).strip(),
+            })
+
+    if not found:
+        return (
+            "⚠️ 查不到符合條件的班級老師資料。\n\n"
+            f"學校：{query['school']}\n班級：{query['class_name']}"
+            + (f"\n科目：{query['subject']}" if query.get("subject") else "")
+        )
+
+    # 同一老師同一班只顯示一次
+    dedup = {}
+    for item in found:
+        key = (item["teacher"], tuple(item["subjects"]))
+        dedup[key] = item
+    found = list(dedup.values())
+
+    display_class = found[0].get("class_name") or query["class_name"]
+    lines = [f"👨‍🏫 {query['school']}｜{display_class}班 老師", ""]
+    if query.get("subject"):
+        lines.append(f"科目：{query['subject']}")
+        lines.append("")
+
+    for item in sorted(found, key=lambda x: (",".join(x["subjects"]), x["teacher"])):
+        subject_text = "、".join(item["subjects"]) if item["subjects"] else "科目未標示"
+        lines.append(f"• {subject_text}：{item['teacher']}")
+
+    lines.extend(["", f"👨‍🏫 共找到 {len(found)} 位老師"])
+    return "\n".join(lines)
+
+
 def parse_subject_teacher_query(text):
     clean = re.sub(r"[，,。.!！?？：:\s]+", "", str(text or ""))
     if "老師" not in clean and "誰教" not in clean and "誰上" not in clean:
@@ -1675,6 +1831,11 @@ def handle_subject_teacher_query(query):
 
 
 def handle_guided_teacher_lookup(user_id,text):
+    class_query = parse_class_teacher_query(text)
+    if class_query:
+        reply = handle_class_teacher_query(class_query)
+        return reply + "\n\n我還在「查老師」模式，可以繼續查下一個班級或老師，或打「主選單」離開。"
+
     subject_query = parse_subject_teacher_query(text)
     if subject_query:
         reply = handle_subject_teacher_query(subject_query)
@@ -1716,20 +1877,37 @@ def is_greeting_request(text):
     return False
 
 
-def get_greeting_reply():
-    player = random.choice(NBA_PLAYERS)
-    return (
-        "嗨嗨～我是大漢訂書小幫手 📚\n"
-        "今天想幹嘛，直接跟我說就行，我馬上上場！\n\n"
-        f"👨‍🏫 想查個別老師 → 例如「{player}有幾個班」\n"
-        "👨‍🏫 想查各科老師 → 例如「華興七年級歷史老師」\n"
-        "📊 想查人數 → 例如「天母七年級人數」\n"
-        "📚 想訂書 → 打「我要訂書」\n"
-        "📖 想查版本 → 打「查版本」\n"
-        "📅 想查訂單 → 打「查訂單」\n\n"
-        "想看完整功能表，打「有什麼功能」就好～"
-    )
+def _pick_players(count=3):
+    pool = list(NBA_PLAYERS)
+    random.shuffle(pool)
+    while len(pool) < count:
+        pool.extend(NBA_PLAYERS)
+    return pool[:count]
 
+
+def get_greeting_reply():
+    p1, p2, p3 = _pick_players(3)
+    return (
+        "📚 大漢訂書小幫手\n\n"
+        "嗨！今天要處理什麼？直接跟我說就可以 🏀\n\n"
+        "📚 學校訂書\n"
+        "• 輸入「我要訂書」→ 我會一步一步帶你完成\n"
+        f"• 也可以直接說：「{p1}老師701、703訂國一數學講義」\n\n"
+        "🏫 補習班訂書\n"
+        "• 輸入「補習班訂書」→ 我會一步一步帶你完成\n"
+        "• 也可以直接說：「大大補習班康軒國文講義20本」\n\n"
+        "👨‍🏫 查老師\n"
+        f"• 個別老師：「{p2}有幾個班」\n"
+        "• 年級科目：「華興七年級歷史老師」\n"
+        "• 指定班級：「天母701老師」\n\n"
+        "📖 查版本 →「華興七年級英文版本」\n"
+        "📅 查訂單 →「查001」或「查昨天訂單」\n"
+        "📊 查人數 →「天母七年級人數」\n"
+        f"📦 其他訂單 →「天母{p3}老師書面紙20張」\n"
+        "📷 照片訂書 → 直接傳訂單照片，我會先整理給你確認\n\n"
+        "不用完全照範例格式；原本的引導模式也都保留。\n"
+        "想看完整功能表，輸入「有什麼功能」。"
+    )
 
 def is_help_request(text):
     compact = re.sub(r"\s+", "", str(text or "").lower())
@@ -1745,22 +1923,28 @@ def is_help_request(text):
 
 
 def get_help_reply():
-    player = random.choice(NBA_PLAYERS)
+    p1, p2, p3 = _pick_players(3)
     return (
-        "📚 大漢訂書小幫手\n\n"
-        "請告訴我你要使用哪一個功能：\n\n"
-        "📚 要訂書 → 輸入「我要訂書」\n"
-        "📚 補習班訂書 → 輸入「補習班訂書」\n"
-        f"👨‍🏫 查個別老師 → 例如「{player}有幾個班」\n"
-        "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
-        "📖 要查版本 → 輸入「查版本」\n"
-        "📅 要查訂單 → 輸入「查訂單」\n"
-        "📊 要查人數 → 例如「天母七年級人數」\n"
-        "📦 其他訂單 → 輸入「其他訂單」\n"
-        "📊 今日訂單統計 → 輸入「統計」\n\n"
-        "進入功能後，我會一步一步引導你完成。"
+        "📚 大漢訂書小幫手｜功能\n\n"
+        "📚 學校訂書\n"
+        "• 輸入「我要訂書」使用原本一步一步模式\n"
+        f"• 或直接說：「{p1}老師701、703訂國一數學講義」\n\n"
+        "🏫 補習班訂書\n"
+        "• 輸入「補習班訂書」使用原本一步一步模式\n"
+        "• 或直接說：「大大補習班康軒國文講義20本」\n\n"
+        "👨‍🏫 查老師\n"
+        f"• 個別老師：「{p2}有幾個班」\n"
+        "• 年級＋科目：「華興七年級歷史老師」\n"
+        "• 學校＋班級：「天母701老師」\n"
+        "• 也可問：「華興國一甲老師」「天母701數學老師」\n\n"
+        "📖 查版本 →「查版本」或直接說學校／年級／科目\n"
+        "📅 查訂單 →「查訂單」「查001」「昨天訂單」\n"
+        "📊 查人數 →「查人數」或「天母七年級人數」\n"
+        f"📦 其他訂單 →「天母{p3}老師書面紙20張」\n"
+        "📊 今日統計 →「統計」\n"
+        "📷 照片訂書 → 直接傳圖片，我會先辨識再讓你確認\n\n"
+        "原本固定指令永遠優先；只有原本規則接不住時，才會使用智慧理解協助。"
     )
-
 
 # =========================================================
 # 訂書流程
@@ -4852,6 +5036,217 @@ def is_ai_writing_request(text):
 def extract_referenced_order_number(text):
     m = re.search(r"(?:訂單)?\s*(\d{3})", text)
     return normalize_order_number(m.group(1)) if m else None
+
+
+
+# =========================================================
+# 智慧理解層（最後一道容錯，不取代原本規則）
+# =========================================================
+def _openai_json(messages, max_output_tokens=700):
+    if not OPENAI_API_KEY:
+        return None
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "temperature": 0,
+        "max_completion_tokens": max_output_tokens,
+    }
+    try:
+        response = HTTP.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers, json=payload, timeout=AI_TIMEOUT_SECONDS
+        )
+        if response.status_code != 200:
+            logger.warning("AI parse failed status=%s body=%s", response.status_code, response.text[:300])
+            return None
+        content = response.json()["choices"][0]["message"]["content"]
+        return json.loads(content)
+    except Exception as error:
+        logger.warning("AI parse error: %s", error)
+        return None
+
+
+def _smart_order_system_prompt():
+    return """你是訂書資料抽取器，不是聊天機器人。
+只輸出 JSON。不能自行補不存在的資料；不確定就留空。
+intent 只能是 school_order、cram_order、unknown。
+school_order 欄位：
+{"intent":"school_order","school":"","teacher":"","publisher":"","book":"","classes":[]}
+classes 只放班級名稱字串，例如 ["701","703"] 或 ["國一甲","國一乙"]。
+cram_order 欄位：
+{"intent":"cram_order","cram_school":"","items":[{"publisher":"","book":"","quantity":0}]}
+只有使用者明確表達訂書/下單/要某本書時才判定訂單。
+不要把查老師、查版本、查訂單、查人數、確認、取消判成訂書。"""
+
+
+def smart_parse_order_text(text):
+    if not OPENAI_API_KEY:
+        return None
+    return _openai_json([
+        {"role": "system", "content": _smart_order_system_prompt()},
+        {"role": "user", "content": str(text or "")[:1000]},
+    ])
+
+
+def _download_line_image(message_id):
+    if not CHANNEL_ACCESS_TOKEN or not message_id:
+        return None
+    try:
+        r = HTTP.get(
+            f"https://api-data.line.me/v2/bot/message/{message_id}/content",
+            headers={"Authorization": "Bearer " + CHANNEL_ACCESS_TOKEN},
+            timeout=12,
+        )
+        if r.status_code == 200 and r.content:
+            return r.content
+        logger.warning("LINE image download failed status=%s", r.status_code)
+    except Exception as error:
+        logger.warning("LINE image download error: %s", error)
+    return None
+
+
+def smart_parse_order_image(image_bytes):
+    if not OPENAI_API_KEY or not image_bytes:
+        return None
+    data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
+    return _openai_json([
+        {"role": "system", "content": _smart_order_system_prompt() + """
+你現在會看到一張訂書相關圖片。請讀取圖片中實際可見的學校/補習班、老師、出版社、書名、班級、數量。
+看不清楚的欄位留空，絕對不要猜。"""},
+        {"role": "user", "content": [
+            {"type": "text", "text": "請把這張圖片整理成訂單 JSON。"},
+            {"type": "image_url", "image_url": {"url": data_url}},
+        ]},
+    ], max_output_tokens=900)
+
+
+def _apply_smart_school_order(user_id, data, source_label="口語"):
+    draft = {
+        "teacher": str(data.get("teacher", "") or "").strip(),
+        "school": str(data.get("school", "") or "").strip(),
+        "classes": unique_list([str(x or "").strip() for x in data.get("classes", []) if str(x or "").strip()]),
+        "publisher": str(data.get("publisher", "") or "").strip(),
+        "book": str(data.get("book", "") or "").strip(),
+    }
+
+    # AI 只提供線索；老師若有輸入，仍先交給既有資料庫精準/模糊機制。
+    order_flow_context[user_id] = draft
+    guided_mode[user_id] = "order_flow"
+
+    if not draft["teacher"]:
+        return f"📷 {source_label}內容已收到。\\n\\n我還缺老師姓名，請直接告訴我是哪一位老師？"
+    if not draft["publisher"]:
+        return make_order_guide_reply(draft)
+    if not draft["book"]:
+        return make_order_guide_reply(draft)
+
+    # 有足夠欄位後仍走原本 build_order_from_draft，班級/人數/書名都由既有資料庫流程核對。
+    result = build_order_from_draft(user_id, draft)
+    if user_id in pending_orders:
+        order_flow_context.pop(user_id, None)
+    return result
+
+
+def _apply_smart_cram_order(user_id, data, source_label="口語"):
+    cram_school = str(data.get("cram_school", "") or "").strip()
+    raw_items = data.get("items", []) if isinstance(data.get("items", []), list) else []
+    items = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        publisher = str(item.get("publisher", "") or "").strip()
+        book = str(item.get("book", "") or "").strip()
+        try:
+            quantity = int(item.get("quantity", 0) or 0)
+        except Exception:
+            quantity = 0
+        if publisher or book or quantity:
+            items.append({"publisher": publisher, "book": book, "quantity": quantity})
+
+    draft = _new_cram_draft()
+    draft["cram_school"] = cram_school
+    draft["items"] = [x for x in items if x["publisher"] and x["book"] and x["quantity"] > 0]
+    cram_order_context[user_id] = draft
+    guided_mode[user_id] = "cram_order_flow"
+
+    if not cram_school:
+        return f"📷 {source_label}內容已收到。\\n\\n我還缺補習班名稱，請告訴我是哪一間補習班？"
+
+    incomplete = next((x for x in items if not x["publisher"] or not x["book"] or x["quantity"] <= 0), None)
+    if incomplete:
+        if not incomplete["publisher"]:
+            return "我已經先記住能辨識的內容。\\n\\n還有一本缺出版社，請告訴我出版社。"
+        if not incomplete["book"]:
+            draft["current_publisher"] = incomplete["publisher"]
+            cram_order_context[user_id] = draft
+            return f"我已經先記住能辨識的內容。\\n\\n出版社：{incomplete['publisher']}\\n請告訴我書名。"
+        draft["current_publisher"] = incomplete["publisher"]
+        draft["current_book"] = incomplete["book"]
+        cram_order_context[user_id] = draft
+        return f"我已經先記住能辨識的內容。\\n\\n[{incomplete['publisher']}] {incomplete['book']} 要幾本？"
+
+    if not draft["items"]:
+        return "我有辨識到補習班，但還沒有足夠的書名／數量。\\n\\n請直接告訴我要訂的第一本書。"
+
+    return _enter_cram_confirm_stage(user_id, draft)
+
+
+def handle_smart_order_fallback(user_id, text):
+    """只有所有既有固定功能都接不住時才執行；失敗就回 None。"""
+    if not OPENAI_API_KEY:
+        return None
+    # 短固定詞、查詢詞不交給 AI，避免搶走既有功能。
+    compact = re.sub(r"\\s+", "", str(text or ""))
+    if compact in CONFIRM_WORDS or compact in EXIT_WORDS:
+        return None
+    data = smart_parse_order_text(text)
+    if not isinstance(data, dict):
+        return None
+    intent = data.get("intent")
+    if intent == "school_order":
+        return _apply_smart_school_order(user_id, data, "口語")
+    if intent == "cram_order":
+        return _apply_smart_cram_order(user_id, data, "口語")
+    return None
+
+
+def handle_image_message(user_id, message_id):
+    """圖片只做訂單辨識；永遠先確認，不直接寫 Google。"""
+    _start_request_budget()
+    lock = _get_user_lock(user_id)
+    with lock:
+        _hydrate_session(user_id)
+        try:
+            if not OPENAI_API_KEY:
+                return (
+                    "📷 我收到圖片了，但目前尚未啟用圖片智慧辨識。\\n\\n"
+                    "原本的文字訂書功能都可以正常使用。"
+                )
+            image_bytes = _download_line_image(message_id)
+            if not image_bytes:
+                return "⚠️ 圖片讀取失敗，請再傳一次。"
+            data = smart_parse_order_image(image_bytes)
+            if not isinstance(data, dict):
+                return (
+                    "⚠️ 這張圖片我目前沒辦法可靠整理成訂單。\\n\\n"
+                    "你可以再拍清楚一點，或直接用文字告訴我；原本流程不會被清掉。"
+                )
+            if data.get("intent") == "school_order":
+                return _apply_smart_school_order(user_id, data, "圖片")
+            if data.get("intent") == "cram_order":
+                return _apply_smart_cram_order(user_id, data, "圖片")
+            return (
+                "📷 我有收到圖片，但目前無法確認這是一張學校／補習班訂書內容。\\n\\n"
+                "請再傳清楚一點，或直接用文字告訴我。"
+            )
+        finally:
+            _persist_session(user_id)
 
 
 # =========================================================
