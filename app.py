@@ -94,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-smart-order-v35"
+APP_VERSION = "2026-09-19-smart-order-v36-book-first-fix"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -2135,6 +2135,31 @@ def validate_order_teacher_input(user_id, raw_text, draft):
         "我不會往下一步。請重新輸入老師姓名。"
     )
 
+def _looks_like_book_input_during_publisher_step(raw_text):
+    """
+    使用者在「出版社」這一步直接輸入書名時，不要把書名硬拿去比出版社。
+    常見書名會帶科目、冊次/年級、講義/評量等詞；這些情況直接轉交原本
+    validate_order_book_input()，保留「模糊候選＋都不是就用我打的」機制。
+    """
+    clean = clean_book_name(str(raw_text or "").strip())
+    compact = re.sub(r"[\s，,。.!！?？：:]+", "", clean)
+    if not compact:
+        return False
+
+    book_words = [
+        "講義", "評量", "教材", "複習", "測驗", "題本", "自修", "課本",
+        "習作", "學習單", "段考", "會考", "大滿貫", "百分百", "學習講義",
+        "國文", "英文", "英語", "數學", "自然", "生物", "理化", "地科",
+        "地球科學", "社會", "歷史", "地理", "公民"
+    ]
+    has_book_word = any(word in compact for word in book_words)
+    has_volume = bool(re.search(r"(?:[1-6]|[一二三四五六])(?:冊)?$", compact))
+    has_grade_number = bool(re.search(r"(?:國[一二三]|七|八|九|高[一二三])", compact))
+
+    # 出版社名稱通常很短；帶「科目/教材詞＋冊次」的內容高度像書名。
+    return has_book_word and (has_volume or has_grade_number or len(compact) >= 5)
+
+
 def validate_order_publisher_input(user_id, raw_text, draft):
     """
     訂書流程第二步：出版社。出版社清單很多、常常變動，不能寫死清單，
@@ -2146,6 +2171,13 @@ def validate_order_publisher_input(user_id, raw_text, draft):
     clean = normalize_order_typo(clean)
     if not clean:
         return "請輸入出版社名稱，例如：康軒、翰林、南一"
+
+    # v36：使用者不必死守「出版社→書名」順序。
+    # 如果這句明顯像書名（例如「段考王數學3」「學習講義英文1」），
+    # 直接走既有書名模糊比對。資料庫有候選就列候選；沒有候選也一定
+    # 保留「用我打的書名」選項，不再卡在「請重新輸入出版社」。
+    if _looks_like_book_input_during_publisher_step(clean):
+        return validate_order_book_input(user_id, clean, draft)
 
     candidates = lookup_fuzzy_candidates("publisher", clean)
     if not candidates:
@@ -2421,7 +2453,7 @@ def make_order_guide_reply(draft):
     if not draft.get("teacher"):
         lines.append("請告訴我是哪一位老師？")
     elif not draft.get("publisher"):
-        lines.append("請告訴我是哪一家出版社？")
+        lines.append("請告訴我出版社；如果你先知道書名，也可以直接輸入書名。")
     elif not draft.get("book"):
         lines.append("請告訴我要訂哪一本書？")
 
