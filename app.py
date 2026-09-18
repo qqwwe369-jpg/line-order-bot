@@ -132,6 +132,7 @@ _google_read_cache = {}
 
 _GOOGLE_CACHE_TTLS = {
     "list_schools": 600,
+    "list_cram_schools": 600,
     "lookup_teacher_matches": 1800,
     "lookup_teacher": 1800,
     "lookup_school_classes": 300,
@@ -730,16 +731,21 @@ def _route_message(user_id, user_text):
             if starts_new_task:
                 pending_receipt_offers.pop(user_id, None)
             elif _is_confirm_word(text) or text in {"要", "我要", "需要", "幫我生成", "生成", "生成訂購單"}:
-                taiwan_date = datetime.now().strftime("%Y/%m/%d")
-                note_text = f"已請業務下單｜{taiwan_date}"
-                note_ok = mark_order_note(offer.get("order_number", ""), note_text)
-                if not note_ok:
-                    # 使用者已經拿到訂購單，不再多塞一段錯誤文案；
-                    # 錯誤只記錄在 Render log，避免 LINE 畫面出現多餘警告。
-                    logger.warning(
-                        "set_order_note failed order=%s",
-                        offer.get("order_number", "")
-                    )
+                # 補習班訂單的 order_number 是另一個分頁自己的編號，
+                # 跟學校訂單分頁完全無關；set_order_note 是改學校訂單
+                # 分頁的備註欄，只有學校訂單才需要呼叫，補習班訂單呼叫
+                # 反而可能誤改到編號剛好相同的另一張學校訂單。
+                if offer.get("kind") != "cram":
+                    taiwan_date = datetime.now().strftime("%Y/%m/%d")
+                    note_text = f"已請業務下單｜{taiwan_date}"
+                    note_ok = mark_order_note(offer.get("order_number", ""), note_text)
+                    if not note_ok:
+                        # 使用者已經拿到訂購單，不再多塞一段錯誤文案；
+                        # 錯誤只記錄在 Render log，避免 LINE 畫面出現多餘警告。
+                        logger.warning(
+                            "set_order_note failed order=%s",
+                            offer.get("order_number", "")
+                        )
                 pending_receipt_offers.pop(user_id, None)
                 return build_purchase_order_reply(offer)
             elif text in RECEIPT_DECLINE_WORDS:
@@ -775,6 +781,16 @@ def _route_message(user_id, user_text):
             "publisher": "", "book": ""
         }
         return make_order_guide_reply(order_flow_context[user_id])
+
+    if is_cram_order_mode_start(text):
+        clear_task_states_for_new_mode(user_id)
+        guided_mode[user_id] = "cram_order_flow"
+        cram_order_context[user_id] = _new_cram_draft()
+        return (
+            "📚 補習班訂書\n\n"
+            "請告訴我是哪一間補習班？\n"
+            "例如：大大補習班、學思達補習班"
+        )
 
     if is_version_mode_start(text):
         clear_task_states_for_new_mode(user_id)
@@ -909,6 +925,22 @@ def _route_message(user_id, user_text):
                 return escape_reply
 
         return handle_guided_other_order(user_id, text)
+
+    if current_mode == "cram_order_flow":
+        if _is_exit_word(text):
+            cram_order_context.pop(user_id, None)
+            pending_name_confirmations.pop(user_id, None)
+            guided_mode.pop(user_id, None)
+            return get_main_menu_reply()
+
+        if user_id in pending_name_confirmations:
+            fuzzy_reply = handle_name_confirmation(user_id, text)
+            if fuzzy_reply is not None:
+                return fuzzy_reply
+
+        cram_reply = handle_cram_order_flow(user_id, text)
+        if cram_reply is not None:
+            return cram_reply
 
     # 0.9 名稱候選確認一定要早於訂書流程。
     if user_id in pending_name_confirmations:
@@ -1225,6 +1257,7 @@ def get_main_menu_reply():
         "🔄 已重新開始\n\n"
         "請告訴我你要使用哪一個功能：\n\n"
         "📚 要訂書 → 輸入「我要訂書」\n"
+        "📚 補習班訂書 → 輸入「補習班訂書」\n"
         "👨‍🏫 查個別老師 → 例如「謝明清有幾個班」\n"
         "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
         "📖 要查版本 → 輸入「查版本」\n"
@@ -1495,6 +1528,7 @@ def clear_task_states_for_new_mode(user_id):
     pending_name_confirmations.pop(user_id, None)
     pending_teacher_corrections.pop(user_id, None)
     teacher_lookup_context.pop(user_id, None)
+    cram_order_context.pop(user_id, None)
 
 def normalize_teacher_name_input(text):
     clean=re.sub(r"[，,。.!！?？\s]+","",str(text or ""))
@@ -1716,6 +1750,7 @@ def get_help_reply():
         "📚 大漢訂書小幫手\n\n"
         "請告訴我你要使用哪一個功能：\n\n"
         "📚 要訂書 → 輸入「我要訂書」\n"
+        "📚 補習班訂書 → 輸入「補習班訂書」\n"
         f"👨‍🏫 查個別老師 → 例如「{player}有幾個班」\n"
         "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
         "📖 要查版本 → 輸入「查版本」\n"
@@ -2495,6 +2530,480 @@ def build_order_from_draft(user_id, draft):
     teacher_lookup_context[user_id] = context
 
     return make_order_confirmation(order)
+
+
+# =========================================================
+# 補習班訂書流程（2026-09 新增）
+#
+# 跟學校訂書完全不同的資料形狀：學校訂單是「一本書、很多班級各要
+# 幾本」；補習班訂單是「一間補習班、很多本不同的書，每本通常只訂
+# 一兩本」。硬塞進學校那套（老師→出版社→書名→班級）流程會很不合理，
+# 所以這裡另外開一個 guided_mode = "cram_order_flow"，用「一次登記
+# 一本書」的清單累加方式收單：
+#   1. 先問補習班名稱（比照老師姓名做模糊比對，防打錯字）
+#   2. 每一本書依序問：出版社 → 書名 → 數量，登記完一本就問要不要
+#      繼續加下一本
+#   3. 使用者回覆「好了」之類的詞結束收書，進入確認畫面
+#   4. 確認畫面可以刪除某一項、或直接輸入下一本的出版社繼續加，
+#      回覆「確認」才真正寫入 Google
+#
+# 書名比對沿用跟學校訂單一樣的「都不是，就用我打的書名」機制
+# （見 validate_order_book_input 的說明），補習班訂的書本來就更雜，
+# 資料庫不可能全部先登記好。
+#
+# 【Google Apps Script 端需要新增的 action，app.py 這裡已經假設
+# 它們存在，實際串接前記得先在 Apps Script 加上對應處理】：
+#   - list_cram_schools            → 回傳已知補習班名單（給精準比對／
+#                                     模糊比對來源），格式比照
+#                                     list_schools：{success, schools:[...]}
+#   - lookup_fuzzy_candidates      → kind 多支援 "cram_school" 一種，
+#                                     從補習班名單裡模糊比對
+#   - create_cram_order            → 寫入一筆補習班訂單，見
+#                                     write_cram_order_to_google() 的
+#                                     payload 格式與預期回傳格式
+# =========================================================
+cram_order_context = {}
+_SESSION_DICTS["cram_order_context"] = cram_order_context
+
+cram_school_catalog_cache = {"schools": [], "expires_at": 0}
+
+CRAM_FINISH_WORDS = {
+    "好了", "不用了", "這樣就好", "完成", "沒有了", "訂好了", "夠了", "可以了", "這樣就可以了"
+}
+
+
+def is_cram_order_mode_start(text):
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+    return compact in {
+        "補習班訂書", "我要幫補習班訂書", "幫補習班訂書", "補習班訂購",
+        "我要補習班訂書", "補習班要訂書", "補習班訂單", "新增補習班訂單",
+        "我要訂補習班的書"
+    }
+
+
+def _new_cram_draft():
+    return {
+        "cram_school": "",
+        "items": [],
+        "current_publisher": "",
+        "current_book": "",
+        "confirming": False,
+    }
+
+
+def get_cram_school_catalog(force_refresh=False):
+    now = time.time()
+
+    if (
+        not force_refresh
+        and cram_school_catalog_cache.get("schools")
+        and now < float(cram_school_catalog_cache.get("expires_at", 0) or 0)
+    ):
+        return list(cram_school_catalog_cache["schools"])
+
+    result = google_post({"action": "list_cram_schools"}, timeout=10, retries=1)
+
+    schools = []
+    if result and result.get("success"):
+        schools = unique_list([
+            str(item or "").strip()
+            for item in result.get("schools", [])
+            if str(item or "").strip()
+        ])
+
+    if schools:
+        cram_school_catalog_cache["schools"] = schools
+        cram_school_catalog_cache["expires_at"] = now + 600
+        return list(schools)
+
+    return list(cram_school_catalog_cache.get("schools", []))
+
+
+def cram_next_item_prompt(draft, first=False):
+    if first:
+        return (
+            f"補習班：{draft.get('cram_school', '')}\n\n"
+            "請告訴我第一本書的出版社？"
+        )
+    return "請告訴我下一本書的出版社？\n如果訂好了，請回覆「好了」。"
+
+
+def make_cram_items_progress_reply(draft):
+    lines = ["🧾 目前已登記："]
+    for i, item in enumerate(draft.get("items", []), start=1):
+        lines.append(
+            f"{i}. [{item.get('publisher', '')}] {item.get('book', '')}"
+            f" x{int(item.get('quantity', 0) or 0)}本"
+        )
+    return "\n".join(lines)
+
+
+def make_cram_order_confirmation(draft):
+    items = draft.get("items", [])
+    total = sum(int(item.get("quantity", 0) or 0) for item in items)
+
+    lines = ["📚 補習班訂購確認", "", f"補習班：{draft.get('cram_school', '')}", ""]
+    for i, item in enumerate(items, start=1):
+        lines.append(
+            f"{i}. [{item.get('publisher', '')}] {item.get('book', '')}"
+            f" x{int(item.get('quantity', 0) or 0)}本"
+        )
+    lines.append("")
+    lines.append(f"共 {len(items)} 種書，總數量：{total}本")
+    lines.append("")
+    lines.append("確認無誤請回覆「確認」。")
+    lines.append("若要調整，可以說「刪除2」刪掉第2項，或直接告訴我下一本的出版社繼續加。")
+    return "\n".join(lines)
+
+
+def validate_cram_school_input(user_id, raw_text, draft):
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
+    if not clean:
+        return "請告訴我補習班名稱。"
+
+    catalog = get_cram_school_catalog()
+    if clean in catalog:
+        draft["cram_school"] = clean
+        pending_name_confirmations.pop(user_id, None)
+        cram_order_context[user_id] = draft
+        return cram_next_item_prompt(draft, first=True)
+
+    candidates = lookup_fuzzy_candidates("cram_school", clean)
+
+    if not candidates:
+        # 資料庫裡完全查不到，可能真的是第一次出現的新補習班。
+        pending_name_confirmations[user_id] = {
+            "field": "cram_school", "purpose": "cram_school",
+            "options": [{"value": clean, "raw": True}],
+            "original": clean
+        }
+        cram_order_context[user_id] = draft
+        return (
+            "⚠️ 補習班名單目前找不到符合的名稱。\n\n"
+            f"你輸入：{clean}\n\n"
+            "如果是新的補習班，回覆「確認」或「都不是」我就直接照你打的建立訂單。\n"
+            "如果是打錯字，請重新輸入正確名稱。"
+        )
+
+    first = candidates[0]
+    value = str(first.get("value", "") or "").strip()
+    score = float(first.get("score", 0) or 0)
+    second_score = float(candidates[1].get("score", 0) or 0) if len(candidates) > 1 else 0.0
+
+    if value == clean:
+        draft["cram_school"] = value
+        pending_name_confirmations.pop(user_id, None)
+        cram_order_context[user_id] = draft
+        return cram_next_item_prompt(draft, first=True)
+
+    # 高可信且明顯領先第二名：直接自動採用，不用多問一次。
+    if value and score >= 0.78 and (len(candidates) == 1 or score - second_score >= 0.12):
+        draft["cram_school"] = value
+        pending_name_confirmations.pop(user_id, None)
+        cram_order_context[user_id] = draft
+        return cram_next_item_prompt(draft, first=True)
+
+    options = []
+    if value and score >= 0.55:
+        threshold = max(0.55, score - 0.1)
+        seen = set()
+        for c in candidates[:3]:
+            c_value = str(c.get("value", "") or "").strip()
+            c_score = float(c.get("score", 0) or 0)
+            if not c_value or c_value in seen:
+                continue
+            if c_value != value and c_score < threshold:
+                continue
+            seen.add(c_value)
+            options.append({"value": c_value})
+
+    options.append({"value": clean, "raw": True})
+
+    pending_name_confirmations[user_id] = {
+        "field": "cram_school", "purpose": "cram_school",
+        "options": options, "original": clean
+    }
+    cram_order_context[user_id] = draft
+
+    raw_index = len(options)
+    lines = ["🔎 補習班名單裡找到接近的名稱。", "", f"你輸入：{clean}", ""]
+    for i, opt in enumerate(options[:-1], start=1):
+        lines.append(f"{i}. {opt['value']}")
+    lines.append(f"{raw_index}. 都不是，這是新的補習班，就用「{clean}」")
+    lines.append("")
+    lines.append("請回覆數字選擇；回覆「確認」等同選第 1 個；回覆「都不是」直接用你打的名稱。")
+    return "\n".join(lines)
+
+
+def validate_cram_item_publisher_input(user_id, raw_text, draft):
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
+    clean = normalize_order_typo(clean)
+    if not clean:
+        return "請告訴我這本書的出版社，例如：康軒、翰林、南一"
+
+    candidates = lookup_fuzzy_candidates("publisher", clean)
+    if not candidates:
+        return ("⚠️ 出版社資料庫目前找不到符合資料。\n\n"
+                f"你輸入：{clean}\n\n"
+                "請重新輸入出版社名稱。")
+
+    first = candidates[0]
+    value = str(first.get("value", "") or "").strip()
+    score = float(first.get("score", 0) or 0)
+
+    if value == clean:
+        draft["current_publisher"] = value
+        pending_name_confirmations.pop(user_id, None)
+        cram_order_context[user_id] = draft
+        return "請告訴我書名？"
+
+    if value and score >= 0.52:
+        options = []
+        seen = set()
+        for c in candidates[:4]:
+            c_value = str(c.get("value", "") or "").strip()
+            c_score = float(c.get("score", 0) or 0)
+            if not c_value or c_value in seen:
+                continue
+            if c_value != value and c_score < 0.52:
+                continue
+            seen.add(c_value)
+            options.append({"value": c_value})
+            if len(options) >= 3:
+                break
+
+        pending_name_confirmations[user_id] = {
+            "field": "publisher", "purpose": "cram_publisher",
+            "options": options, "original": clean
+        }
+        cram_order_context[user_id] = draft
+
+        lines = ["🔎 出版社名稱可能有錯字，找到以下接近的候選。", "", f"你輸入：{clean}", ""]
+        for i, opt in enumerate(options, start=1):
+            lines.append(f"{i}. {opt['value']}")
+        lines.append("")
+        if len(options) > 1:
+            lines.append("請直接回覆數字（例如「1」）選擇要的那一家；回覆「確認」等同選第 1 個。")
+        else:
+            lines.append("是的請回覆「確認」。")
+        lines.append("如果都不是，請直接輸入正確出版社名稱，我會取消這個候選並重新查資料庫。")
+        return "\n".join(lines)
+
+    return ("⚠️ 出版社資料庫目前無法確認這個名稱。\n\n"
+            f"你輸入：{clean}\n\n請重新輸入出版社名稱。")
+
+
+def validate_cram_item_book_input(user_id, raw_text, draft):
+    query = clean_book_name(str(raw_text or "").strip())
+    query = re.sub(r"^(?:我要訂|要訂|訂)", "", query).strip()
+    if not query:
+        return "請輸入書名或書名關鍵字。"
+
+    publisher = str(draft.get("current_publisher") or "").strip()
+    candidates = lookup_book_candidates_enhanced(query, publisher=publisher)
+
+    if candidates:
+        first = candidates[0]
+        value = str(first.get("value", "") or "").strip()
+        score = float(first.get("score", 0) or 0)
+
+        if value == query:
+            draft["current_book"] = value
+            pending_name_confirmations.pop(user_id, None)
+            cram_order_context[user_id] = draft
+            return "這本要訂幾本？"
+    else:
+        value, score = "", 0.0
+
+    db_options = []
+    if value and score >= 0.52:
+        threshold = max(0.52, score - 0.08)
+        seen = set()
+        for c in candidates[:4]:
+            c_value = str(c.get("value", "") or "").strip()
+            c_score = float(c.get("score", 0) or 0)
+            if not c_value or c_value in seen:
+                continue
+            if c_value != value and c_score < threshold:
+                continue
+            seen.add(c_value)
+            db_options.append({
+                "value": c_value,
+                "publisher": str(c.get("publisher", "") or "")
+            })
+            if len(db_options) >= 3:
+                break
+
+    options = list(db_options)
+    options.append({"value": query, "publisher": "", "raw": True})
+
+    pending_name_confirmations[user_id] = {
+        "field": "book", "purpose": "cram_book",
+        "options": options, "original": query
+    }
+    cram_order_context[user_id] = draft
+
+    raw_index = len(options)
+    if db_options:
+        lines = ["🔎 我從書籍資料庫找到以下接近的書名。", "", f"你輸入：{query}", ""]
+        for i, opt in enumerate(db_options, start=1):
+            lines.append(f"{i}. {opt['value']}")
+        lines.append(f"{raw_index}. 都不是，就用我打的書名：{query}")
+        lines.append("")
+        lines.append(
+            "請直接回覆數字（例如「1」）選擇要的那一本；"
+            "回覆「確認」等同選第 1 個；回覆「都不是」直接用你打的書名。"
+        )
+    else:
+        lines = [
+            "⚠️ 書籍資料庫目前找不到符合的書名。", "",
+            f"你輸入：{query}", "",
+            f"{raw_index}. 就用我打的書名：{query}", "",
+            "如果這本書本來就沒登記在資料庫，回覆「確認」或「都不是」我就直接照你打的建立訂單。"
+        ]
+    lines.append("如果都不是，請直接輸入正確書名或更明確的關鍵字，我會重新查一次資料庫。")
+    return "\n".join(lines)
+
+
+def validate_cram_item_quantity_input(user_id, raw_text, draft):
+    m = re.fullmatch(r"(\d{1,4})\s*本?", str(raw_text or "").strip())
+    if not m:
+        return "請告訴我這本書要訂幾本？直接輸入數字就好，例如「2」。"
+
+    quantity = int(m.group(1))
+    if quantity <= 0:
+        return "數量要大於 0，請重新輸入。"
+
+    draft.setdefault("items", []).append({
+        "publisher": draft.get("current_publisher", ""),
+        "book": draft.get("current_book", ""),
+        "quantity": quantity,
+    })
+    draft["current_publisher"] = ""
+    draft["current_book"] = ""
+    cram_order_context[user_id] = draft
+
+    return (
+        make_cram_items_progress_reply(draft)
+        + "\n\n請告訴我下一本書的出版社？如果訂好了，請回覆「好了」。"
+    )
+
+
+def _enter_cram_confirm_stage(user_id, draft):
+    if not draft.get("items"):
+        return "⚠️ 你還沒有登記任何書，請先告訴我要訂的第一本書的出版社。"
+
+    draft["confirming"] = True
+    cram_order_context[user_id] = draft
+    return make_cram_order_confirmation(draft)
+
+
+def handle_cram_confirm_stage(user_id, clean, draft):
+    if _is_confirm_word(clean):
+        return confirm_cram_order(user_id)
+
+    m = re.fullmatch(r"(?:刪除|刪掉|移除|拿掉)\s*(\d{1,2})", clean)
+    if m:
+        index = int(m.group(1)) - 1
+        items = draft.get("items", [])
+        if 0 <= index < len(items):
+            removed = items.pop(index)
+            cram_order_context[user_id] = draft
+            removed_line = f"✅ 已刪除：[{removed.get('publisher', '')}] {removed.get('book', '')}\n\n"
+            if not items:
+                draft["confirming"] = False
+                cram_order_context[user_id] = draft
+                return removed_line + "目前清單是空的，請告訴我下一本要訂的出版社。"
+            return removed_line + make_cram_order_confirmation(draft)
+        return f"⚠️ 目前只有 1～{len(items)} 項，請輸入正確的編號。"
+
+    if clean in {"加", "繼續加", "再加一本", "加一本"}:
+        draft["confirming"] = False
+        cram_order_context[user_id] = draft
+        return cram_next_item_prompt(draft)
+
+    # 使用者直接輸入了出版社名稱想加下一本，不用先打「加」。
+    draft["confirming"] = False
+    cram_order_context[user_id] = draft
+    return validate_cram_item_publisher_input(user_id, clean, draft)
+
+
+def write_cram_order_to_google(draft):
+    result = google_post({
+        "action": "create_cram_order",
+        "cram_school": draft.get("cram_school", ""),
+        "items": draft.get("items", [])
+    }, timeout=15, retries=1)
+
+    if result and result.get("success") is True:
+        return True, str(result.get("order_number", "") or "")
+
+    return False, None
+
+
+def confirm_cram_order(user_id):
+    draft = cram_order_context.get(user_id)
+    if not draft or not draft.get("items"):
+        return "⚠️ 找不到尚未確認的補習班訂單，請重新輸入。"
+
+    success, order_number = write_cram_order_to_google(draft)
+    if not success:
+        return "❌ 補習班訂單寫入失敗，請稍後再試。"
+
+    items = [dict(item) for item in draft.get("items", [])]
+    cram_school = draft.get("cram_school", "")
+    total = sum(int(item.get("quantity", 0) or 0) for item in items)
+
+    cram_order_context.pop(user_id, None)
+    guided_mode.pop(user_id, None)
+    pending_name_confirmations.pop(user_id, None)
+
+    pending_receipt_offers[user_id] = {
+        "kind": "cram",
+        "order_number": order_number,
+        "cram_school": cram_school,
+        "items": items,
+        "created_at": time.time(),
+    }
+
+    return [
+        (
+            "✅ 補習班訂單已確認\n\n"
+            f"訂單編號：{order_number}\n"
+            f"補習班：{cram_school}\n"
+            f"共 {len(items)} 種書，總數量：{total}本\n"
+            "已成功寫入 Google 試算表。"
+        ),
+        (
+            "需要幫你生成一份訂購單 PDF，讓你可以存下來 email 給補習班或出版社嗎？\n"
+            "回覆「要」或「好」即可，40 秒內沒有回覆就會自動取消這個提問。"
+        )
+    ]
+
+
+def handle_cram_order_flow(user_id, text):
+    clean = normalize_order_typo(text)
+
+    draft = cram_order_context.get(user_id)
+    if draft is None:
+        draft = _new_cram_draft()
+        cram_order_context[user_id] = draft
+
+    if not draft.get("cram_school"):
+        return validate_cram_school_input(user_id, clean, draft)
+
+    if draft.get("confirming"):
+        return handle_cram_confirm_stage(user_id, clean, draft)
+
+    if not draft.get("current_publisher"):
+        if clean in CRAM_FINISH_WORDS:
+            return _enter_cram_confirm_stage(user_id, draft)
+        return validate_cram_item_publisher_input(user_id, clean, draft)
+
+    if not draft.get("current_book"):
+        return validate_cram_item_book_input(user_id, clean, draft)
+
+    return validate_cram_item_quantity_input(user_id, clean, draft)
 
 
 def normalize_order_typo(text):
@@ -4578,6 +5087,32 @@ def handle_name_confirmation(user_id, text):
 
             return "⚠️ 確認名稱後仍找不到唯一老師資料，請把學校名稱一起告訴我。"
 
+        if pending.get("purpose") == "cram_school":
+            draft = cram_order_context.get(user_id)
+            if not draft:
+                return "✅ 已確認名稱。請重新輸入剛才的補習班訂書內容。"
+            draft["cram_school"] = str(chosen.get("value", "") or "").strip()
+            cram_order_context[user_id] = draft
+            return cram_next_item_prompt(draft, first=True)
+
+        if pending.get("purpose") == "cram_publisher":
+            draft = cram_order_context.get(user_id)
+            if not draft:
+                return "✅ 已確認名稱。請重新輸入剛才的補習班訂書內容。"
+            draft["current_publisher"] = str(chosen.get("value", "") or "").strip()
+            cram_order_context[user_id] = draft
+            return "請告訴我書名？"
+
+        if pending.get("purpose") == "cram_book":
+            draft = cram_order_context.get(user_id)
+            if not draft:
+                return "✅ 已確認名稱。請重新輸入剛才的補習班訂書內容。"
+            draft["current_book"] = str(chosen.get("value", "") or "").strip()
+            if chosen.get("publisher"):
+                draft["current_publisher"] = str(chosen.get("publisher", "") or "").strip()
+            cram_order_context[user_id] = draft
+            return "這本要訂幾本？"
+
         draft = order_flow_context.get(user_id)
         if not draft:
             return "✅ 已確認名稱。請重新輸入剛才的訂書內容。"
@@ -4615,7 +5150,8 @@ def handle_name_confirmation(user_id, text):
             "teacher": "老師姓名",
             "book": "書名",
             "school": "學校名稱",
-            "publisher": "出版社名稱"
+            "publisher": "出版社名稱",
+            "cram_school": "補習班名稱"
         }.get(pending.get("field"), "名稱")
         return f"好，沒有採用。請重新輸入正確的{field_name}。"
 
@@ -4721,7 +5257,7 @@ def google_post(payload, timeout=10, retries=1):
 
             if action in {
                 "create_order", "update_order", "cancel_order", "set_order_note",
-                "create_other_order", "update_other_order"
+                "create_other_order", "update_other_order", "create_cram_order"
             } and isinstance(data, dict) and data.get("success"):
                 clear_google_read_cache()
 
@@ -5449,10 +5985,113 @@ def _purchase_order_ttl_display():
     return f"{int(ttl_hours)} 小時"
 
 
+def generate_cram_purchase_order_pdf(offer):
+    """
+    補習班版的訂購單 PDF：跟學校版共用同一顆印章跟同一套字型，
+    但資訊區塊沒有單一「出版社」欄位（每本書出版社可能不同），改成
+    品項表直接列「出版社／書名／數量」三欄。回傳 (token, path)；
+    失敗回傳 (None, None)。
+    """
+    if not _CJK_FONT_READY:
+        logger.error("cram purchase order pdf skipped: CJK font not registered")
+        return None, None
+
+    token = uuid.uuid4().hex
+    path = os.path.join(PURCHASE_ORDER_DIR, f"{token}.pdf")
+
+    date_str = datetime.now().strftime("%Y/%m/%d")
+    cram_school = str(offer.get("cram_school", "") or "")
+    items = offer.get("items", [])
+    total_qty = sum(int(item.get("quantity", 0) or 0) for item in items)
+
+    doc = SimpleDocTemplate(
+        path, pagesize=A5,
+        topMargin=13 * mm, bottomMargin=42 * mm,
+        leftMargin=14 * mm, rightMargin=14 * mm
+    )
+
+    title_style = ParagraphStyle(
+        "title", fontName=CJK_FONT_NAME, fontSize=17, leading=22,
+        alignment=1, spaceAfter=2
+    )
+    subtitle_style = ParagraphStyle(
+        "subtitle", fontName=CJK_FONT_NAME, fontSize=9, leading=13,
+        alignment=1, textColor=colors.grey, spaceAfter=10
+    )
+    label_style = ParagraphStyle("label", fontName=CJK_FONT_NAME, fontSize=10, leading=16)
+    small_style = ParagraphStyle(
+        "small", fontName=CJK_FONT_NAME, fontSize=8.5, leading=13, textColor=colors.grey
+    )
+
+    elements = [
+        Paragraph("訂　購　單", title_style),
+        Paragraph("請協助幫忙下訂單", subtitle_style),
+    ]
+
+    info_data = [
+        [f"訂購人：士林大漢", f"日期：{date_str}"],
+        [f"補習班：{cram_school}", ""],
+    ]
+    info_table = Table(info_data, colWidths=[48 * mm, 48 * mm])
+    info_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), CJK_FONT_NAME),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LINEBELOW", (0, -1), (-1, -1), 0.8, colors.black),
+    ]))
+    elements.append(info_table)
+    elements.append(Spacer(1, 10))
+
+    table_data = [["出版社", "書名", "數量"]]
+    for item in items:
+        table_data.append([
+            str(item.get("publisher", "") or ""),
+            str(item.get("book", "") or ""),
+            f"{int(item.get('quantity', 0) or 0)}本"
+        ])
+    table_data.append(["", "合計", f"{total_qty}本"])
+
+    table = Table(table_data, colWidths=[24 * mm, 60 * mm, 22 * mm])
+    table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), CJK_FONT_NAME),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("GRID", (0, 0), (-1, -2), 0.6, colors.HexColor("#999999")),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.black),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
+        ("ALIGN", (2, 0), (2, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    elements.append(table)
+    elements.append(Spacer(1, 12))
+
+    elements.append(Paragraph("以上訂單　麻煩幫我處理", label_style))
+    elements.append(Paragraph("感謝！！！", label_style))
+    elements.append(Spacer(1, 20))
+    elements.append(Paragraph("訂購人簽章：＿＿＿＿＿＿＿＿＿＿＿＿", small_style))
+
+    try:
+        doc.build(
+            elements,
+            onFirstPage=_draw_purchase_order_stamp,
+            onLaterPages=_draw_purchase_order_stamp
+        )
+    except Exception as error:
+        logger.error(f"cram purchase order pdf build error: {error}")
+        return None, None
+
+    return token, path
+
+
 def build_purchase_order_reply(offer):
     """
     產生 PDF 後決定怎麼交付。目前只有 "link" 模式：給下載連結，
-    使用者自己存檔後手動 email 給出版社。
+    使用者自己存檔後手動 email 給出版社／補習班。
+
+    offer 若帶 kind="cram"，走補習班版排版（generate_cram_purchase_order_pdf）；
+    否則走學校版（generate_purchase_order_pdf）。兩者共用同一顆印章。
 
     之後要新增「機器人直接寄信給出版社」時：
     1. 需要一份「出版社 -> email」對照表（建議另開 Google 試算表分頁，
@@ -5464,7 +6103,11 @@ def build_purchase_order_reply(offer):
        寄信成功才回傳「已寄出」訊息，失敗要 fallback 回連結模式，
        避免使用者誤以為已經寄出去了。
     """
-    token, path = generate_purchase_order_pdf(offer)
+    if offer.get("kind") == "cram":
+        token, path = generate_cram_purchase_order_pdf(offer)
+    else:
+        token, path = generate_purchase_order_pdf(offer)
+
     if not token:
         return "❌ 訂購單 PDF 產生失敗，請稍後再試一次。"
 
@@ -5475,10 +6118,12 @@ def build_purchase_order_reply(offer):
     base_url = (PUBLIC_BASE_URL or request.url_root).rstrip("/")
     download_url = f"{base_url}/purchase-order/{token}.pdf"
 
+    recipient = "出版社" if offer.get("kind") != "cram" else "補習班或出版社"
+
     return (
         "📄 訂購單 PDF 已經產生好了\n\n"
         f"{download_url}\n\n"
-        "點開後存到手機/電腦，再用信箱 App 把這個 PDF 附加上去 email 給出版社。\n"
+        f"點開後存到手機/電腦，再用信箱 App 把這個 PDF 附加上去 email 給{recipient}。\n"
         f"這個連結 {_purchase_order_ttl_display()}內有效，過期要回來重新產生一次。"
     )
 
