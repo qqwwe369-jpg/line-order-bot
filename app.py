@@ -1990,18 +1990,29 @@ def validate_order_book_input(user_id, raw_text, draft):
 
     publisher = str(draft.get("publisher") or "").strip()
     candidates = lookup_book_candidates_enhanced(query, publisher=publisher)
-    if not candidates:
-        return ("⚠️ 書籍資料庫找不到符合的書名。\n\n"
-                f"你輸入：{query}\n\n"
-                "老師／出版社資料已保留，我不會往下一步。請重新輸入書名或更明確的關鍵字。")
 
-    first = candidates[0]
-    value = str(first.get("value", "") or "").strip()
-    score = float(first.get("score", 0) or 0)
+    if candidates:
+        first = candidates[0]
+        value = str(first.get("value", "") or "").strip()
+        score = float(first.get("score", 0) or 0)
 
+        # 完全一樣，直接採用，不用多問。
+        if value == query:
+            draft["book"] = value
+            pending_name_confirmations.pop(user_id, None)
+            order_flow_context[user_id] = draft
+            if draft.get("teacher") and draft.get("book"):
+                result = build_order_from_draft(user_id, draft)
+                if user_id in pending_orders:
+                    order_flow_context.pop(user_id, None)
+                return result
+            return make_order_guide_reply(draft)
+    else:
+        value, score = "", 0.0
+
+    db_options = []
     if value and score >= 0.52:
         threshold = max(0.52, score - 0.08)
-        options = []
         seen = set()
         for c in candidates[:4]:
             c_value = str(c.get("value", "") or "").strip()
@@ -2013,37 +2024,47 @@ def validate_order_book_input(user_id, raw_text, draft):
                 continue
 
             seen.add(c_value)
-            options.append({
+            db_options.append({
                 "value": c_value,
                 "publisher": str(c.get("publisher", "") or "")
             })
 
-            if len(options) >= 3:
+            if len(db_options) >= 3:
                 break
 
-        pending_name_confirmations[user_id] = {
-            "field": "book", "purpose": "order_book",
-            "options": options,
-            "original": query
-        }
-        order_flow_context[user_id] = draft
+    # 不管資料庫有沒有找到接近的候選，最後都保留一個「都不是，直接用
+    # 我打的當書名」的選項——書籍資料庫不可能什麼書都事先登記好，
+    # 遇到資料庫裡真的沒有這本書時，還是要能直接照使用者輸入的繼續
+    # 往下訂，而不是卡在「查不到」死路。這個選項一律排在候選清單最後。
+    options = list(db_options)
+    options.append({"value": query, "publisher": "", "raw": True})
 
+    pending_name_confirmations[user_id] = {
+        "field": "book", "purpose": "order_book",
+        "options": options,
+        "original": query
+    }
+    order_flow_context[user_id] = draft
+
+    raw_index = len(options)
+
+    if db_options:
         lines = ["🔎 我從書籍資料庫找到以下接近的書名。", "", f"你輸入：{query}", ""]
-        for i, opt in enumerate(options, start=1):
+        for i, opt in enumerate(db_options, start=1):
             lines.append(f"{i}. {opt['value']}")
+        lines.append(f"{raw_index}. 都不是，就用我打的書名：{query}")
         lines.append("")
+        lines.append("請直接回覆數字（例如「1」）選擇要的那一本；回覆「確認」等同選第 1 個。")
+    else:
+        lines = [
+            "⚠️ 書籍資料庫目前找不到符合的書名。", "",
+            f"你輸入：{query}", "",
+            f"{raw_index}. 就用我打的書名：{query}", "",
+            f"如果這本書本來就沒登記在資料庫，回覆「確認」或「{raw_index}」我就直接照你打的建立訂單。"
+        ]
 
-        if len(options) > 1:
-            lines.append("請直接回覆數字（例如「1」）選擇要的那一本；回覆「確認」等同選第 1 個。")
-        else:
-            lines.append("是的請回覆「確認」。")
-
-        lines.append("如果都不是，請直接輸入正確書名或更明確的關鍵字，我會取消這個候選並重新查資料庫。")
-        return "\n".join(lines)
-
-    return ("⚠️ 我目前無法確認書名。\n\n"
-            f"你輸入：{query}\n\n"
-            "老師／出版社資料已保留，我不會往下一步。請再輸入一次完整書名或更明確的關鍵字。")
+    lines.append("如果都不是，請直接輸入正確書名或更明確的關鍵字，我會重新查一次資料庫。")
+    return "\n".join(lines)
 
 def handle_order_flow(user_id, text):
     clean = normalize_order_typo(text)
@@ -5256,10 +5277,63 @@ try:
 except Exception as error:
     logger.error(f"CJK font register failed ({_CJK_FONT_PATH}): {error}")
 
+# 仿印章設定：大漢書局的店章資訊，蓋在訂購單右下角，讓 PDF 看起來
+# 比較像正式單據，不是一張純白紙。可以透過環境變數覆蓋，之後店章
+# 內容有異動（例如換電話、換地址）不用改程式碼、重新部署即可。
+STAMP_COMPANY_NAME = os.environ.get("STAMP_COMPANY_NAME", "大漢書局")
+STAMP_PHONE = os.environ.get("STAMP_PHONE", "電話：(02) 2833-3838")
+STAMP_ADDRESS = os.environ.get("STAMP_ADDRESS", "台北市士林區美崙街96號")
+STAMP_COLOR = colors.Color(0.72, 0.06, 0.06)  # 印章紅
+
+
+def _draw_purchase_order_stamp(c, doc):
+    """
+    在頁面右下角畫一個仿印章的紅色戳記（雙框＋店名＋地址電話，
+    整體微微旋轉），讓 PDF 訂購單看起來比較像正式單據，而不是一張
+    只有幾行字的白紙。純用向量圖形畫出來，不需要另外準備印章圖檔。
+    """
+    if not _CJK_FONT_READY:
+        return
+
+    c.saveState()
+    page_width, _page_height = A5
+    stamp_width, stamp_height = 60 * mm, 26 * mm
+    x = page_width - stamp_width - 16 * mm
+    y = 18 * mm
+
+    c.translate(x + stamp_width / 2, y + stamp_height / 2)
+    c.rotate(-6)
+    c.translate(-stamp_width / 2, -stamp_height / 2)
+
+    c.setStrokeColor(STAMP_COLOR)
+    c.setFillColor(STAMP_COLOR)
+
+    # 外框＋內框，仿真實印章常見的雙線邊框。
+    c.setLineWidth(1.4)
+    c.roundRect(0, 0, stamp_width, stamp_height, 3 * mm, stroke=1, fill=0)
+    c.setLineWidth(0.6)
+    c.roundRect(
+        1.6 * mm, 1.6 * mm,
+        stamp_width - 3.2 * mm, stamp_height - 3.2 * mm,
+        2 * mm, stroke=1, fill=0
+    )
+
+    c.setFont(CJK_FONT_NAME, 13)
+    c.drawCentredString(stamp_width / 2, stamp_height - 9 * mm, STAMP_COMPANY_NAME)
+
+    c.setFont(CJK_FONT_NAME, 6.3)
+    c.drawCentredString(stamp_width / 2, stamp_height - 15.2 * mm, STAMP_ADDRESS)
+    c.drawCentredString(stamp_width / 2, stamp_height - 19.6 * mm, STAMP_PHONE)
+
+    c.restoreState()
+
 
 def generate_purchase_order_pdf(offer):
     """把訂購單內容畫成 A5（約 A4 一半）大小的 PDF，回傳 (token, path)；
-    失敗回傳 (None, None)。"""
+    失敗回傳 (None, None)。版面刻意抓真實訂購單的樣子：標題＋雙欄
+    資訊區＋品項表＋合計＋簽章欄，右下角再蓋一個仿印章的紅色戳記，
+    不追求完整正式格式，但至少讓出版社收到時一眼就看得出是正式單據。
+    """
     if not _CJK_FONT_READY:
         logger.error("purchase order pdf skipped: CJK font not registered")
         return None, None
@@ -5272,51 +5346,83 @@ def generate_purchase_order_pdf(offer):
     publisher = str(offer.get("publisher", "") or "")
     book = str(offer.get("book", "") or "")
     classes = offer.get("classes", [])
+    total_qty = sum(int(item.get("students", 0) or 0) for item in classes)
 
     doc = SimpleDocTemplate(
         path, pagesize=A5,
-        topMargin=14 * mm, bottomMargin=14 * mm,
+        topMargin=13 * mm, bottomMargin=42 * mm,
         leftMargin=14 * mm, rightMargin=14 * mm
     )
 
-    title_style = ParagraphStyle("title", fontName=CJK_FONT_NAME, fontSize=14, leading=20, spaceAfter=10)
-    base_style = ParagraphStyle("base", fontName=CJK_FONT_NAME, fontSize=10, leading=16)
-    small_style = ParagraphStyle("small", fontName=CJK_FONT_NAME, fontSize=9, leading=13)
+    title_style = ParagraphStyle(
+        "title", fontName=CJK_FONT_NAME, fontSize=17, leading=22,
+        alignment=1, spaceAfter=2
+    )
+    subtitle_style = ParagraphStyle(
+        "subtitle", fontName=CJK_FONT_NAME, fontSize=9, leading=13,
+        alignment=1, textColor=colors.grey, spaceAfter=10
+    )
+    label_style = ParagraphStyle("label", fontName=CJK_FONT_NAME, fontSize=10, leading=16)
+    small_style = ParagraphStyle(
+        "small", fontName=CJK_FONT_NAME, fontSize=8.5, leading=13, textColor=colors.grey
+    )
 
     elements = [
-        Paragraph("請協助幫忙下訂單", title_style),
-        Paragraph("訂購人：士林大漢", base_style),
-        Paragraph(f"日期：{date_str}", base_style),
-        Paragraph(f"學校：{school}", base_style),
-        Paragraph(f"出版社：{publisher}", base_style),
-        Spacer(1, 8),
+        Paragraph("訂　購　單", title_style),
+        Paragraph("請協助幫忙下訂單", subtitle_style),
     ]
+
+    info_data = [
+        [f"訂購人：士林大漢", f"日期：{date_str}"],
+        [f"學校：{school}", f"出版社：{publisher}"],
+    ]
+    info_table = Table(info_data, colWidths=[48 * mm, 48 * mm])
+    info_table.setStyle(TableStyle([
+        ("FONTNAME", (0, 0), (-1, -1), CJK_FONT_NAME),
+        ("FONTSIZE", (0, 0), (-1, -1), 10),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("LINEBELOW", (0, -1), (-1, -1), 0.8, colors.black),
+    ]))
+    elements.append(info_table)
+    elements.append(Spacer(1, 10))
 
     table_data = [["書名", "班級", "數量"]]
     for item in classes:
         class_name = str(item.get("class_name", "") or "")
         students = int(item.get("students", 0) or 0)
         table_data.append([book, class_name, f"{students}本"])
+    table_data.append(["", "合計", f"{total_qty}本"])
 
     table = Table(table_data, colWidths=[62 * mm, 22 * mm, 22 * mm])
     table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), CJK_FONT_NAME),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.whitesmoke),
-        ("ALIGN", (2, 0), (2, -1), "CENTER"),
+        ("FONTSIZE", (0, 0), (-1, -1), 9.5),
+        ("GRID", (0, 0), (-1, -2), 0.6, colors.HexColor("#999999")),
+        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.black),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
+        ("ALIGN", (1, 0), (2, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
     ]))
     elements.append(table)
+    elements.append(Spacer(1, 12))
+
+    elements.append(Paragraph("備註：麻煩教用貨單集中", label_style))
+    elements.append(Paragraph(f"外箱備註：{school}", label_style))
     elements.append(Spacer(1, 10))
-    elements.append(Paragraph("備註：麻煩教用貨單集中", small_style))
-    elements.append(Paragraph(f"外箱備註：{school}", small_style))
-    elements.append(Spacer(1, 10))
-    elements.append(Paragraph("以上訂單　麻煩幫我處理", base_style))
-    elements.append(Paragraph("感謝！！！", base_style))
+    elements.append(Paragraph("以上訂單　麻煩幫我處理", label_style))
+    elements.append(Paragraph("感謝！！！", label_style))
+    elements.append(Spacer(1, 20))
+    elements.append(Paragraph("訂購人簽章：＿＿＿＿＿＿＿＿＿＿＿＿", small_style))
 
     try:
-        doc.build(elements)
+        doc.build(
+            elements,
+            onFirstPage=_draw_purchase_order_stamp,
+            onLaterPages=_draw_purchase_order_stamp
+        )
     except Exception as error:
         logger.error(f"purchase order pdf build error: {error}")
         return None, None
