@@ -94,7 +94,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-smart-order-v36-book-first-fix"
+APP_VERSION = "2026-09-19-smart-order-v37"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1593,7 +1593,20 @@ def parse_class_teacher_query(text):
     if not any(k in clean for k in ["老師", "誰教", "誰上", "任課"]):
         return None
 
-    school = extract_school_name(clean)
+    # 常用學校先走本地別名，不必每次為了辨識「天母／華興／衛理」
+    # 先呼叫 GAS list_schools。其他學校仍保留原本 extract_school_name。
+    local_school_aliases = [
+        ("天母國中", "天母國中"), ("天母", "天母國中"),
+        ("華興中學", "華興中學"), ("華興", "華興中學"),
+        ("衛理女中", "衛理女中"), ("衛理", "衛理女中"),
+    ]
+    school = ""
+    for alias, canonical in local_school_aliases:
+        if alias in clean:
+            school = canonical
+            break
+    if not school:
+        school = extract_school_name(clean)
     if not school:
         return None
 
@@ -1652,12 +1665,44 @@ def _class_name_equivalent(a, b):
 
 
 def handle_class_teacher_query(query):
-    # lookup_teacher_matches 原本就能以 school 篩選並回傳老師＋班級。
-    matches = lookup_teacher_matches("", school=query["school"])
+    """
+    指定班級反查老師。這裡直接呼叫既有 lookup_teacher_matches action，
+    並區分「GAS 暫時逾時」和「真的查無資料」，避免 timeout 被誤報成查不到。
+    """
+    result = google_post({
+        "action": "lookup_teacher_matches",
+        "teacher": "",
+        "school": query["school"],
+        "grade": "",
+        "subject": query.get("subject", "")
+    }, timeout=9, retries=1)
+
+    if result is None:
+        return (
+            "⚠️ 老師資料庫暫時查詢失敗，請再試一次。\n\n"
+            f"學校：{query['school']}\n班級：{query['class_name']}"
+        )
+
+    if not result.get("success"):
+        return (
+            "⚠️ 老師資料庫暫時無法完成查詢，請再試一次。\n\n"
+            f"學校：{query['school']}\n班級：{query['class_name']}"
+        )
+
+    matches = []
+    for item in result.get("matches", []):
+        matches.append({
+            "school": str(item.get("school", "")).strip(),
+            "teacher": str(item.get("teacher", "")).strip(),
+            "subjects": unique_list(item.get("subjects", [])),
+            "classes": copy_classes(item.get("classes", []))
+        })
+
     if not matches:
         return (
-            "⚠️ 查不到這個學校的老師資料。\n\n"
+            "⚠️ 查不到符合條件的班級老師資料。\n\n"
             f"學校：{query['school']}\n班級：{query['class_name']}"
+            + (f"\n科目：{query['subject']}" if query.get("subject") else "")
         )
 
     found = []
@@ -1682,7 +1727,6 @@ def handle_class_teacher_query(query):
             + (f"\n科目：{query['subject']}" if query.get("subject") else "")
         )
 
-    # 同一老師同一班只顯示一次
     dedup = {}
     for item in found:
         key = (item["teacher"], tuple(item["subjects"]))
@@ -1692,8 +1736,7 @@ def handle_class_teacher_query(query):
     display_class = found[0].get("class_name") or query["class_name"]
     lines = [f"👨‍🏫 {query['school']}｜{display_class}班 老師", ""]
     if query.get("subject"):
-        lines.append(f"科目：{query['subject']}")
-        lines.append("")
+        lines.extend([f"科目：{query['subject']}", ""])
 
     for item in sorted(found, key=lambda x: (",".join(x["subjects"]), x["teacher"])):
         subject_text = "、".join(item["subjects"]) if item["subjects"] else "科目未標示"
@@ -2300,24 +2343,18 @@ def validate_order_book_input(user_id, raw_text, draft):
     raw_index = len(options)
 
     if db_options:
-        lines = ["🔎 我從書籍資料庫找到以下接近的書名。", "", f"你輸入：{query}", ""]
+        lines = ["🔎 找到接近的書名", "", f"你輸入：{query}", ""]
         for i, opt in enumerate(db_options, start=1):
             lines.append(f"{i}. {opt['value']}")
-        lines.append(f"{raw_index}. 都不是，就用我打的書名：{query}")
-        lines.append("")
-        lines.append(
-            f"請直接回覆數字（例如「1」）選擇要的那一本；"
-            "回覆「確認」等同選第 1 個；回覆「都不是」直接用你打的書名。"
-        )
+        lines.append(f"{raw_index}. 使用原本輸入：{query}")
+        lines.extend(["", f"請回覆 1～{raw_index}"])
     else:
         lines = [
-            "⚠️ 書籍資料庫目前找不到符合的書名。", "",
+            "🔎 資料庫沒有相符書名", "",
             f"你輸入：{query}", "",
-            f"{raw_index}. 就用我打的書名：{query}", "",
-            "如果這本書本來就沒登記在資料庫，回覆「確認」或「都不是」我就直接照你打的建立訂單。"
+            f"1. 使用原本輸入：{query}", "",
+            "請回覆 1"
         ]
-
-    lines.append("如果都不是，請直接輸入正確書名或更明確的關鍵字，我會重新查一次資料庫。")
     return "\n".join(lines)
 
 def handle_order_flow(user_id, text):
@@ -3061,23 +3098,18 @@ def validate_cram_item_book_input(user_id, raw_text, draft):
 
     raw_index = len(options)
     if db_options:
-        lines = ["🔎 我從書籍資料庫找到以下接近的書名。", "", f"你輸入：{query}", ""]
+        lines = ["🔎 找到接近的書名", "", f"你輸入：{query}", ""]
         for i, opt in enumerate(db_options, start=1):
             lines.append(f"{i}. {opt['value']}")
-        lines.append(f"{raw_index}. 都不是，就用我打的書名：{query}")
-        lines.append("")
-        lines.append(
-            "請直接回覆數字（例如「1」）選擇要的那一本；"
-            "回覆「確認」等同選第 1 個；回覆「都不是」直接用你打的書名。"
-        )
+        lines.append(f"{raw_index}. 使用原本輸入：{query}")
+        lines.extend(["", f"請回覆 1～{raw_index}"])
     else:
         lines = [
-            "⚠️ 書籍資料庫目前找不到符合的書名。", "",
+            "🔎 資料庫沒有相符書名", "",
             f"你輸入：{query}", "",
-            f"{raw_index}. 就用我打的書名：{query}", "",
-            "如果這本書本來就沒登記在資料庫，回覆「確認」或「都不是」我就直接照你打的建立訂單。"
+            "1. 使用原本輸入：" + query, "",
+            "請回覆 1"
         ]
-    lines.append("如果都不是，請直接輸入正確書名或更明確的關鍵字，我會重新查一次資料庫。")
     return "\n".join(lines)
 
 
@@ -5086,7 +5118,6 @@ def _openai_json(messages, max_output_tokens=700):
         "model": OPENAI_MODEL,
         "messages": messages,
         "response_format": {"type": "json_object"},
-        "temperature": 0,
         "max_completion_tokens": max_output_tokens,
     }
     try:
@@ -5558,6 +5589,12 @@ def handle_name_confirmation(user_id, text):
             draft["school"] = chosen["value"]
 
         order_flow_context[user_id] = draft
+
+        # 使用者選到 raw=True（例如第 3 項「使用原本輸入」）時，
+        # 這個書名就是使用者明確指定的正式輸入，不可再做第二次 fuzzy。
+        # 若先前因為直接輸入書名而尚未取得出版社，就保留書名並詢問出版社。
+        if pending.get("field") == "book" and chosen.get("raw") and not draft.get("publisher"):
+            return make_order_guide_reply(draft)
 
         if draft.get("teacher") and draft.get("book"):
             result = build_order_from_draft(user_id, draft)
@@ -6579,6 +6616,10 @@ def add_lebron_flavor(message):
         return body
 
     compact = re.sub(r"\s+", "", body)
+
+    # 候選選擇還沒處理完成，不加「LeBron James 幫你處理好了」這類完成語。
+    if "🔎找到接近的書名" in compact or "🔎資料庫沒有相符書名" in compact:
+        return body
 
     if any(key in compact for key in [
         "查不到", "找不到", "處理失敗", "查詢失敗", "寫入失敗",
