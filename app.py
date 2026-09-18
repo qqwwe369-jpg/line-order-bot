@@ -2054,13 +2054,16 @@ def validate_order_book_input(user_id, raw_text, draft):
             lines.append(f"{i}. {opt['value']}")
         lines.append(f"{raw_index}. 都不是，就用我打的書名：{query}")
         lines.append("")
-        lines.append("請直接回覆數字（例如「1」）選擇要的那一本；回覆「確認」等同選第 1 個。")
+        lines.append(
+            f"請直接回覆數字（例如「1」）選擇要的那一本；"
+            "回覆「確認」等同選第 1 個；回覆「都不是」直接用你打的書名。"
+        )
     else:
         lines = [
             "⚠️ 書籍資料庫目前找不到符合的書名。", "",
             f"你輸入：{query}", "",
             f"{raw_index}. 就用我打的書名：{query}", "",
-            f"如果這本書本來就沒登記在資料庫，回覆「確認」或「{raw_index}」我就直接照你打的建立訂單。"
+            "如果這本書本來就沒登記在資料庫，回覆「確認」或「都不是」我就直接照你打的建立訂單。"
         ]
 
     lines.append("如果都不是，請直接輸入正確書名或更明確的關鍵字，我會重新查一次資料庫。")
@@ -4521,8 +4524,16 @@ def handle_name_confirmation(user_id, text):
 
     options = pending.get("options")
 
+    # 書名候選清單最後一定會有一個「用我打的書名」的選項（raw=True），
+    # 但它排第幾個要看資料庫找到幾個候選、每次不一定一樣，使用者要
+    # 每次都數清單很麻煩。這裡固定幾個關鍵字，不管排第幾個都能直接
+    # 選到它，不用算編號。
+    RAW_SELECT_WORDS = {"都不是", "用我的", "用我打的", "自訂"}
+
     chosen = None
-    if clean in yes_words:
+    if options and clean in RAW_SELECT_WORDS:
+        chosen = next((opt for opt in options if opt.get("raw")), None)
+    elif clean in yes_words:
         chosen = options[0] if options else pending
     elif options and re.fullmatch(r"[1-9]\d?", clean):
         index = int(clean) - 1
