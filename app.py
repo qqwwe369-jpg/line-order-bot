@@ -127,7 +127,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-smart-router-v39-multibook-v2"
+APP_VERSION = "2026-09-19-smart-router-v39-multibook-v3"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1335,6 +1335,17 @@ def _guided_mode_escape_reply(user_id, text):
         historical_order_context[user_id] = order
         return make_historical_order_with_offer(user_id, order)
 
+    # 剛查過某位老師的班級資料後，使用者常會直接接著打「班級＋書名」
+    # 想幫他訂書（例如「701康軒英文」），不想再打一次「我要訂書」。
+    # looks_like_contextual_class_book() 同時要求：(1) 提到的班級都
+    # 確實是剛才那位老師的班級 (2) 扣掉班級名稱後還剩下看起來像書名
+    # 的文字——單純問「張建國有幾個班」這種句子沒有提到任何班級，
+    # 不會誤觸發；「701」單獨一個班級號碼、沒有書名，也不會觸發。
+    teacher_context = teacher_lookup_context.get(user_id) or conversation_context.get(user_id)
+    if teacher_context and looks_like_contextual_class_book(text, teacher_context):
+        guided_mode.pop(user_id, None)
+        return handle_order_flow(user_id, text)
+
     return None
 
 
@@ -1637,8 +1648,23 @@ def normalize_teacher_name_input(text):
 def finish_teacher_lookup(user_id,item):
     reply=make_teacher_reply(item["school"],item["teacher"],item["classes"])
     pending_teacher_corrections.pop(user_id,None)
-    pending_name_confirmations.pop(user_id,None); teacher_lookup_context.pop(user_id,None)
-    conversation_context.pop(user_id,None)
+    pending_name_confirmations.pop(user_id,None)
+
+    # 引導模式（guided_mode="teacher_lookup"）原本查完老師就把 context
+    # 清空，導致跟「查老師」以外的路徑（handle_teacher_lookup／
+    # handle_class_teacher_query／handle_subject_teacher_query）行為
+    # 不一致——那些路徑查完都會保留 context，讓使用者可以直接接著打
+    # 「班級＋書名」續走訂書流程（見 looks_like_contextual_class_book／
+    # _guided_mode_escape_reply）。這裡補齊同樣的行為，兩種查法之後
+    # 的體驗才會一致。
+    context = {
+        "school": item["school"],
+        "teacher": item["teacher"],
+        "classes": copy_classes(item["classes"])
+    }
+    teacher_lookup_context[user_id] = context
+    conversation_context[user_id] = context
+
     if guided_mode.get(user_id) == "teacher_lookup":
         return reply + "\n\n我還在「查老師」模式，可以繼續輸入下一位老師姓名，或打「主選單」離開。"
     guided_mode.pop(user_id,None)
@@ -4876,7 +4902,9 @@ def make_teacher_reply(school, teacher, classes):
         "各班人數：\n"
         + "\n".join(lines)
         + f"\n\n👥 總學生人數：{total}人\n\n"
-        "以上是目前 Google「老師班級資料」中的完整資料。"
+        "以上是目前 Google「老師班級資料」中的完整資料。\n\n"
+        "💡 要幫他訂書的話，可以直接輸入「班級＋書名」（例如「701康軒英文」），"
+        "不用再打一次「我要訂書」；單純查詢的話不用理會這行。"
     )
 
 
