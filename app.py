@@ -277,6 +277,7 @@ QUICK_REPLY_MAIN_ITEMS = [
     ("📅 查訂單", "查訂單"),
     ("📖 查版本", "查版本"),
     ("📊 查人數", "查人數"),
+    ("➕ 更多功能", "更多功能"),
 ]
 
 
@@ -800,6 +801,12 @@ def _route_message(user_id, user_text):
 
     if is_help_request(text):
         return get_help_reply()
+
+    if is_photo_order_help_request(text):
+        return get_photo_order_help_reply()
+
+    if is_ai_assistant_help_request(text):
+        return get_ai_assistant_help_reply()
 
     if text in {"版本", "版本號", "目前版本", "程式版本"}:
         return f"目前機器人版本：{APP_VERSION}"
@@ -2099,17 +2106,27 @@ def get_greeting_reply():
     _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
     return (
         "📚 大漢訂書小幫手\n\n"
-        "你好！直接告訴我今天要處理什麼，我會一步一步幫你完成。\n\n"
-        f"例如：{p1}老師701、703訂國一數學講義\n\n"
-        "也可以直接點下面的快速按鈕 👇\n"
-        "想看全部功能，輸入「功能」即可。"
+        "你好！不用背指令，直接告訴我今天要處理什麼。\n\n"
+        "常用功能\n"
+        "📚 訂書　👨‍🏫 查老師　📅 查訂單\n"
+        "📖 查版本　📊 查人數\n\n"
+        "✨ 我還可以幫你\n"
+        "📷 拍照訂書｜直接傳訂購單、手寫單或 LINE 截圖\n"
+        "🧠 AI 智慧理解｜直接用平常說話的方式告訴我需求\n"
+        "📚 多書訂購｜不同班級配不同本書\n"
+        "🏫 補習班訂書｜補習班教材下單\n"
+        "📦 其他訂單｜書面紙、文具等\n"
+        "📊 今日訂單統計\n\n"
+        f"💬 例如：{p1}老師701、703訂國一數學講義\n"
+        "📷 有訂書照片的話，直接傳給我就可以。\n\n"
+        "也可以點下面的快速按鈕 👇"
     )
 
 
 def is_help_request(text):
     compact = re.sub(r"\s+", "", str(text or "").lower())
     phrases = {
-        "功能", "功能介紹", "使用說明", "說明", "幫助", "help",
+        "功能", "功能介紹", "使用說明", "說明", "幫助", "help", "更多功能",
         "怎麼用", "如何使用", "你會什麼", "你可以幹嘛",
         "你可以做什麼", "你能幹嘛", "你能做什麼",
         "你能幫我做什麼", "可以幫我做什麼",
@@ -2119,24 +2136,70 @@ def is_help_request(text):
     return compact in phrases
 
 
+def is_photo_order_help_request(text):
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+    return compact in {
+        "圖片訂書", "照片訂書", "拍照訂書", "圖片下單", "照片下單",
+        "怎麼用圖片訂書", "怎麼用照片訂書", "怎麼拍照訂書"
+    }
+
+
+def get_photo_order_help_reply():
+    return (
+        "📷 拍照訂書\n\n"
+        "不用先輸入指令，直接把訂書圖片傳給我就可以。\n\n"
+        "我可以嘗試讀取：\n"
+        "• 系統產生的訂購單\n"
+        "• 老師傳來的 LINE 對話截圖\n"
+        "• 手寫或列印的訂書資料\n"
+        "• 書名、出版社、班級與數量\n\n"
+        "辨識完成後，我會先整理成「訂購確認」，不會直接寫入 Google。\n"
+        "資料有錯時，直接告訴我要改哪一項即可。\n\n"
+        "👉 現在直接傳圖片給我就可以了。"
+    )
+
+
+def is_ai_assistant_help_request(text):
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or "")).lower()
+    return compact in {"ai", "ai助手", "智慧助手", "ai智慧助手", "ai智慧理解", "智慧理解"}
+
+
+def get_ai_assistant_help_reply():
+    return (
+        "🧠 AI 智慧理解\n\n"
+        "它不是一般聊天機器人，而是幫你理解訂書工作的自然語言。\n"
+        "你不用記固定格式，照平常說話就可以。\n\n"
+        "例如：\n"
+        "• 張建國老師要訂段考王英文3\n"
+        "• 幫我看華興國一英文是哪幾個老師\n"
+        "• 王老師昨天有沒有訂東西\n"
+        "• 華興七年級現在用什麼數學課本\n\n"
+        "資料庫答案仍以 Google 資料為準；AI 只負責理解你的意思，不會自己亂補資料。"
+    )
+
+
 def get_help_reply():
     p3 = _pick_players(1)[0]
     _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
     return (
-        "📚 大漢訂書小幫手｜功能一覽\n\n"
-        "不用背指令，直接用平常說話的方式告訴我就可以。\n\n"
-        "📚 訂書\n  王老師701、703訂國一數學講義\n"
-        "👨‍🏫 查老師\n  謝明清有幾個班\n"
-        "📅 查訂單\n  查001／昨天的訂單\n"
-        "📖 查版本\n  華興七年級英文版本\n"
-        "📊 查人數\n  天母七年級人數\n\n"
-        "更多功能\n"
+        "📚 大漢訂書小幫手｜完整功能\n\n"
+        "不用背指令，直接用平常說話的方式告訴我需求。\n\n"
+        "【常用功能】\n"
+        "📚 訂書｜王老師701、703訂國一數學講義\n"
+        "👨‍🏫 查老師｜謝明清有幾個班\n"
+        "📅 查訂單｜查001／王老師昨天的訂單\n"
+        "📖 查版本｜華興七年級英文版本\n"
+        "📊 查人數｜天母七年級人數\n\n"
+        "【智慧功能】\n"
+        "📷 拍照訂書｜直接傳圖片，自動整理訂單\n"
+        "🧠 AI 智慧理解｜直接講人話，不用固定格式\n"
+        "📚 多書訂購｜一位老師，不同班級配不同本書\n\n"
+        "【其他功能】\n"
         "🏫 補習班訂書\n"
-        "📚 多書訂購（一個班配一本不同的書）\n"
         f"📦 其他訂單｜例如：天母{p3}老師書面紙20張\n"
-        "📊 今日訂單統計\n"
-        "📷 照片訂書\n\n"
-        "任何時候輸入「主選單」可以離開目前流程；輸入「重來」會清除目前進度。"
+        "📊 今日訂單統計\n\n"
+        "💡 輸入「拍照訂書」可看圖片使用說明；輸入「AI助手」可看智慧理解範例。\n"
+        "任何時候輸入「主選單」可離開目前流程；輸入「重來」會清除目前進度。"
     )
 
 
@@ -6062,15 +6125,116 @@ def smart_parse_order_image(image_bytes):
     if not OPENAI_API_KEY or not image_bytes:
         return None
     data_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
+    system_prompt = """你是大漢訂書系統的圖片資料抽取器，不是聊天機器人。
+只輸出 JSON，不可以自行補不存在的資料；看不清楚就留空。
+
+先判斷圖片類型 image_type：
+- purchase_order：正式/列印/系統產生的訂購單，圖片本身已列出訂購資料
+- chat_screenshot：LINE/聊天截圖中的訂書需求
+- handwritten_order：手寫或一般訂書紙條
+- book_photo：主要是書籍封面/書名
+- unknown：無法判斷
+
+intent 只能是 school_order、cram_order、unknown。
+學校訂單固定輸出：
+{
+  "intent":"school_order",
+  "image_type":"purchase_order",
+  "school":"",
+  "teacher":"",
+  "publisher":"",
+  "book":"",
+  "classes":[],
+  "class_items":[{"class_name":"","quantity":0}],
+  "total_quantity":0,
+  "confidence":"high"
+}
+
+重要規則：
+1. 如果是正式訂購單，優先讀取訂購單表格本身，不要把公司章、店章、訂購人或頁尾文字誤認成老師。
+2. teacher 只能取「老師/教師」欄位；「訂購人」不是老師。
+3. class_items 要保存圖片上每個班級實際寫的數量；不要用老師資料庫人數推測。
+4. 如果表格每列都有同一本書但不同班級，book 放共同書名，class_items 分別放班級與數量。
+5. 正式訂購單即使老師欄空白，只要學校、書名、班級與數量足夠，也可以判定 school_order；不要猜老師。
+6. confidence 只能 high、medium、low。關鍵欄位看不清楚就用 low。
+7. 補習班訂單使用：
+{"intent":"cram_order","image_type":"purchase_order","cram_school":"","items":[{"publisher":"","book":"","quantity":0}],"confidence":"high"}
+"""
     return _openai_json([
-        {"role": "system", "content": _smart_order_system_prompt() + """
-你現在會看到一張訂書相關圖片。請讀取圖片中實際可見的學校/補習班、老師、出版社、書名、班級、數量。
-看不清楚的欄位留空，絕對不要猜。"""},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "text", "text": "請把這張圖片整理成訂單 JSON。"},
-            {"type": "image_url", "image_url": {"url": data_url}},
+            {"type": "text", "text": "請仔細讀取這張圖片。先判斷圖片類型，再整理成訂單 JSON。正式訂購單請以表格內容為主要依據。"},
+            {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
         ]},
-    ], max_output_tokens=900)
+    ], max_output_tokens=1200)
+
+
+def _image_class_items(data):
+    raw = data.get("class_items", []) if isinstance(data, dict) else []
+    result = []
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("class_name", "") or "").strip()
+        try:
+            qty = int(item.get("quantity", 0) or 0)
+        except Exception:
+            qty = 0
+        if name and qty > 0:
+            result.append({"class_name": name, "students": qty})
+    return sort_class_items(result)
+
+
+def _apply_purchase_order_image(user_id, data):
+    """正式訂購單圖片：以圖片上的班級/數量為來源，不強迫回查老師班級資料。"""
+    school = str(data.get("school", "") or "").strip()
+    teacher = normalize_person_name(str(data.get("teacher", "") or "").strip())
+    publisher = str(data.get("publisher", "") or "").strip()
+    book = clean_book_name(str(data.get("book", "") or "").strip())
+    classes = _image_class_items(data)
+    confidence = str(data.get("confidence", "") or "").lower()
+
+    missing = []
+    if not school: missing.append("學校")
+    if not book: missing.append("書名")
+    if not classes: missing.append("班級與數量")
+    if confidence == "low" or missing:
+        missing_text = "、".join(missing) if missing else "部分文字"
+        return (
+            "📷 我有讀到這是一張訂購單，但有些內容還不夠清楚。\n\n"
+            f"需要再確認：{missing_text}\n\n"
+            "請重新拍清楚一點，或直接用文字補充；我不會自行猜測後建立訂單。"
+        )
+
+    # 出版社若圖片沒讀到，才用既有書籍資料庫補；圖片有值就保留圖片內容。
+    if not publisher:
+        publisher = str(get_book_publisher(book) or "").strip()
+    if not publisher:
+        return (
+            "📷 訂購單大部分已讀取完成，但目前無法確認出版社。\n\n"
+            f"📖 書名：{book}\n"
+            "請直接告訴我出版社名稱。"
+        )
+
+    order = {
+        "teacher": teacher or "未填寫",
+        "school": school,
+        "book": book,
+        "publisher": publisher,
+        "classes": classes,
+        "quantity": calculate_total(classes),
+        "source": "image_purchase_order",
+    }
+    pending_orders[user_id] = order
+    # 正式訂購單本身已提供數量，不建立 teacher class context，避免把圖片數量覆蓋成資料庫人數。
+    order_flow_context.pop(user_id, None)
+    guided_mode.pop(user_id, None)
+    pending_name_confirmations.pop(user_id, None)
+    return (
+        "📷 已讀取訂購單\n\n" +
+        make_order_confirmation(order).replace("📚 訂購確認\n\n", "") +
+        "\n\n💡 這張是正式訂購單，我會以圖片上列出的班級與數量為準。"
+    )
 
 
 def _apply_smart_school_order(user_id, data, source_label="口語"):
@@ -6372,7 +6536,7 @@ def handle_smart_order_fallback(user_id, text):
 
 
 def handle_image_message(user_id, message_id):
-    """圖片只做訂單辨識；永遠先確認，不直接寫 Google。"""
+    """圖片智慧訂書：先辨識圖片類型；永遠先確認，不直接寫 Google。"""
     _start_request_budget()
     lock = _get_user_lock(user_id)
     with lock:
@@ -6380,8 +6544,8 @@ def handle_image_message(user_id, message_id):
         try:
             if not OPENAI_API_KEY:
                 return (
-                    "📷 我收到圖片了，但目前尚未啟用圖片智慧辨識。\\n\\n"
-                    "原本的文字訂書功能都可以正常使用。"
+                    "📷 我收到圖片了，但目前尚未啟用圖片智慧辨識。\n\n"
+                    "請先設定 OPENAI_API_KEY；文字訂書功能仍可正常使用。"
                 )
             image_bytes = _download_line_image(message_id)
             if not image_bytes:
@@ -6389,16 +6553,27 @@ def handle_image_message(user_id, message_id):
             data = smart_parse_order_image(image_bytes)
             if not isinstance(data, dict):
                 return (
-                    "⚠️ 這張圖片我目前沒辦法可靠整理成訂單。\\n\\n"
-                    "你可以再拍清楚一點，或直接用文字告訴我；原本流程不會被清掉。"
+                    "⚠️ 這張圖片我目前沒辦法可靠整理成訂單。\n\n"
+                    "請重新拍清楚一點，或直接用文字告訴我；我不會自行猜測。"
                 )
-            if data.get("intent") == "school_order":
+
+            intent = str(data.get("intent", "") or "")
+            image_type = str(data.get("image_type", "") or "")
+
+            # 系統/正式訂購單有自己的班級與數量，不能再拿老師姓名回查後覆蓋。
+            if intent == "school_order" and image_type == "purchase_order":
+                return _apply_purchase_order_image(user_id, data)
+            if intent == "school_order":
                 return _apply_smart_school_order(user_id, data, "圖片")
-            if data.get("intent") == "cram_order":
+            if intent == "cram_order":
                 return _apply_smart_cram_order(user_id, data, "圖片")
+            if image_type == "book_photo":
+                book = str(data.get("book", "") or "").strip()
+                if book:
+                    return f"📷 我看起來收到的是書籍照片。\n\n可能的書名：{book}\n\n如果你要訂這本，請再告訴我老師或班級。"
             return (
-                "📷 我有收到圖片，但目前無法確認這是一張學校／補習班訂書內容。\\n\\n"
-                "請再傳清楚一點，或直接用文字告訴我。"
+                "📷 我有收到圖片，但目前無法確認裡面有完整的訂書需求。\n\n"
+                "你可以傳：訂購單、老師的 LINE 訂書截圖、手寫訂單，或直接用文字補充。"
             )
         finally:
             _persist_session(user_id)
