@@ -55,6 +55,14 @@ multi_book_order_context 草稿字典，不共用 order_flow_context：
   5. 找到的種數如果剛好等於使用者要的數量，直接進下一步；
      找到的數量對不上，會列出實際找到幾種，讓使用者選擇直接採用
      或換關鍵字重查，不會自己亂湊數量
+  4.5 指定出版社湊不滿使用者要的數量時，自動放寬成「不限出版社」
+     繼續湊，直到湊滿或真的沒有更多符合的書為止。判斷出版社永遠
+     是看資料庫的「出版社」欄位，書名裡就算寫著「OO版」（例如某些
+     出版社考卷書名會寫「XX版」代表搭配哪個課本，跟真正出版社無關）
+     也不影響判斷。
+  5.5 湊滿數量後，會先進入「審核」畫面列出整份清單，讓使用者可以
+     用「N不要」或「換N」把某一項換成另一本還沒出現過的書（一樣會
+     優先在原出版社找，找不到才跨社湊），確認沒問題後才會問班級
   6. 請使用者依序告訴我這幾種書要給哪幾個班（一個班對一種書）
   7. 確認畫面過了之後，逐筆呼叫既有的 write_to_google_sheet()
      寫入，每個「班級＋書」各自是一筆獨立訂單——這代表 Google
@@ -119,7 +127,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-smart-router-v39-multibook"
+APP_VERSION = "2026-09-19-smart-router-v39-multibook-v2"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -3415,7 +3423,14 @@ def _new_multi_book_draft():
         "publisher": None,
         "keyword": "", "expected_count": 0,
         "candidates": [], "assignments": [],
-        "awaiting_decision": False, "awaiting_classes": False,
+        # excluded_values：目前清單裡已經出現過（或曾經被使用者換掉）
+        # 的書名，換一項時用來避免重複建議同一本。
+        "excluded_values": [],
+        "awaiting_decision": False,
+        # awaiting_review：候選清單湊滿數量後，先讓使用者確認／逐項替換，
+        # 確認過才會進到 awaiting_classes 問班級分配。
+        "awaiting_review": False,
+        "awaiting_classes": False,
         "confirming": False,
     }
 
@@ -3548,6 +3563,52 @@ def validate_multi_book_keyword_input(user_id, raw_text, draft):
     return f"關鍵字：{clean}\n\n這次要挑幾種不同的書？請直接輸入數字，例如「7」。"
 
 
+def _collect_multi_book_matches(query, publisher):
+    """
+    查一次書籍模糊比對，回傳所有分數達門檻、且書名不重複的候選
+    （依分數高到低排序）。底層 lookup_book_candidates_enhanced()
+    本身最多只會回 10 筆，這裡不另外放寬，算是既有機制的限制。
+    """
+    raw = lookup_book_candidates_enhanced(query, publisher=publisher)
+    seen = set()
+    result = []
+    for c in raw:
+        value = str(c.get("value", "") or "").strip()
+        score = float(c.get("score", 0) or 0)
+        if not value or value in seen or score < MULTI_BOOK_MATCH_SCORE_THRESHOLD:
+            continue
+        seen.add(value)
+        result.append({
+            "value": value,
+            "publisher": str(c.get("publisher", "") or publisher or ""),
+            "score": score,
+        })
+    return sorted(result, key=lambda x: x["score"], reverse=True)
+
+
+def _find_multi_book_replacement(draft, excluded_values):
+    """
+    幫某一項候選找替代書：先在使用者指定的出版社裡找，找不到就自動
+    放寬成不限出版社（跨社湊），excluded_values 內的書名（目前清單上
+    已經有的、或剛被換掉的）一律跳過，避免湊出重複的書。
+    """
+    query = draft.get("keyword", "")
+    publisher = draft.get("publisher") or ""
+
+    pools = [publisher] if publisher else []
+    pools.append("")  # 不限出版社
+
+    checked_pools = set()
+    for pub in pools:
+        if pub in checked_pools:
+            continue
+        checked_pools.add(pub)
+        for c in _collect_multi_book_matches(query, pub):
+            if c["value"] not in excluded_values:
+                return c
+    return None
+
+
 def validate_multi_book_count_input(user_id, raw_text, draft):
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
     m = re.fullmatch(r"([0-9]{1,3}|[一二三四五六七八九十]{1,3})種?", clean)
@@ -3568,63 +3629,93 @@ def validate_multi_book_count_input(user_id, raw_text, draft):
 def _run_multi_book_search(user_id, draft):
     query = draft.get("keyword", "")
     publisher = draft.get("publisher") or ""
-
-    candidates = lookup_book_candidates_enhanced(query, publisher=publisher)
-    matched = [
-        c for c in candidates
-        if float(c.get("score", 0) or 0) >= MULTI_BOOK_MATCH_SCORE_THRESHOLD
-    ]
-    matched = matched[:MULTI_BOOK_MAX_CANDIDATES]
-
     expected = draft.get("expected_count", 0)
+
+    matched = _collect_multi_book_matches(query, publisher)
+
+    # 指定出版社湊不滿時，自動放寬成不限出版社繼續湊，直到湊滿、或
+    # 資料庫裡真的沒有更多符合的書為止。判斷出版社永遠是看資料庫的
+    # 「出版社」欄位，書名裡就算寫著「OO版」也不影響——那只是這份
+    # 考卷搭配哪個課本版本的說明文字，不是它真正的出版社。
+    if publisher and len(matched) < expected:
+        seen_values = {c["value"] for c in matched}
+        for c in _collect_multi_book_matches(query, ""):
+            if len(matched) >= expected:
+                break
+            if c["value"] in seen_values:
+                continue
+            matched.append(c)
+            seen_values.add(c["value"])
+
+    matched = matched[:MULTI_BOOK_MAX_CANDIDATES]
+    draft["candidates"] = matched
+    draft["excluded_values"] = sorted({c["value"] for c in matched})
+    multi_book_order_context[user_id] = draft
 
     if not matched:
         draft["expected_count"] = 0
         multi_book_order_context[user_id] = draft
         return (
-            "⚠️ 依照目前條件完全查不到符合的書。\n\n"
-            f"出版社：{publisher or '不限'}\n關鍵字：{query}\n\n"
-            "請重新輸入書名關鍵字（出版社維持剛才的設定）。"
+            "⚠️ 依照目前條件完全查不到符合的書（已經含跨出版社查詢）。\n\n"
+            f"關鍵字：{query}\n\n"
+            "請重新輸入書名關鍵字。"
         )
-
-    draft["candidates"] = matched
-    multi_book_order_context[user_id] = draft
 
     if len(matched) == expected:
         draft["awaiting_decision"] = False
-        draft["awaiting_classes"] = True
+        draft["awaiting_review"] = True
         multi_book_order_context[user_id] = draft
-        return make_multi_book_candidates_reply(draft, exact=True)
+        return make_multi_book_review_reply(draft)
 
     draft["awaiting_decision"] = True
     multi_book_order_context[user_id] = draft
-    return make_multi_book_candidates_reply(draft, exact=False)
+    return make_multi_book_shortfall_reply(draft)
 
 
-def make_multi_book_candidates_reply(draft, exact):
+def _format_multi_book_candidate_lines(candidates):
+    return [
+        f"{i}. [{c.get('publisher', '')}] {c.get('value', '')}"
+        for i, c in enumerate(candidates, start=1)
+    ]
+
+
+def make_multi_book_review_reply(draft):
     candidates = draft.get("candidates", [])
-    lines = ["🔎 找到符合的書：", ""]
-    for i, c in enumerate(candidates, start=1):
-        lines.append(f"{i}. [{c.get('publisher', '') or draft.get('publisher', '')}] {c.get('value', '')}")
+    lines = ["🔎 找到符合的書（已含跨出版社湊數量）：", ""]
+    lines.extend(_format_multi_book_candidate_lines(candidates))
     lines.append("")
+    lines.append(f"共 {len(candidates)} 種，符合你要的數量。")
+    lines.append("")
+    lines.append("如果有哪一項不要，回覆「N不要」或「換N」（例如「4不要」）我會幫你換掉那一項。")
+    lines.append("都沒問題的話，請回覆「確認」，我再請你分配班級。")
+    return "\n".join(lines)
 
-    if exact:
-        class_list = "、".join(
-            c["class_name"] for c in sort_class_items(draft.get("teacher_classes", []))
-        )
-        lines.append(f"共 {len(candidates)} 種，符合你要的數量。")
-        lines.append("")
-        lines.append(
-            f"請依照上面清單的順序，依序告訴我要給哪 {len(candidates)} 個班"
-            "（用空格或逗號分隔）。"
-        )
-        lines.append(f"{draft.get('teacher', '')} 目前班級：{class_list}")
-    else:
-        expected = draft.get("expected_count", 0)
-        lines.append(f"共找到 {len(candidates)} 種，跟你說的 {expected} 種不一樣。")
-        lines.append("")
-        lines.append("回覆「採用」直接用這幾種；或直接輸入新的書名關鍵字重新查詢。")
 
+def make_multi_book_classes_prompt(draft):
+    candidates = draft.get("candidates", [])
+    class_list = "、".join(
+        c["class_name"] for c in sort_class_items(draft.get("teacher_classes", []))
+    )
+    lines = ["📚 最終書單：", ""]
+    lines.extend(_format_multi_book_candidate_lines(candidates))
+    lines.append("")
+    lines.append(
+        f"請依照上面清單的順序，依序告訴我要給哪 {len(candidates)} 個班"
+        "（用空格或逗號分隔）。"
+    )
+    lines.append(f"{draft.get('teacher', '')} 目前班級：{class_list}")
+    return "\n".join(lines)
+
+
+def make_multi_book_shortfall_reply(draft):
+    candidates = draft.get("candidates", [])
+    expected = draft.get("expected_count", 0)
+    lines = ["🔎 找到符合的書（已含跨出版社查詢）：", ""]
+    lines.extend(_format_multi_book_candidate_lines(candidates))
+    lines.append("")
+    lines.append(f"共找到 {len(candidates)} 種，跟你說的 {expected} 種不一樣。")
+    lines.append("")
+    lines.append("回覆「採用」直接用這幾種；或直接輸入新的書名關鍵字重新查詢。")
     return "\n".join(lines)
 
 
@@ -3632,9 +3723,9 @@ def handle_multi_book_search_mismatch(user_id, clean, draft):
     if clean in MULTI_BOOK_ACCEPT_FOUND_WORDS:
         draft["expected_count"] = len(draft.get("candidates", []))
         draft["awaiting_decision"] = False
-        draft["awaiting_classes"] = True
+        draft["awaiting_review"] = True
         multi_book_order_context[user_id] = draft
-        return make_multi_book_candidates_reply(draft, exact=True)
+        return make_multi_book_review_reply(draft)
 
     if clean in MULTI_BOOK_RETRY_KEYWORD_WORDS:
         draft["keyword"] = ""
@@ -3650,6 +3741,73 @@ def handle_multi_book_search_mismatch(user_id, clean, draft):
     draft["awaiting_decision"] = False
     multi_book_order_context[user_id] = draft
     return _run_multi_book_search(user_id, draft)
+
+
+_MULTI_BOOK_SWAP_PATTERN = re.compile(
+    r"(?:換|換掉|刪除|刪掉|移除|拿掉)?第?(\d{1,2})(?:個|項|本|不要|換掉|換一個|不要了)*"
+)
+
+
+def _parse_multi_book_swap_index(clean):
+    m = re.fullmatch(_MULTI_BOOK_SWAP_PATTERN, clean)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except Exception:
+        return None
+
+
+def handle_multi_book_review_stage(user_id, clean, draft):
+    if _is_exit_word(clean):
+        multi_book_order_context.pop(user_id, None)
+        guided_mode.pop(user_id, None)
+        return "❌ 已取消這筆多書訂單，Google 沒有寫入。"
+
+    if _is_confirm_word(clean) or clean in {"可以", "沒問題", "都可以", "都沒問題", "可以了", "這樣就好"}:
+        draft["awaiting_review"] = False
+        draft["awaiting_classes"] = True
+        multi_book_order_context[user_id] = draft
+        return make_multi_book_classes_prompt(draft)
+
+    index = _parse_multi_book_swap_index(clean)
+    if index is None:
+        return (
+            "（沒看懂你的回覆。要換掉某一項，請回覆「N不要」或「換N」；"
+            "都沒問題的話回覆「確認」。）\n\n"
+            + make_multi_book_review_reply(draft)
+        )
+
+    candidates = draft.get("candidates", [])
+    if not (1 <= index <= len(candidates)):
+        return f"⚠️ 目前只有 1～{len(candidates)} 項，請輸入正確的編號。"
+
+    removed = candidates[index - 1]
+    excluded = set(draft.get("excluded_values", []))
+    excluded.add(str(removed.get("value", "")).strip())
+
+    replacement = _find_multi_book_replacement(draft, excluded)
+
+    if replacement is None:
+        draft["excluded_values"] = sorted(excluded)
+        multi_book_order_context[user_id] = draft
+        return (
+            f"⚠️ 找不到其他符合條件、還沒出現過的書可以替換第 {index} 項。\n\n"
+            "目前清單維持不變；如果要放寬條件，請直接重新輸入「多書訂購」重新開始。\n\n"
+            + make_multi_book_review_reply(draft)
+        )
+
+    candidates[index - 1] = replacement
+    excluded.add(str(replacement.get("value", "")).strip())
+    draft["candidates"] = candidates
+    draft["excluded_values"] = sorted(excluded)
+    multi_book_order_context[user_id] = draft
+
+    return (
+        f"✅ 已把第 {index} 項換成：[{replacement.get('publisher', '')}] {replacement.get('value', '')}\n\n"
+        + make_multi_book_review_reply(draft)
+    )
+
 
 
 def validate_multi_book_classes_input(user_id, raw_text, draft):
@@ -3802,6 +3960,9 @@ def handle_multi_book_order_flow(user_id, text):
 
     if draft.get("awaiting_classes"):
         return validate_multi_book_classes_input(user_id, clean, draft)
+
+    if draft.get("awaiting_review"):
+        return handle_multi_book_review_stage(user_id, clean, draft)
 
     if draft.get("awaiting_decision"):
         return handle_multi_book_search_mismatch(user_id, clean, draft)
