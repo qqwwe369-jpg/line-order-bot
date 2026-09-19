@@ -127,7 +127,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-smart-router-v39-multibook-v3"
+APP_VERSION = "2026-09-19-smart-router-v39-multibook-v4-quickreply"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -253,6 +253,60 @@ def _request_budget_exceeded():
         elapsed > REQUEST_TIME_BUDGET_SECONDS
         or calls >= REQUEST_MAX_GOOGLE_CALLS
     )
+
+
+# =========================================================
+# LINE Quick Reply（快速回覆按鈕）
+#
+# 跟圖文選單（Rich Menu）不一樣：Quick Reply 是「跟著這一則訊息」
+# 出現、使用者點了或滑走就消失的按鈕，很適合放在「你好」「有什麼
+# 功能」這種入口時刻。做法是某個回覆函式（例如 get_greeting_reply）
+# 執行時，先呼叫 _set_quick_reply() 把想附加的按鈕暫存起來，
+# callback() 收到最終回覆文字後，用 _pop_quick_reply() 取出、
+# 附加到送給 LINE 的最後一則訊息上。用 threading.local 存放，
+# 跟上面 REQUEST_TIME_BUDGET 那組是同一種做法：每次處理一則使用者
+# 訊息開始時都會重置，處理結束後在 callback() 取用一次就清空，
+# 不會跨訊息殘留、也不會跨 worker 互相干擾。
+# =========================================================
+_quick_reply_state = threading.local()
+
+# 優先順序（使用者實際排定）：訂書 → 查老師 → 查訂單 → 查版本 → 查人數
+QUICK_REPLY_MAIN_ITEMS = [
+    ("📚 訂書", "我要訂書"),
+    ("👨‍🏫 查老師", "查老師"),
+    ("📅 查訂單", "查訂單"),
+    ("📖 查版本", "查版本"),
+    ("📊 查人數", "查人數"),
+]
+
+
+def _reset_quick_reply():
+    _quick_reply_state.items = None
+
+
+def _set_quick_reply(items):
+    _quick_reply_state.items = items
+
+
+def _pop_quick_reply():
+    items = getattr(_quick_reply_state, "items", None)
+    _quick_reply_state.items = None
+    return items
+
+
+def _quick_reply_payload(items):
+    if not items:
+        return None
+    return {
+        "items": [
+            {
+                "type": "action",
+                # LINE 按鈕文字（label）上限 20 字，這裡先截斷防呆。
+                "action": {"type": "message", "label": str(label)[:20], "text": str(text)}
+            }
+            for label, text in items[:13]
+        ]
+    }
 
 
 # =========================================================
@@ -675,6 +729,7 @@ def callback():
         )
 
         request_started = time.perf_counter()
+        _reset_quick_reply()
         try:
             if message_type == "image":
                 reply_message = add_lebron_flavor(handle_image_message(user_id, message_id))
@@ -684,9 +739,11 @@ def callback():
             logger.exception(f"handle_message error: {error}")
             reply_message = FIXED_FALLBACK_MESSAGE
 
+        quick_reply = _quick_reply_payload(_pop_quick_reply())
+
         handle_elapsed = time.perf_counter() - request_started
         line_started = time.perf_counter()
-        reply_to_line(reply_token, reply_message)
+        reply_to_line(reply_token, reply_message, quick_reply=quick_reply)
         line_elapsed = time.perf_counter() - line_started
         total_elapsed = time.perf_counter() - request_started
         logger.info(
@@ -2031,27 +2088,13 @@ def _pick_players(count=3):
 
 
 def get_greeting_reply():
-    p1, p2, p3 = _pick_players(3)
+    p1 = _pick_players(1)[0]
+    _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
     return (
         "📚 大漢訂書小幫手\n\n"
-        "嗨！今天要處理什麼？直接跟我說就可以 🏀\n\n"
-        "📚 學校訂書\n"
-        "• 輸入「我要訂書」→ 我會一步一步帶你完成\n"
-        f"• 也可以直接說：「{p1}老師701、703訂國一數學講義」\n\n"
-        "🏫 補習班訂書\n"
-        "• 輸入「補習班訂書」→ 我會一步一步帶你完成\n"
-        "• 也可以直接說：「大大補習班康軒國文講義20本」\n\n"
-        "👨‍🏫 查老師\n"
-        f"• 個別老師：「{p2}有幾個班」\n"
-        "• 年級科目：「華興七年級歷史老師」\n"
-        "• 指定班級：「天母701老師」\n\n"
-        "📖 查版本 →「華興七年級英文版本」\n"
-        "📅 查訂單 →「查001」或「查昨天訂單」\n"
-        "📊 查人數 →「天母七年級人數」\n"
-        f"📦 其他訂單 →「天母{p3}老師書面紙20張」\n"
-        "📷 照片訂書 → 直接傳訂單照片，我會先整理給你確認\n\n"
-        "不用完全照範例格式；原本的引導模式也都保留。\n"
-        "想看完整功能表，輸入「有什麼功能」。"
+        "嗨！今天要處理什麼？直接跟我說就可以，或點下面的按鈕 👇\n"
+        f"例如：「{p1}老師701、703訂國一數學講義」\n\n"
+        "想看更多功能（補習班訂書／多書訂購／其他訂單...），輸入「有什麼功能」。"
     )
 
 def is_help_request(text):
@@ -2068,27 +2111,20 @@ def is_help_request(text):
 
 
 def get_help_reply():
-    p1, p2, p3 = _pick_players(3)
+    p3 = _pick_players(1)[0]
+    _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
     return (
         "📚 大漢訂書小幫手｜功能\n\n"
-        "📚 學校訂書\n"
-        "• 輸入「我要訂書」使用原本一步一步模式\n"
-        f"• 或直接說：「{p1}老師701、703訂國一數學講義」\n\n"
-        "🏫 補習班訂書\n"
-        "• 輸入「補習班訂書」使用原本一步一步模式\n"
-        "• 或直接說：「大大補習班康軒國文講義20本」\n\n"
-        "👨‍🏫 查老師\n"
-        f"• 個別老師：「{p2}有幾個班」\n"
-        "• 年級＋科目：「華興七年級歷史老師」\n"
-        "• 學校＋班級：「天母701老師」\n"
-        "• 也可問：「華興國一甲老師」「天母701數學老師」\n\n"
-        "📖 查版本 →「查版本」或直接說學校／年級／科目\n"
-        "📅 查訂單 →「查訂單」「查001」「昨天訂單」\n"
-        "📊 查人數 →「查人數」或「天母七年級人數」\n"
-        f"📦 其他訂單 →「天母{p3}老師書面紙20張」\n"
-        "📊 今日統計 →「統計」\n"
-        "📷 照片訂書 → 直接傳圖片，我會先辨識再讓你確認\n\n"
-        "原本固定指令永遠優先；只有原本規則接不住時，才會使用智慧理解協助。"
+        "常用的幾個都可以直接點下面按鈕，或直接用一般口語講就好，"
+        "不用先打指令，例如：\n\n"
+        "📚 訂書 →「王老師701、703訂國一數學講義」\n"
+        "👨‍🏫 查老師 →「謝明清有幾個班」\n"
+        "📅 查訂單 →「查001」或「昨天的訂單」\n"
+        "📖 查版本 →「華興七年級英文版本」\n"
+        "📊 查人數 →「天母七年級人數」\n\n"
+        "其他還有：🏫 補習班訂書、📚 多書訂購（一班一本不同的書）、"
+        f"📦 其他訂單（例如「天母{p3}老師書面紙20張」）、📊 今日統計、📷 照片訂書。\n\n"
+        "原本固定指令永遠優先；只有規則接不住時，才會用智慧理解協助。"
     )
 
 # =========================================================
@@ -7716,7 +7752,7 @@ def add_lebron_flavor(message):
 # =========================================================
 # LINE 回覆
 # =========================================================
-def reply_to_line(reply_token, message):
+def reply_to_line(reply_token, message, quick_reply=None):
     if not reply_token:
         logger.warning("reply_token missing")
         return
@@ -7737,12 +7773,19 @@ def reply_to_line(reply_token, message):
     else:
         message_items = [str(message or "").strip()]
 
+    messages = [
+        {"type": "text", "text": item[:4900]}
+        for item in message_items[:5]
+    ]
+
+    # Quick Reply 只能附加在其中一則訊息上，LINE 會顯示在整組回覆的
+    # 最下面，所以固定附加在最後一則。
+    if quick_reply and messages:
+        messages[-1]["quickReply"] = quick_reply
+
     data = {
         "replyToken": reply_token,
-        "messages": [
-            {"type": "text", "text": item[:4900]}
-            for item in message_items[:5]
-        ]
+        "messages": messages
     }
 
     attempts = 2
