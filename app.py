@@ -127,7 +127,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-smart-router-v39-multibook-v4-quickreply"
+APP_VERSION = "2026-09-19-smart-router-v39-multibook-v6-grade-shorthand"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -2601,6 +2601,17 @@ def handle_order_flow(user_id, text):
             parsed = parse_contextual_class_book(clean, recent)
         else:
             return None
+    elif not parsed.get("classes") and user_id not in order_flow_context:
+        # parse_order_message() 的班級偵測只認得「701」這種數字班級。
+        # 句子裡如果其實是「國一甲丁戊」這種文字班級簡寫，加上句子
+        # 本身有「訂」字，上面那個分支不會被觸發（has_order_intent
+        # 已經是 True），沒有這一段的話班級會被判斷成「沒有指定」，
+        # 依現有邏輯會直接預設成該老師的全部班級——實際上使用者是
+        # 有指定班級的，只是文字班級沒被認出來。這裡用剛查過的老師
+        # 資料再比對一次文字班級，抓到的話用這個結果整個換掉。
+        recent = conversation_context.get(user_id)
+        if recent and looks_like_contextual_class_book(clean, recent):
+            parsed = parse_contextual_class_book(clean, recent)
 
     if user_id in order_flow_context:
         parsed = merge_followup_into_parsed(clean, parsed, draft)
@@ -4074,36 +4085,93 @@ def normalize_order_typo(text):
     return clean
 
 
+def _find_and_strip_letter_classes(text, known_class_names):
+    """
+    extract_classes() 只認得「701」這種數字班級。有些學校班級是
+    「國一甲」「國三戊」這種文字命名，這裡另外處理：依 known_class_names
+    建出每個年級前綴（例如「國一」）底下實際有哪些代號字（例如
+    「甲丁戊己庚」），再用這個前綴＋代號字的正規表示式去文字裡找，
+    同時支援單一班級（「國三戊」）跟省略前綴的連續簡寫
+    （「國一甲丁戊己庚」＝國一甲／國一丁／國一戊／國一己／國一庚）。
+    只會比對到這位老師真的有的班級，不會誤吃到不相干的文字。
+    回傳 (找到的班級清單, 拿掉班級文字後剩下的字串)。
+    """
+    prefixes = {}
+    for name in known_class_names:
+        name = str(name or "")
+        if len(name) >= 2:
+            prefixes.setdefault(name[:-1], set()).add(name[-1])
+
+    remaining = text
+    found = []
+
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        suffix_chars = "".join(sorted(re.escape(c) for c in prefixes[prefix]))
+        if not suffix_chars:
+            continue
+        pattern = re.escape(prefix) + "[" + suffix_chars + "]+"
+        for m in re.finditer(pattern, remaining):
+            for ch in m.group(0)[len(prefix):]:
+                found.append(prefix + ch)
+        remaining = re.sub(pattern, " ", remaining)
+
+    # 只講年級本身、沒有列出字母（例如「國一」），代表這位老師底下
+    # 這個年級的班級「全部」都要，不用一個一個打。上面那段已經把
+    # 「年級＋字母」的寫法都吃掉了，這裡剩下的「國一」就是單純講
+    # 年級整體的情況。
+    for prefix in sorted(prefixes, key=len, reverse=True):
+        if prefix in remaining:
+            for suffix in sorted(prefixes[prefix]):
+                found.append(prefix + suffix)
+            remaining = remaining.replace(prefix, " ", 1)
+
+    return unique_list(found), remaining
+
+
 def looks_like_contextual_class_book(text, context):
-    known = {
+    known = [
         str(item.get("class_name"))
         for item in context.get("classes", [])
-    }
+    ]
 
     mentioned = extract_classes(text)
-    if not mentioned:
-        return False
-    if not all(item in known for item in mentioned):
-        return False
+    if mentioned:
+        if not all(item in known for item in mentioned):
+            return False
+        remainder = text
+        for class_name in mentioned:
+            remainder = re.sub(
+                r"(?<!\d)" + re.escape(class_name) + r"(?!\d)",
+                " ",
+                remainder
+            )
+        remainder = re.sub(r"[跟和與、,，/\s]+", " ", remainder).strip()
+        return len(remainder) >= 2
 
-    remainder = text
-    for class_name in mentioned:
-        remainder = re.sub(
-            r"(?<!\d)" + re.escape(class_name) + r"(?!\d)",
-            " ",
-            remainder
-        )
-
+    # 數字班級抓不到時，再試文字班級簡寫（國一甲丁戊...）。
+    letter_matches, remainder = _find_and_strip_letter_classes(text, known)
+    if not letter_matches:
+        return False
     remainder = re.sub(r"[跟和與、,，/\s]+", " ", remainder).strip()
     return len(remainder) >= 2
 
 
 def parse_contextual_class_book(text, context):
     clean = normalize_order_typo(text)
+    known = [
+        str(item.get("class_name"))
+        for item in context.get("classes", [])
+    ]
+
     classes = extract_classes(clean)
+    letter_remainder = None
+    if not classes:
+        classes, letter_remainder = _find_and_strip_letter_classes(clean, known)
 
     if "訂" in clean:
         book = clean.split("訂", 1)[1].strip()
+    elif letter_remainder is not None:
+        book = letter_remainder
     else:
         book = clean
         for class_name in classes:
