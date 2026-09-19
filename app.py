@@ -73,6 +73,28 @@ multi_book_order_context 草稿字典，不共用 order_flow_context：
   假設一張訂單只有一本書），之後真的需要可以再擴充
   generate_purchase_order_pdf()。
 
+【AI Agent pilot（2026-09-20 新增，v42）】
+在既有「規則優先、AI 當最後容錯」的架構上，這次多加兩件事：
+  1. AI_AGENT_ENABLED（環境變數，預設開）：開啟後，原本的智慧路由／
+     圖片辨識改用 _openai_agent_json()／_openai_agent_chat()，會帶
+     上這個使用者最近幾輪對話（ai_agent_history，見 _remember_ai_turn），
+     讓「他呢？」「那本呢？」這種代名詞、省略主詞的講法也能被理解。
+     關掉這個環境變數會整個退回 v41 的單輪呼叫邏輯（_openai_json）。
+  2. 「一般對話」fallback：當規則跟意圖分類器都判斷不出來要做什麼
+     （intent 是 chat 或 unknown）時，才會讓 AI 自由對話一次——
+     system prompt 明確禁止它虛構老師／班級／訂單等公司資料，也
+     禁止在聊天裡宣稱訂單已建立/修改/取消（那些一定要走既有確認
+     流程）。這不影響「14. 明確代寫請求直接擋下」那道更早、更嚴格
+     的防線，兩者是分開的機制。
+  另外，圖片辨識新增「正式訂購單」（image_type=purchase_order）
+  這個分類：這種圖片本身就列好了班級與數量，直接採用圖片上的值，
+  不會像口語辨識那樣拿老師姓名回頭去資料庫查班級人數覆蓋掉——避免
+  正式訂購單上「這次只訂 20 本」被誤植成資料庫裡那個班「平常」的
+  人數。老師欄位如果圖片上真的是空的，會標成「未填寫」讓使用者在
+  確認畫面上看清楚，而不是自己亂猜一個老師名字；確認後這個字串會
+  照樣寫進 Google，如果不想要「未填寫」出現在正式紀錄裡，請在確認
+  前先手動補上老師姓名。
+
 【訂購單交付方式（2026-09 新增）】
 訂單確認完成後，使用者可以選擇讓機器人生成一張 PDF 版的訂購單，
 用來 email 給出版社（取代原本純文字、傳給業務轉單的做法）。
@@ -127,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-v40-multibook-message-ui-v1"
+APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v2-reviewed"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -327,6 +349,10 @@ GOOGLE_SCRIPT_URL = os.environ.get("GOOGLE_SCRIPT_URL")
 # 沒有設定 OPENAI_API_KEY 時，原本所有功能仍照常運作。
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5-mini").strip()
+# v42 AI Agent：可獨立選較強模型；關閉後完全退回原本 v41 邏輯。
+AI_AGENT_ENABLED = os.environ.get("AI_AGENT_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+AI_AGENT_MODEL = os.environ.get("AI_AGENT_MODEL", "gpt-5.6-sol").strip()
+AI_AGENT_MAX_HISTORY = int(os.environ.get("AI_AGENT_MAX_HISTORY", "10"))
 AI_TIMEOUT_SECONDS = float(os.environ.get("AI_TIMEOUT_SECONDS", "12"))
 
 for _env_name, _env_value in [
@@ -414,6 +440,8 @@ pending_teacher_corrections = {}
 guided_mode = {}
 
 pending_receipt_offers = {}
+# v42：保存最近幾輪自然語言上下文，讓「他／那本／剛剛那個」可以被理解。
+ai_agent_history = {}
 
 _SESSION_DICTS = {
     "pending_orders": pending_orders,
@@ -430,6 +458,7 @@ _SESSION_DICTS = {
     "pending_teacher_corrections": pending_teacher_corrections,
     "guided_mode": guided_mode,
     "pending_receipt_offers": pending_receipt_offers,
+    "ai_agent_history": ai_agent_history,
 }
 
 # =========================================================
@@ -774,7 +803,9 @@ def handle_message(user_id, user_text):
     with lock:
         _hydrate_session(user_id)
         try:
-            return _route_message(user_id, user_text)
+            reply = _route_message(user_id, user_text)
+            _remember_ai_turn(user_id, user_text, reply)
+            return reply
         finally:
             _persist_session(user_id)
 
@@ -1260,7 +1291,11 @@ def _route_message(user_id, user_text):
 
         return make_teacher_book_orders_reply(teacher, orders)
 
-    # 14. AI 功能已停用：草擬／自由問答不再呼叫 OpenAI
+    # 14. 明確的「幫我寫訊息／代寫」請求仍直接擋下，不讓 AI 代筆。
+    #     （注意：這不等於 AI 完全不能聊天——v42 新增的 AI Agent
+    #     在所有規則都接不住時，會允許 OpenAI 做一般對話，見
+    #     handle_smart_function_fallback() 的 intent == "chat"/"unknown"
+    #     分支，那邊有另外的 system prompt 禁止虛構公司資料。）
     if is_ai_writing_request(text):
         return FIXED_FALLBACK_MESSAGE
 
@@ -2112,7 +2147,7 @@ def get_greeting_reply():
         "📖 查版本　📊 查人數\n\n"
         "✨ 我還可以幫你\n"
         "📷 拍照訂書｜直接傳訂購單、手寫單或 LINE 截圖\n"
-        "🧠 AI 智慧理解｜直接用平常說話的方式告訴我需求\n"
+        "🧠 大漢 AI 助手｜直接講人話，我會自己判斷要查什麼\n"
         "📚 多書訂購｜不同班級配不同本書\n"
         "🏫 補習班訂書｜補習班教材下單\n"
         "📦 其他訂單｜書面紙、文具等\n"
@@ -2161,20 +2196,21 @@ def get_photo_order_help_reply():
 
 def is_ai_assistant_help_request(text):
     compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or "")).lower()
-    return compact in {"ai", "ai助手", "智慧助手", "ai智慧助手", "ai智慧理解", "智慧理解"}
+    return compact in {"ai", "ai助手", "智慧助手", "ai智慧助手", "ai智慧理解", "智慧理解", "大漢ai助手", "大漢ai"}
 
 
 def get_ai_assistant_help_reply():
     return (
         "🧠 AI 智慧理解\n\n"
-        "它不是一般聊天機器人，而是幫你理解訂書工作的自然語言。\n"
-        "你不用記固定格式，照平常說話就可以。\n\n"
+        "你不用記固定指令，照平常說話就可以。\n"
+        "我會先理解你的意思，需要公司資料時會再查 Google 資料庫。\n\n"
         "例如：\n"
         "• 張建國老師要訂段考王英文3\n"
         "• 幫我看華興國一英文是哪幾個老師\n"
         "• 王老師昨天有沒有訂東西\n"
         "• 華興七年級現在用什麼數學課本\n\n"
-        "資料庫答案仍以 Google 資料為準；AI 只負責理解你的意思，不會自己亂補資料。"
+        "也可以接著說「他呢？」「那上次訂什麼？」「幫我整理成訊息」。\n\n"
+        "資料庫答案仍以 Google 資料為準；建立、修改或取消訂單仍會先讓你確認。"
     )
 
 
@@ -2192,7 +2228,7 @@ def get_help_reply():
         "📊 查人數｜天母七年級人數\n\n"
         "【智慧功能】\n"
         "📷 拍照訂書｜直接傳圖片，自動整理訂單\n"
-        "🧠 AI 智慧理解｜直接講人話，不用固定格式\n"
+        "🧠 大漢 AI 助手｜直接講人話，可理解前後文並自動選擇查詢功能\n"
         "📚 多書訂購｜一位老師，不同班級配不同本書\n\n"
         "【其他功能】\n"
         "🏫 補習班訂書\n"
@@ -6095,9 +6131,11 @@ cram_order 欄位：
 不要把查老師、查版本、查訂單、查人數、確認、取消判成訂書。"""
 
 
-def smart_parse_order_text(text):
+def smart_parse_order_text(text, user_id=None):
     if not OPENAI_API_KEY:
         return None
+    if AI_AGENT_ENABLED and user_id:
+        return _openai_agent_json(user_id, _smart_order_system_prompt() + "\n請結合最近對話理解代名詞與省略資訊，但不能自行猜資料庫內容。", text, max_output_tokens=900)
     return _openai_json([
         {"role": "system", "content": _smart_order_system_prompt()},
         {"role": "user", "content": str(text or "")[:1000]},
@@ -6251,7 +6289,7 @@ def _apply_smart_school_order(user_id, data, source_label="口語"):
     guided_mode[user_id] = "order_flow"
 
     if not draft["teacher"]:
-        return f"📷 {source_label}內容已收到。\\n\\n我還缺老師姓名，請直接告訴我是哪一位老師？"
+        return f"📷 {source_label}內容已收到。\n\n我還缺老師姓名，請直接告訴我是哪一位老師？"
 
     # 資訊不完整時先把老師 canonicalize，例如「張建國老師」→「張建國」，
     # 並取得學校/班級；接著只追問缺少的書名。
@@ -6291,70 +6329,122 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
     guided_mode[user_id] = "cram_order_flow"
 
     if not cram_school:
-        return f"📷 {source_label}內容已收到。\\n\\n我還缺補習班名稱，請告訴我是哪一間補習班？"
+        return f"📷 {source_label}內容已收到。\n\n我還缺補習班名稱，請告訴我是哪一間補習班？"
 
     incomplete = next((x for x in items if not x["publisher"] or not x["book"] or x["quantity"] <= 0), None)
     if incomplete:
         if not incomplete["publisher"]:
-            return "我已經先記住能辨識的內容。\\n\\n還有一本缺出版社，請告訴我出版社。"
+            return "我已經先記住能辨識的內容。\n\n還有一本缺出版社，請告訴我出版社。"
         if not incomplete["book"]:
             draft["current_publisher"] = incomplete["publisher"]
             cram_order_context[user_id] = draft
-            return f"我已經先記住能辨識的內容。\\n\\n出版社：{incomplete['publisher']}\\n請告訴我書名。"
+            return f"我已經先記住能辨識的內容。\n\n出版社：{incomplete['publisher']}\n請告訴我書名。"
         draft["current_publisher"] = incomplete["publisher"]
         draft["current_book"] = incomplete["book"]
         cram_order_context[user_id] = draft
-        return f"我已經先記住能辨識的內容。\\n\\n[{incomplete['publisher']}] {incomplete['book']} 要幾本？"
+        return f"我已經先記住能辨識的內容。\n\n[{incomplete['publisher']}] {incomplete['book']} 要幾本？"
 
     if not draft["items"]:
-        return "我有辨識到補習班，但還沒有足夠的書名／數量。\\n\\n請直接告訴我要訂的第一本書。"
+        return "我有辨識到補習班，但還沒有足夠的書名／數量。\n\n請直接告訴我要訂的第一本書。"
 
     return _enter_cram_confirm_stage(user_id, draft)
 
 
+
+def _remember_ai_turn(user_id, user_text, reply_text):
+    """只保存短期對話上下文；不把整個資料庫塞給模型。"""
+    if not AI_AGENT_ENABLED:
+        return
+    history = ai_agent_history.setdefault(user_id, [])
+    history.append({"role": "user", "content": str(user_text or "")[:1200]})
+    history.append({"role": "assistant", "content": str(reply_text or "")[:1800]})
+    keep = max(4, AI_AGENT_MAX_HISTORY * 2)
+    if len(history) > keep:
+        del history[:-keep]
+
+
+def _agent_context_messages(user_id):
+    history = ai_agent_history.get(user_id, [])
+    if not isinstance(history, list):
+        return []
+    return [x for x in history[-max(4, AI_AGENT_MAX_HISTORY * 2):]
+            if isinstance(x, dict) and x.get("role") in {"user", "assistant"}]
+
+
+def _openai_agent_json(user_id, system_prompt, text, max_output_tokens=900):
+    if not OPENAI_API_KEY or not AI_AGENT_ENABLED:
+        return None
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    messages = [{"role": "system", "content": system_prompt}]
+    messages.extend(_agent_context_messages(user_id))
+    messages.append({"role": "user", "content": str(text or "")[:1600]})
+    payload = {
+        "model": AI_AGENT_MODEL,
+        "messages": messages,
+        "response_format": {"type": "json_object"},
+        "max_completion_tokens": max_output_tokens,
+    }
+    try:
+        r = HTTP.post("https://api.openai.com/v1/chat/completions", headers=headers,
+                      json=payload, timeout=max(AI_TIMEOUT_SECONDS, 20))
+        if r.status_code != 200:
+            logger.warning("AI agent parse failed status=%s body=%s", r.status_code, r.text[:300])
+            return None
+        return json.loads(r.json()["choices"][0]["message"]["content"])
+    except Exception as error:
+        logger.warning("AI agent parse error: %s", error)
+        return None
+
+
+def _openai_agent_chat(user_id, text):
+    """一般對話/整理文字。公司內部事實不得由模型自行猜。"""
+    if not OPENAI_API_KEY or not AI_AGENT_ENABLED:
+        return None
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    system = """你是「大漢 AI 助手」，在 LINE 裡用繁體中文自然、簡潔地協助使用者。
+你可以一般對話、整理文字、改寫訊息、解釋問題，也要理解前後文。
+但是老師、班級、人數、書名資料庫、出版社、學校版本、歷史訂單等公司內部事實絕對不能自行猜測。
+這些資料若目前沒有由系統工具提供，就清楚說需要查資料庫，不要編造。
+任何建立、修改、取消訂單都不能在聊天回答中宣稱已完成，必須走系統確認流程。
+不要要求使用者背固定指令；盡量理解他的自然說法。"""
+    messages = [{"role":"system","content":system}]
+    messages.extend(_agent_context_messages(user_id))
+    messages.append({"role":"user","content":str(text or "")[:2000]})
+    payload={"model":AI_AGENT_MODEL,"messages":messages,"max_completion_tokens":700}
+    try:
+        r=HTTP.post("https://api.openai.com/v1/chat/completions",headers=headers,json=payload,
+                    timeout=max(AI_TIMEOUT_SECONDS,20))
+        if r.status_code!=200:
+            logger.warning("AI agent chat failed status=%s body=%s",r.status_code,r.text[:300]); return None
+        return str(r.json()["choices"][0]["message"]["content"] or "").strip() or None
+    except Exception as error:
+        logger.warning("AI agent chat error: %s",error); return None
+
+
 def _smart_function_system_prompt():
-    return """你是 LINE 訂書系統的「意圖與欄位抽取器」，不是聊天機器人。
-只輸出 JSON，不能回答使用者問題，也不能自行補不存在的資料；不確定就留空。
-intent 只能是：teacher_lookup、history_lookup、version_lookup、stats_lookup、school_order、cram_order、other_order、unknown。
+    return """你是「大漢 AI Agent」的意圖路由器。只輸出 JSON，不要直接回答。
+你會看到最近對話，因此必須理解「他、那本、剛剛那個、上次、其他班也要」等前後文。
+intent 只能是：teacher_lookup、history_lookup、version_lookup、stats_lookup、school_order、cram_order、other_order、chat、unknown。
 
-輸出欄位固定為：
-{
-  "intent":"unknown",
-  "teacher":"",
-  "school":"",
-  "grade":"",
-  "subject":"",
-  "class_name":"",
-  "order_number":"",
-  "date_text":"",
-  "publisher":"",
-  "book":"",
-  "classes":[],
-  "cram_school":"",
-  "items":[],
-  "normalized_query":""
-}
+輸出固定欄位：
+{"intent":"unknown","teacher":"","school":"","grade":"","subject":"","class_name":"","order_number":"","date_text":"","publisher":"","book":"","classes":[],"cram_school":"","items":[],"normalized_query":""}
 
-判斷原則：
-- 查某位老師、某班老師、某年級某科老師 => teacher_lookup
-- 查以前訂單、某老師訂書紀錄、某日期訂單、訂單編號 => history_lookup
-- 查學校教科書版本 => version_lookup
-- 查學校/年級/班級學生人數 => stats_lookup
-- 明確要學校老師訂書/下單 => school_order
-- 明確要補習班訂書 => cram_order
-- 文具、書面紙等非教科書登記 => other_order
-- 只是聊天、確認、取消、無法判斷 => unknown
+原則：
+- 使用者意思到了就判斷意圖，不要求固定關鍵字。
+- 查老師/班級/任課 => teacher_lookup。
+- 查過去訂單/上次訂什麼/某日期/編號 => history_lookup。
+- 查教材版本 => version_lookup；查學生/班級人數 => stats_lookup。
+- 要建立學校訂單 => school_order；補習班 => cram_order；文具等 => other_order。
+- 一般聊天、寫訊息、整理文字、解釋問題 => chat。
+- 公司內部資料不能自行補；只抽取使用者或前文已明確出現的資訊。
+- normalized_query 要改寫成既有系統容易處理的簡短格式。
+- 涉及下單時只判斷意圖，真正資料與寫入交給既有安全流程。"""
 
-normalized_query 請盡量改寫成系統既有簡短格式，例如：
-「幫我看看華興國一現在用什麼數學課本」=>「華興國一數學版本」
-「我想知道張建國是教哪些班」=>「張建國有幾個班」
-「王老師昨天有沒有訂東西」=> date_text="昨天", teacher="王老師"（不要虛構訂單）
-只有使用者明確表達訂書/下單時，才能判成 school_order/cram_order。"""
-
-
-def smart_parse_function_text(text):
+def smart_parse_function_text(text, user_id=None):
     if not OPENAI_API_KEY:
         return None
+    if AI_AGENT_ENABLED and user_id:
+        return _openai_agent_json(user_id, _smart_function_system_prompt(), text, max_output_tokens=900)
     return _openai_json([
         {"role": "system", "content": _smart_function_system_prompt()},
         {"role": "user", "content": str(text or "")[:1000]},
@@ -6380,7 +6470,7 @@ def handle_smart_teacher_lookup(user_id, text, keep_mode=False, parsed_data=None
     """AI 只把口語整理成既有老師查詢；真正答案仍由 Google 老師資料庫提供。"""
     if not OPENAI_API_KEY:
         return None
-    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text)
+    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text, user_id=user_id)
     if not isinstance(data, dict) or data.get("intent") != "teacher_lookup":
         return None
     query = _smart_teacher_query_from_data(data)
@@ -6427,7 +6517,7 @@ def handle_smart_history_lookup(user_id, text, keep_mode=False, parsed_data=None
     """AI 只理解查單意圖；訂單內容仍全部來自 Google 訂單資料。"""
     if not OPENAI_API_KEY:
         return None
-    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text)
+    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text, user_id=user_id)
     if not isinstance(data, dict) or data.get("intent") != "history_lookup":
         return None
 
@@ -6486,7 +6576,7 @@ def handle_smart_function_fallback(user_id, text):
     compact = re.sub(r"\s+", "", str(text or ""))
     if compact in CONFIRM_WORDS or compact in EXIT_WORDS or len(compact) < 2:
         return None
-    data = smart_parse_function_text(text)
+    data = smart_parse_function_text(text, user_id=user_id)
     if not isinstance(data, dict):
         return None
     intent = str(data.get("intent", "") or "")
@@ -6513,6 +6603,12 @@ def handle_smart_function_fallback(user_id, text):
         if parsed:
             pending_other_orders[user_id] = parsed
             return make_other_order_confirmation(parsed)
+    if intent == "chat":
+        return _openai_agent_chat(user_id, text)
+    # v42 pilot：即使分類器不確定，也讓 AI 有一次自然對話機會，
+    # 但 system prompt 明確禁止它虛構公司內部資料或宣稱已寫入訂單。
+    if AI_AGENT_ENABLED and intent == "unknown":
+        return _openai_agent_chat(user_id, text)
     return None
 
 
@@ -6524,7 +6620,7 @@ def handle_smart_order_fallback(user_id, text):
     compact = re.sub(r"\\s+", "", str(text or ""))
     if compact in CONFIRM_WORDS or compact in EXIT_WORDS:
         return None
-    data = smart_parse_order_text(text)
+    data = smart_parse_order_text(text, user_id=user_id)
     if not isinstance(data, dict):
         return None
     intent = data.get("intent")
