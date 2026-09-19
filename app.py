@@ -40,6 +40,31 @@ guided_mode 目前有六種值："teacher_lookup"、"version_lookup"、
   - 除了「其他訂單」（一次性登記）之外，完成一次動作後預設繼續留在模式內，
     可以連續查詢，不用每次重打進入指令
 
+【多書訂購（2026-09 新增，一個班一種不同的書）】
+情境：「XX老師要訂七個班，各給一種不同的康軒歷史1測驗卷」——
+跟一般訂書「一本書、很多班級」的形狀完全不同，是「一位老師、
+很多本不同的書，一班配一本」。為了不動到既有的 order_flow（一般
+學校訂書）跟它高度共用的資料結構，這裡刻意另外開一個完全獨立的
+guided_mode = "multi_book_order_flow"，有自己獨立的
+multi_book_order_context 草稿字典，不共用 order_flow_context：
+  1. 問老師姓名（沿用既有老師模糊比對機制）
+  2. 問出版社關鍵字（可回覆「不限」跳過）
+  3. 問書名關鍵字（例如「歷史1測驗卷」）
+  4. 問要挑幾種 → 拿關鍵字＋出版社去書籍模糊比對，這次不是只取
+     分數最高的一筆，而是把所有分數達門檻的候選「全部」收下
+  5. 找到的種數如果剛好等於使用者要的數量，直接進下一步；
+     找到的數量對不上，會列出實際找到幾種，讓使用者選擇直接採用
+     或換關鍵字重查，不會自己亂湊數量
+  6. 請使用者依序告訴我這幾種書要給哪幾個班（一個班對一種書）
+  7. 確認畫面過了之後，逐筆呼叫既有的 write_to_google_sheet()
+     寫入，每個「班級＋書」各自是一筆獨立訂單——這代表 Google
+     Apps Script 完全不用新增任何 action，全部沿用學校訂單既有的
+     create_order。任何一筆寫入失敗都不會影響其他筆，最後會列出
+     成功／失敗清單，失敗的請使用者改用一般訂書流程手動補單。
+  目前這個功能還沒有像一般訂單一樣接訂購單 PDF（因為 PDF 產生器
+  假設一張訂單只有一本書），之後真的需要可以再擴充
+  generate_purchase_order_pdf()。
+
 【訂購單交付方式（2026-09 新增）】
 訂單確認完成後，使用者可以選擇讓機器人生成一張 PDF 版的訂購單，
 用來 email 給出版社（取代原本純文字、傳給業務轉單的做法）。
@@ -94,7 +119,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-smart-order-v38-final"
+APP_VERSION = "2026-09-19-smart-router-v39-multibook"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -738,6 +763,7 @@ def _route_message(user_id, user_text):
                 or is_history_mode_start(text)
                 or is_other_order_mode_start(text)
                 or is_stats_mode_start(text)
+                or is_multi_book_order_mode_start(text)
             )
 
             if starts_new_task:
@@ -802,6 +828,16 @@ def _route_message(user_id, user_text):
             "📚 補習班訂書\n\n"
             "請告訴我是哪一間補習班？\n"
             "例如：大大補習班、學思達補習班"
+        )
+
+    if is_multi_book_order_mode_start(text):
+        clear_task_states_for_new_mode(user_id)
+        guided_mode[user_id] = "multi_book_order_flow"
+        multi_book_order_context[user_id] = _new_multi_book_draft()
+        return (
+            "📚 多書訂購（一個班一種不同的書）\n\n"
+            "適合像「這位老師七個班，要各拿一種不同的康軒歷史1測驗卷」這種情境。\n\n"
+            "請先告訴我是哪一位老師？"
         )
 
     if is_version_mode_start(text):
@@ -953,6 +989,22 @@ def _route_message(user_id, user_text):
         cram_reply = handle_cram_order_flow(user_id, text)
         if cram_reply is not None:
             return cram_reply
+
+    if current_mode == "multi_book_order_flow":
+        if _is_exit_word(text):
+            multi_book_order_context.pop(user_id, None)
+            pending_name_confirmations.pop(user_id, None)
+            guided_mode.pop(user_id, None)
+            return get_main_menu_reply()
+
+        if user_id in pending_name_confirmations:
+            fuzzy_reply = handle_name_confirmation(user_id, text)
+            if fuzzy_reply is not None:
+                return fuzzy_reply
+
+        multi_book_reply = handle_multi_book_order_flow(user_id, text)
+        if multi_book_reply is not None:
+            return multi_book_reply
 
     # 0.9 名稱候選確認一定要早於訂書流程。
     if user_id in pending_name_confirmations:
@@ -1221,7 +1273,7 @@ def _route_message(user_id, user_text):
     # 19.5 智慧理解最後容錯：
     # 原本所有固定功能、guided_mode、資料庫規則都已經先跑完。
     # AI 只能在這裡協助理解「原本接不住的訂書口語」，不能搶走既有功能。
-    smart_reply = handle_smart_order_fallback(user_id, text)
+    smart_reply = handle_smart_function_fallback(user_id, text)
     if smart_reply is not None:
         return smart_reply
 
@@ -1287,6 +1339,7 @@ def get_main_menu_reply():
         "請告訴我你要使用哪一個功能：\n\n"
         "📚 要訂書 → 輸入「我要訂書」\n"
         "📚 補習班訂書 → 輸入「補習班訂書」\n"
+        "📚 一班一種不同的書 → 輸入「多書訂購」\n"
         "👨‍🏫 查個別老師 → 例如「謝明清有幾個班」\n"
         "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
         "👨‍🏫 查班級老師 → 例如「天母701老師」\n"
@@ -1534,6 +1587,11 @@ def handle_guided_history_lookup(user_id, text):
 
         return reply + "\n\n我還在「查訂單」模式，可以繼續輸入其他日期、訂單編號或老師。"
 
+    # 固定格式接不住時，最後才讓 AI 協助把口語整理成既有查訂單格式。
+    smart_reply = handle_smart_history_lookup(user_id, text, keep_mode=True)
+    if smart_reply is not None:
+        return smart_reply
+
     return get_history_lookup_guide_reply()
 
 
@@ -1559,6 +1617,7 @@ def clear_task_states_for_new_mode(user_id):
     pending_teacher_corrections.pop(user_id, None)
     teacher_lookup_context.pop(user_id, None)
     cram_order_context.pop(user_id, None)
+    multi_book_order_context.pop(user_id, None)
 
 def normalize_teacher_name_input(text):
     clean=re.sub(r"[，,。.!！?？\s]+","",str(text or ""))
@@ -1902,6 +1961,11 @@ def handle_guided_teacher_lookup(user_id,text):
     if fuzzy.get("status")=="confirm":
         pending_name_confirmations[user_id]={"field":"teacher","purpose":"guided_teacher_lookup","value":fuzzy.get("value",""),"school":fuzzy.get("school",""),"original":name}
         return ("🔎 我猜你可能打到同音字或錯字。\n\n"+f"你輸入：{name}\n你是指：{fuzzy.get('value','')}"+(f"（{fuzzy.get('school')}）" if fuzzy.get("school") else "")+" 嗎？\n\n請回覆「是」或「不是」。")
+    # 固定姓名／班級／科目規則都接不住時，才交給 AI 理解口語。
+    smart_reply = handle_smart_teacher_lookup(user_id, text, keep_mode=True)
+    if smart_reply is not None:
+        return smart_reply
+
     return "⚠️ 目前找不到這位老師。\n\n"+f"你輸入：{name}\n\n"+"我還在「查老師」模式。\n請直接重新輸入老師姓名，不用再打一次「查老師」。"
 
 # =========================================================
@@ -3302,6 +3366,456 @@ def handle_cram_order_flow(user_id, text):
         return validate_cram_item_book_input(user_id, clean, draft)
 
     return validate_cram_item_quantity_input(user_id, clean, draft)
+
+
+# =========================================================
+# 多書訂購流程（2026-09 新增，一個班一種不同的書）
+#
+# 跟學校訂書（order_flow：一本書、很多班級）、補習班訂書
+# （cram_order_flow：一間補習班、很多本書、不分班級）都不一樣，
+# 這裡是「一位老師、很多本『不同』的書，一個班對應一本」，
+# 例如：一位老師七個班，各拿一種不同的康軒歷史1測驗卷。
+#
+# 完全獨立的 guided_mode = "multi_book_order_flow" + 獨立的
+# multi_book_order_context 草稿字典，不會動到 order_flow_context，
+# 也不需要 Google Apps Script 新增任何 action：確認後是逐筆呼叫
+# 既有的 write_to_google_sheet()，把每個「班級＋書」都當成一筆
+# 獨立的學校訂單寫入，跟平常手動一班一班訂書寫進 Google 的資料
+# 格式完全相同。
+# =========================================================
+multi_book_order_context = {}
+_SESSION_DICTS["multi_book_order_context"] = multi_book_order_context
+
+# 書籍模糊比對分數門檻：只有達到這個分數的候選才會被視為「符合條件」
+# 一起收下，不是只取分數最高的一筆。門檻比照其他地方的「還算可信」
+# 標準（0.5 上下），故意不設太高，避免漏掉書名寫法差異較大的候選。
+MULTI_BOOK_MATCH_SCORE_THRESHOLD = 0.5
+# 一次最多處理幾種書／幾個班，純粹防呆，避免異常輸入。
+MULTI_BOOK_MAX_CANDIDATES = 15
+
+MULTI_BOOK_NO_PUBLISHER_WORDS = {"不限", "沒有限定", "不限出版社", "都可以", "沒有"}
+MULTI_BOOK_ACCEPT_FOUND_WORDS = {"採用", "就這些", "使用這些", "照這樣", "這樣就好"}
+MULTI_BOOK_RETRY_KEYWORD_WORDS = {"換關鍵字", "重新輸入", "重新搜尋", "重新查", "換一個"}
+
+
+def is_multi_book_order_mode_start(text):
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+    return compact in {
+        "多書訂購", "多書訂單", "不同書訂單", "各班不同書", "各班不同的書",
+        "多種書訂購", "我要訂不同的書", "多本不同的書", "一班一種書",
+        "我要多書訂購"
+    }
+
+
+def _new_multi_book_draft():
+    return {
+        "teacher": "", "school": "", "teacher_classes": [],
+        # publisher 用 None 代表「還沒問過」，跟使用者明確選「不限」
+        # 得到的空字串 "" 要分開，兩者意義不同。
+        "publisher": None,
+        "keyword": "", "expected_count": 0,
+        "candidates": [], "assignments": [],
+        "awaiting_decision": False, "awaiting_classes": False,
+        "confirming": False,
+    }
+
+
+def _apply_multi_book_teacher(user_id, draft, match):
+    teacher_classes = match.get("classes") or get_teacher_classes(
+        match["school"], match["teacher"]
+    ) or []
+
+    if not teacher_classes:
+        return f"⚠️ {match['teacher']} 目前查不到任何班級資料，請確認老師姓名是否正確。"
+
+    draft["teacher"] = match["teacher"]
+    draft["school"] = match["school"]
+    draft["teacher_classes"] = teacher_classes
+    multi_book_order_context[user_id] = draft
+    pending_name_confirmations.pop(user_id, None)
+
+    class_list = "、".join(c["class_name"] for c in sort_class_items(teacher_classes))
+    return (
+        f"老師：{draft['teacher']}（{draft['school']}）\n"
+        f"目前班級：{class_list}\n\n"
+        "請告訴我要限定哪個出版社？（例如「康軒」）\n"
+        "沒有要限定的話，請回覆「不限」。"
+    )
+
+
+def validate_multi_book_teacher_input(user_id, raw_text, draft):
+    clean = normalize_person_name(raw_text)
+    if not clean:
+        return "請告訴我是哪一位老師？"
+
+    exact_matches = lookup_teacher_matches(clean)
+
+    if len(exact_matches) == 1:
+        return _apply_multi_book_teacher(user_id, draft, exact_matches[0])
+
+    if len(exact_matches) > 1:
+        schools = "、".join(unique_list([m["school"] for m in exact_matches]))
+        return (
+            f"⚠️ 查到多位同名老師（{schools}），這個功能目前還不支援自動判斷學校。\n\n"
+            "請改用「學校＋老師姓名」重新輸入，例如「天母國中王小明」。"
+        )
+
+    match = resolve_fuzzy_name("teacher", clean)
+
+    if match.get("status") == "auto":
+        matches = lookup_teacher_matches(match["value"], school=match.get("school", ""))
+        if len(matches) == 1:
+            return _apply_multi_book_teacher(user_id, draft, matches[0])
+        return "⚠️ 老師資料庫目前找不到唯一符合的班級資料，請重新輸入老師姓名。"
+
+    if match.get("status") == "confirm":
+        pending_name_confirmations[user_id] = {
+            "purpose": "multi_book_teacher",
+            "field": "teacher",
+            "value": match["value"],
+            "school": match.get("school", ""),
+            "original": clean,
+        }
+        multi_book_order_context[user_id] = draft
+        return (
+            "🔎 我猜你可能打到同音字或錯字。\n\n"
+            f"你輸入：{clean}\n你是指：{match['value']} 嗎？\n\n"
+            "請回覆「是」或「不是」。"
+        )
+
+    return f"⚠️ 老師資料庫目前找不到符合的老師「{clean}」，請重新輸入姓名。"
+
+
+def validate_multi_book_publisher_input(user_id, raw_text, draft):
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
+
+    if clean in MULTI_BOOK_NO_PUBLISHER_WORDS:
+        draft["publisher"] = ""
+        multi_book_order_context[user_id] = draft
+        return "好，出版社不限。\n\n請告訴我書名關鍵字，例如「歷史1測驗卷」。"
+
+    if not clean:
+        return "請告訴我出版社關鍵字，或回覆「不限」。"
+
+    candidates = lookup_fuzzy_candidates("publisher", clean)
+    if not candidates:
+        return (
+            "⚠️ 出版社資料庫目前找不到符合資料。\n\n"
+            f"你輸入：{clean}\n\n請重新輸入出版社名稱，或回覆「不限」。"
+        )
+
+    first = candidates[0]
+    value = str(first.get("value", "") or "").strip()
+    score = float(first.get("score", 0) or 0)
+
+    if value == clean or (value and score >= 0.6):
+        draft["publisher"] = value or clean
+        multi_book_order_context[user_id] = draft
+        return f"出版社：{draft['publisher']}\n\n請告訴我書名關鍵字，例如「歷史1測驗卷」。"
+
+    options = []
+    seen = set()
+    for c in candidates[:3]:
+        c_value = str(c.get("value", "") or "").strip()
+        if c_value and c_value not in seen:
+            seen.add(c_value)
+            options.append({"value": c_value})
+    options.append({"value": clean, "raw": True})
+
+    pending_name_confirmations[user_id] = {
+        "purpose": "multi_book_publisher",
+        "field": "publisher",
+        "options": options,
+        "original": clean,
+    }
+    multi_book_order_context[user_id] = draft
+
+    lines = ["🔎 出版社名稱可能有錯字，找到以下接近的候選。", "", f"你輸入：{clean}", ""]
+    for i, opt in enumerate(options[:-1], start=1):
+        lines.append(f"{i}. {opt['value']}")
+    lines.append(f"{len(options)}. 都不是，直接用「{clean}」")
+    lines.append("")
+    lines.append("請回覆數字選擇；回覆「確認」等同選第 1 個。")
+    return "\n".join(lines)
+
+
+def validate_multi_book_keyword_input(user_id, raw_text, draft):
+    clean = clean_book_name(str(raw_text or "").strip())
+    if not clean:
+        return "請告訴我書名關鍵字，例如「歷史1測驗卷」。"
+    draft["keyword"] = clean
+    multi_book_order_context[user_id] = draft
+    return f"關鍵字：{clean}\n\n這次要挑幾種不同的書？請直接輸入數字，例如「7」。"
+
+
+def validate_multi_book_count_input(user_id, raw_text, draft):
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
+    m = re.fullmatch(r"([0-9]{1,3}|[一二三四五六七八九十]{1,3})種?", clean)
+    if not m:
+        return "請直接告訴我要挑幾種書，用數字回覆就好，例如「7」。"
+
+    raw_count = m.group(1)
+    count = int(raw_count) if raw_count.isdigit() else int(_CN_NUM_MAP.get(raw_count, 0) or 0)
+
+    if not count or count <= 0 or count > MULTI_BOOK_MAX_CANDIDATES:
+        return f"數量要介於 1～{MULTI_BOOK_MAX_CANDIDATES} 之間，請重新輸入。"
+
+    draft["expected_count"] = count
+    multi_book_order_context[user_id] = draft
+    return _run_multi_book_search(user_id, draft)
+
+
+def _run_multi_book_search(user_id, draft):
+    query = draft.get("keyword", "")
+    publisher = draft.get("publisher") or ""
+
+    candidates = lookup_book_candidates_enhanced(query, publisher=publisher)
+    matched = [
+        c for c in candidates
+        if float(c.get("score", 0) or 0) >= MULTI_BOOK_MATCH_SCORE_THRESHOLD
+    ]
+    matched = matched[:MULTI_BOOK_MAX_CANDIDATES]
+
+    expected = draft.get("expected_count", 0)
+
+    if not matched:
+        draft["expected_count"] = 0
+        multi_book_order_context[user_id] = draft
+        return (
+            "⚠️ 依照目前條件完全查不到符合的書。\n\n"
+            f"出版社：{publisher or '不限'}\n關鍵字：{query}\n\n"
+            "請重新輸入書名關鍵字（出版社維持剛才的設定）。"
+        )
+
+    draft["candidates"] = matched
+    multi_book_order_context[user_id] = draft
+
+    if len(matched) == expected:
+        draft["awaiting_decision"] = False
+        draft["awaiting_classes"] = True
+        multi_book_order_context[user_id] = draft
+        return make_multi_book_candidates_reply(draft, exact=True)
+
+    draft["awaiting_decision"] = True
+    multi_book_order_context[user_id] = draft
+    return make_multi_book_candidates_reply(draft, exact=False)
+
+
+def make_multi_book_candidates_reply(draft, exact):
+    candidates = draft.get("candidates", [])
+    lines = ["🔎 找到符合的書：", ""]
+    for i, c in enumerate(candidates, start=1):
+        lines.append(f"{i}. [{c.get('publisher', '') or draft.get('publisher', '')}] {c.get('value', '')}")
+    lines.append("")
+
+    if exact:
+        class_list = "、".join(
+            c["class_name"] for c in sort_class_items(draft.get("teacher_classes", []))
+        )
+        lines.append(f"共 {len(candidates)} 種，符合你要的數量。")
+        lines.append("")
+        lines.append(
+            f"請依照上面清單的順序，依序告訴我要給哪 {len(candidates)} 個班"
+            "（用空格或逗號分隔）。"
+        )
+        lines.append(f"{draft.get('teacher', '')} 目前班級：{class_list}")
+    else:
+        expected = draft.get("expected_count", 0)
+        lines.append(f"共找到 {len(candidates)} 種，跟你說的 {expected} 種不一樣。")
+        lines.append("")
+        lines.append("回覆「採用」直接用這幾種；或直接輸入新的書名關鍵字重新查詢。")
+
+    return "\n".join(lines)
+
+
+def handle_multi_book_search_mismatch(user_id, clean, draft):
+    if clean in MULTI_BOOK_ACCEPT_FOUND_WORDS:
+        draft["expected_count"] = len(draft.get("candidates", []))
+        draft["awaiting_decision"] = False
+        draft["awaiting_classes"] = True
+        multi_book_order_context[user_id] = draft
+        return make_multi_book_candidates_reply(draft, exact=True)
+
+    if clean in MULTI_BOOK_RETRY_KEYWORD_WORDS:
+        draft["keyword"] = ""
+        draft["expected_count"] = 0
+        draft["candidates"] = []
+        draft["awaiting_decision"] = False
+        multi_book_order_context[user_id] = draft
+        return "好，請重新告訴我書名關鍵字。"
+
+    # 使用者沒有回覆固定詞，就當成直接打了新的書名關鍵字，
+    # 維持原本出版社與種數設定，重新查一次。
+    draft["keyword"] = clean_book_name(clean)
+    draft["awaiting_decision"] = False
+    multi_book_order_context[user_id] = draft
+    return _run_multi_book_search(user_id, draft)
+
+
+def validate_multi_book_classes_input(user_id, raw_text, draft):
+    parts = [p for p in re.split(r"[，,、\s]+", str(raw_text or "").strip()) if p]
+
+    if not parts:
+        return "請依序輸入班級名稱，用空格或逗號分隔。"
+
+    known_names = {c["class_name"] for c in draft.get("teacher_classes", [])}
+    unknown = [p for p in parts if p not in known_names]
+
+    if unknown:
+        available = "、".join(
+            c["class_name"] for c in sort_class_items(draft.get("teacher_classes", []))
+        )
+        return (
+            f"⚠️ 這幾個班級對不上 {draft.get('teacher', '')} 的資料：{'、'.join(unknown)}\n\n"
+            f"{draft.get('teacher', '')} 目前班級：{available}\n\n"
+            "請重新輸入，用空格或逗號分隔。"
+        )
+
+    if len(unique_list(parts)) != len(parts):
+        return "⚠️ 班級名稱重複了，請確認每個班只出現一次後重新輸入。"
+
+    expected = len(draft.get("candidates", []))
+    if len(parts) != expected:
+        return (
+            f"⚠️ 目前有 {expected} 種書，但你輸入了 {len(parts)} 個班級，兩者數量要一樣。\n\n"
+            "請重新輸入班級名稱（用空格或逗號分隔）。"
+        )
+
+    class_lookup = {c["class_name"]: c for c in draft.get("teacher_classes", [])}
+    assignments = []
+    for class_name, book_item in zip(parts, draft["candidates"]):
+        info = class_lookup[class_name]
+        assignments.append({
+            "class_name": class_name,
+            "students": int(info.get("students", 0) or 0),
+            "book": str(book_item.get("value", "") or ""),
+            "publisher": str(book_item.get("publisher", "") or draft.get("publisher") or ""),
+        })
+
+    draft["assignments"] = assignments
+    draft["awaiting_classes"] = False
+    draft["confirming"] = True
+    multi_book_order_context[user_id] = draft
+    return make_multi_book_order_confirmation(draft)
+
+
+def make_multi_book_order_confirmation(draft):
+    lines = [
+        "📚 多書訂購確認（一個班一種書）", "",
+        f"老師：{draft.get('teacher', '')}（{draft.get('school', '')}）", ""
+    ]
+    total = 0
+    for i, item in enumerate(draft.get("assignments", []), start=1):
+        lines.append(
+            f"{i}. {item['class_name']}（{item['students']}本）→ "
+            f"[{item['publisher']}] {item['book']}"
+        )
+        total += item["students"]
+    lines.append("")
+    lines.append(f"共 {len(draft.get('assignments', []))} 種書，總數量：{total}本")
+    lines.append("")
+    lines.append("確認無誤請回覆「確認」。")
+    lines.append("要取消這筆多書訂單請回覆「取消」。")
+    return "\n".join(lines)
+
+
+def handle_multi_book_confirm_stage(user_id, clean, draft):
+    if _is_confirm_word(clean):
+        return confirm_multi_book_order(user_id)
+
+    if _is_exit_word(clean) or clean in {"不要了", "這筆不要"}:
+        multi_book_order_context.pop(user_id, None)
+        guided_mode.pop(user_id, None)
+        return "❌ 已取消這筆多書訂單，Google 沒有寫入。"
+
+    return (
+        make_multi_book_order_confirmation(draft)
+        + "\n\n（沒看懂你的回覆，請回覆「確認」或「取消」。）"
+    )
+
+
+def confirm_multi_book_order(user_id):
+    draft = multi_book_order_context.get(user_id)
+    if not draft or not draft.get("assignments"):
+        return "⚠️ 找不到尚未確認的多書訂單，請重新輸入。"
+
+    teacher = draft.get("teacher", "")
+    school = draft.get("school", "")
+    results = []
+
+    # 逐筆寫入既有的學校訂單（一個班對一本書），跟平常一班一班手動
+    # 訂書寫進 Google 的資料格式完全相同，也沿用同一套「寫入只送一次
+    # ＋事後驗證」機制（見 write_to_google_sheet）。任何一筆失敗都不
+    # 會影響其他筆已經成功寫入的訂單。
+    for item in draft["assignments"]:
+        order = {
+            "teacher": teacher,
+            "school": school,
+            "book": item["book"],
+            "publisher": item["publisher"],
+            "classes": [{"class_name": item["class_name"], "students": item["students"]}],
+        }
+        success, order_number = write_to_google_sheet(order)
+        results.append({
+            "class_name": item["class_name"],
+            "book": item["book"],
+            "publisher": item["publisher"],
+            "success": success,
+            "order_number": order_number,
+        })
+
+    multi_book_order_context.pop(user_id, None)
+    guided_mode.pop(user_id, None)
+    pending_name_confirmations.pop(user_id, None)
+
+    ok = [r for r in results if r["success"]]
+    failed = [r for r in results if not r["success"]]
+
+    lines = ["✅ 多書訂單已處理", ""]
+    for r in ok:
+        lines.append(
+            f"✔️ {r['class_name']} → [{r['publisher']}] {r['book']}"
+            f"（訂單編號 {r['order_number']}）"
+        )
+    if failed:
+        lines.append("")
+        lines.append("⚠️ 以下幾筆寫入失敗，請稍後改用一般訂書流程手動補上：")
+        for r in failed:
+            lines.append(f"❌ {r['class_name']} → [{r['publisher']}] {r['book']}")
+
+    lines.append("")
+    lines.append(f"成功 {len(ok)} 筆／共 {len(results)} 筆。")
+
+    return "\n".join(lines)
+
+
+def handle_multi_book_order_flow(user_id, text):
+    clean = normalize_order_typo(text)
+
+    draft = multi_book_order_context.get(user_id)
+    if draft is None:
+        draft = _new_multi_book_draft()
+        multi_book_order_context[user_id] = draft
+
+    if draft.get("confirming"):
+        return handle_multi_book_confirm_stage(user_id, clean, draft)
+
+    if draft.get("awaiting_classes"):
+        return validate_multi_book_classes_input(user_id, clean, draft)
+
+    if draft.get("awaiting_decision"):
+        return handle_multi_book_search_mismatch(user_id, clean, draft)
+
+    if not draft.get("teacher"):
+        return validate_multi_book_teacher_input(user_id, clean, draft)
+
+    if draft.get("publisher") is None:
+        return validate_multi_book_publisher_input(user_id, clean, draft)
+
+    if not draft.get("keyword"):
+        return validate_multi_book_keyword_input(user_id, clean, draft)
+
+    return validate_multi_book_count_input(user_id, clean, draft)
 
 
 def normalize_order_typo(text):
@@ -5358,6 +5872,210 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
     return _enter_cram_confirm_stage(user_id, draft)
 
 
+def _smart_function_system_prompt():
+    return """你是 LINE 訂書系統的「意圖與欄位抽取器」，不是聊天機器人。
+只輸出 JSON，不能回答使用者問題，也不能自行補不存在的資料；不確定就留空。
+intent 只能是：teacher_lookup、history_lookup、version_lookup、stats_lookup、school_order、cram_order、other_order、unknown。
+
+輸出欄位固定為：
+{
+  "intent":"unknown",
+  "teacher":"",
+  "school":"",
+  "grade":"",
+  "subject":"",
+  "class_name":"",
+  "order_number":"",
+  "date_text":"",
+  "publisher":"",
+  "book":"",
+  "classes":[],
+  "cram_school":"",
+  "items":[],
+  "normalized_query":""
+}
+
+判斷原則：
+- 查某位老師、某班老師、某年級某科老師 => teacher_lookup
+- 查以前訂單、某老師訂書紀錄、某日期訂單、訂單編號 => history_lookup
+- 查學校教科書版本 => version_lookup
+- 查學校/年級/班級學生人數 => stats_lookup
+- 明確要學校老師訂書/下單 => school_order
+- 明確要補習班訂書 => cram_order
+- 文具、書面紙等非教科書登記 => other_order
+- 只是聊天、確認、取消、無法判斷 => unknown
+
+normalized_query 請盡量改寫成系統既有簡短格式，例如：
+「幫我看看華興國一現在用什麼數學課本」=>「華興國一數學版本」
+「我想知道張建國是教哪些班」=>「張建國有幾個班」
+「王老師昨天有沒有訂東西」=> date_text="昨天", teacher="王老師"（不要虛構訂單）
+只有使用者明確表達訂書/下單時，才能判成 school_order/cram_order。"""
+
+
+def smart_parse_function_text(text):
+    if not OPENAI_API_KEY:
+        return None
+    return _openai_json([
+        {"role": "system", "content": _smart_function_system_prompt()},
+        {"role": "user", "content": str(text or "")[:1000]},
+    ], max_output_tokens=650)
+
+
+def _smart_teacher_query_from_data(data):
+    teacher = str(data.get("teacher", "") or "").strip()
+    school = str(data.get("school", "") or "").strip()
+    grade = str(data.get("grade", "") or "").strip()
+    subject = str(data.get("subject", "") or "").strip()
+    class_name = str(data.get("class_name", "") or "").strip()
+    if school and class_name:
+        return f"{school}{class_name}老師"
+    if school and grade and subject:
+        return f"{school}{grade}{subject}老師"
+    if teacher:
+        return f"{teacher}有幾個班"
+    return ""
+
+
+def handle_smart_teacher_lookup(user_id, text, keep_mode=False, parsed_data=None):
+    """AI 只把口語整理成既有老師查詢；真正答案仍由 Google 老師資料庫提供。"""
+    if not OPENAI_API_KEY:
+        return None
+    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text)
+    if not isinstance(data, dict) or data.get("intent") != "teacher_lookup":
+        return None
+    query = _smart_teacher_query_from_data(data)
+    if not query:
+        query = str(data.get("normalized_query", "") or "").strip()
+    if not query:
+        return None
+
+    class_query = parse_class_teacher_query(query)
+    if class_query:
+        reply = handle_class_teacher_query(class_query)
+    else:
+        subject_query = parse_subject_teacher_query(query)
+        if subject_query:
+            reply = handle_subject_teacher_query(subject_query)
+        else:
+            teacher = str(data.get("teacher", "") or "").strip()
+            if not teacher:
+                teacher = normalize_teacher_name_input(query)
+            if not teacher:
+                return None
+            matches = lookup_teacher_matches(teacher, school=str(data.get("school", "") or "").strip())
+            if len(matches) == 1:
+                reply = finish_teacher_lookup(user_id, matches[0])
+            elif len(matches) > 1:
+                schools = unique_list([m.get("school", "") for m in matches if m.get("school")])
+                reply = f"🔎 找到同名老師。\n\n老師：{teacher}\n學校：{'、'.join(schools)}\n\n請輸入「學校＋老師姓名」。"
+            else:
+                fuzzy = resolve_fuzzy_name("teacher", teacher, school=str(data.get("school", "") or "").strip())
+                if fuzzy.get("status") == "auto":
+                    cm = lookup_teacher_matches(str(fuzzy.get("value", "") or "").strip(), school=str(fuzzy.get("school", "") or "").strip())
+                    if len(cm) == 1:
+                        reply = finish_teacher_lookup(user_id, cm[0])
+                    else:
+                        return None
+                else:
+                    return None
+    if keep_mode and guided_mode.get(user_id) == "teacher_lookup":
+        return reply + "\n\n我還在「查老師」模式，可以繼續查下一位老師，或打「主選單」離開。"
+    return reply
+
+
+def handle_smart_history_lookup(user_id, text, keep_mode=False, parsed_data=None):
+    """AI 只理解查單意圖；訂單內容仍全部來自 Google 訂單資料。"""
+    if not OPENAI_API_KEY:
+        return None
+    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text)
+    if not isinstance(data, dict) or data.get("intent") != "history_lookup":
+        return None
+
+    number = str(data.get("order_number", "") or "").strip()
+    if number:
+        number = normalize_order_number(number)
+        order = lookup_google_order(number)
+        if not order:
+            return f"⚠️ 查不到訂單 {number}。"
+        historical_order_context[user_id] = order
+        if not keep_mode:
+            guided_mode.pop(user_id, None)
+        return make_historical_order_with_offer(user_id, order)
+
+    date_text = str(data.get("date_text", "") or "").strip()
+    teacher = str(data.get("teacher", "") or "").strip()
+    # 同時包含日期＋老師時，先按日期查，再在本地篩老師，避免 AI 自己判斷資料內容。
+    if date_text:
+        parsed_date = parse_guided_date(date_text)
+        if parsed_date:
+            orders = lookup_orders_by_date(parsed_date)
+            if orders is None:
+                return "⚠️ 訂單查詢暫時失敗，請稍後再試。"
+            if teacher:
+                key = normalize_teacher_name_input(teacher)
+                orders = [o for o in orders if key and key in normalize_teacher_name_input(str(o.get("teacher", "") or ""))]
+            if not orders:
+                label = f"{parsed_date}｜{teacher}" if teacher else parsed_date
+                return f"📅 {label} 目前查不到訂書訂單。"
+            if len(orders) == 1:
+                historical_order_context[user_id] = orders[0]
+            reply = make_daily_orders_reply(parsed_date, orders)
+            if keep_mode:
+                reply += "\n\n我還在「查訂單」模式，可以繼續查其他日期、編號或老師。"
+            return reply
+
+    if teacher:
+        matches = lookup_teacher_matches(teacher, school=str(data.get("school", "") or "").strip())
+        canonical = str(matches[0].get("teacher", "") or "").strip() if len(matches) == 1 else teacher
+        orders = lookup_book_orders_by_teacher(canonical)
+        if not orders:
+            return f"⚠️ 查不到這位老師的訂書紀錄。\n\n老師：{canonical}"
+        if len(orders) == 1:
+            historical_order_context[user_id] = orders[0]
+        reply = make_teacher_book_orders_reply(canonical, orders)
+        if keep_mode:
+            reply += "\n\n我還在「查訂單」模式，可以繼續查其他日期、編號或老師。"
+        return reply
+    return None
+
+
+def handle_smart_function_fallback(user_id, text):
+    """全域 AI 路由器：所有既有規則失敗後才執行，不直接產生資料庫答案。"""
+    if not OPENAI_API_KEY:
+        return None
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if compact in CONFIRM_WORDS or compact in EXIT_WORDS or len(compact) < 2:
+        return None
+    data = smart_parse_function_text(text)
+    if not isinstance(data, dict):
+        return None
+    intent = str(data.get("intent", "") or "")
+
+    if intent == "teacher_lookup":
+        return handle_smart_teacher_lookup(user_id, text, parsed_data=data)
+    if intent == "history_lookup":
+        return handle_smart_history_lookup(user_id, text, parsed_data=data)
+    if intent in {"school_order", "cram_order"}:
+        # 訂書仍沿用昨天已驗證的專用抽取器，避免全域分類器改變既有訂書品質。
+        return handle_smart_order_fallback(user_id, text)
+
+    normalized = str(data.get("normalized_query", "") or "").strip()
+    if intent == "version_lookup" and normalized:
+        query = parse_school_version_query(user_id, normalized)
+        if query:
+            return handle_school_version_query(query)
+    if intent == "stats_lookup" and normalized:
+        query = parse_school_stats_query(user_id, normalized)
+        if query:
+            return handle_school_stats_query(query)
+    if intent == "other_order" and normalized:
+        parsed = parse_other_order(user_id, normalized)
+        if parsed:
+            pending_other_orders[user_id] = parsed
+            return make_other_order_confirmation(parsed)
+    return None
+
+
 def handle_smart_order_fallback(user_id, text):
     """只有所有既有固定功能都接不住時才執行；失敗就回 None。"""
     if not OPENAI_API_KEY:
@@ -5668,6 +6386,28 @@ def handle_name_confirmation(user_id, text):
                 draft["current_publisher"] = str(chosen.get("publisher", "") or "").strip()
             cram_order_context[user_id] = draft
             return "這本要訂幾本？"
+
+        if pending.get("purpose") == "multi_book_teacher":
+            draft = multi_book_order_context.get(user_id)
+            if not draft:
+                return "✅ 已確認名稱。請重新輸入剛才多書訂購的老師姓名。"
+            matches = lookup_teacher_matches(
+                chosen.get("value", ""), school=chosen.get("school", "")
+            )
+            if len(matches) == 1:
+                return _apply_multi_book_teacher(user_id, draft, matches[0])
+            return (
+                "⚠️ 確認名稱後仍找不到唯一老師資料，"
+                "請直接輸入「學校＋老師姓名」重新輸入。"
+            )
+
+        if pending.get("purpose") == "multi_book_publisher":
+            draft = multi_book_order_context.get(user_id)
+            if not draft:
+                return "✅ 已確認名稱。請重新輸入剛才多書訂購的出版社。"
+            draft["publisher"] = str(chosen.get("value", "") or "").strip()
+            multi_book_order_context[user_id] = draft
+            return f"出版社：{draft['publisher']}\n\n請告訴我書名關鍵字，例如「歷史1測驗卷」。"
 
         draft = order_flow_context.get(user_id)
         if not draft:
