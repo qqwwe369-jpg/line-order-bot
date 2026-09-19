@@ -127,7 +127,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-19-smart-router-v39-multibook-v6-grade-shorthand"
+APP_VERSION = "2026-09-19-v40-multibook-message-ui-v1"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -336,7 +336,7 @@ for _env_name, _env_value in [
     if not _env_value:
         logger.warning(f"啟動時發現環境變數未設定：{_env_name}")
 
-FIXED_FALLBACK_MESSAGE = "👑 LeBron James 正在想辦法處理中，請稍後再試一次。"
+FIXED_FALLBACK_MESSAGE = "⚠️ 這句我目前還無法確定你的意思。\n\n你可以換個方式再說一次，或輸入「功能」查看可以使用的功能。"
 
 DEFAULT_SCHOOL = os.environ.get("DEFAULT_SCHOOL", "天母國中")
 
@@ -1403,6 +1403,15 @@ def _guided_mode_escape_reply(user_id, text):
         guided_mode.pop(user_id, None)
         return handle_order_flow(user_id, text)
 
+    # 完全沒提到班級（不管數字還是文字班級），但這句話看起來就是要
+    # 訂書（例如「訂段考王國文6」），而且剛好知道是哪位老師——這種
+    # 情況預設成這位老師的「全部班級」，跟既有一步一步訂書流程「沒
+    # 指定班級就預設全部班」的行為一致，最後還是會先出確認畫面讓
+    # 使用者看過班級清單才寫入 Google。
+    if teacher_context and _looks_like_order_for_known_teacher_no_class(text, teacher_context):
+        guided_mode.pop(user_id, None)
+        return handle_order_flow(user_id, text)
+
     return None
 
 
@@ -1410,22 +1419,19 @@ def _guided_mode_escape_reply(user_id, text):
 # 引導式主選單／查老師模式
 # =========================================================
 def get_main_menu_reply():
+    _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
     return (
-        "🔄 已重新開始\n\n"
-        "請告訴我你要使用哪一個功能：\n\n"
-        "📚 要訂書 → 輸入「我要訂書」\n"
-        "📚 補習班訂書 → 輸入「補習班訂書」\n"
-        "📚 一班一種不同的書 → 輸入「多書訂購」\n"
-        "👨‍🏫 查個別老師 → 例如「謝明清有幾個班」\n"
-        "👨‍🏫 查各科老師 → 例如「華興七年級歷史老師」\n"
-        "👨‍🏫 查班級老師 → 例如「天母701老師」\n"
-        "📖 要查版本 → 輸入「查版本」\n"
-        "📅 要查訂單 → 輸入「查訂單」\n"
-        "📊 要查人數 → 例如「天母七年級人數」\n"
-        "📦 其他訂單 → 輸入「其他訂單」\n"
-        "📊 今日訂單統計 → 輸入「統計」\n\n"
-        "完成一個查詢後，下一句會重新當成新的對話。"
+        "🏠 大漢訂書小幫手｜主選單\n\n"
+        "直接告訴我你要做什麼就可以，不用背指令。\n\n"
+        "📚 訂書｜例如：王老師701、703訂國一數學講義\n"
+        "👨‍🏫 查老師｜例如：謝明清有幾個班\n"
+        "📅 查訂單｜例如：查001、昨天的訂單\n"
+        "📖 查版本｜例如：華興七年級英文版本\n"
+        "📊 查人數｜例如：天母七年級人數\n\n"
+        "其他功能：補習班訂書、多書訂購、其他訂單、今日統計、照片訂書。\n"
+        "需要完整說明時，輸入「功能」。"
     )
+
 
 def is_teacher_mode_start(text):
     compact=re.sub(r"[\s，,。.!！?？]+","",str(text or ""))
@@ -1474,23 +1480,24 @@ def is_stats_mode_start(text):
 def get_history_lookup_guide_reply():
     return (
         "📅 訂單查詢\n\n"
-        "請直接告訴我要怎麼查：\n"
-        "• 今天 → 輸入「今天」\n"
-        "• 昨天 → 輸入「昨天」\n"
-        "• 指定日期 → 例如「8月30日」\n"
-        "• 訂單編號 → 例如「001」\n"
-        "• 老師 → 例如「王老師」\n\n"
-        "查不到時我會繼續留在「查訂單」模式。"
+        "直接告訴我你想找哪一張：\n\n"
+        "• 今天／昨天\n"
+        "• 8月30日\n"
+        "• 001 或 查001\n"
+        "• 王老師的訂單\n\n"
+        "查到訂單後，可以直接修改班級數量或取消訂單。"
     )
+
 
 
 def get_stats_lookup_guide_reply():
     return (
         "📊 學生人數查詢\n\n"
-        "請輸入「學校＋年級」。\n"
+        "請告訴我「學校＋年級」。\n"
         "例如：天母七年級、華興高一\n\n"
-        "查完一次後我會繼續留在「查人數」模式，可以連續查下一個年級。"
+        "查完後可以直接接著查下一個年級。"
     )
+
 
 
 def _finish_guided_mode(user_id, reply):
@@ -2092,10 +2099,12 @@ def get_greeting_reply():
     _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
     return (
         "📚 大漢訂書小幫手\n\n"
-        "嗨！今天要處理什麼？直接跟我說就可以，或點下面的按鈕 👇\n"
-        f"例如：「{p1}老師701、703訂國一數學講義」\n\n"
-        "想看更多功能（補習班訂書／多書訂購／其他訂單...），輸入「有什麼功能」。"
+        "你好！直接告訴我今天要處理什麼，我會一步一步幫你完成。\n\n"
+        f"例如：{p1}老師701、703訂國一數學講義\n\n"
+        "也可以直接點下面的快速按鈕 👇\n"
+        "想看全部功能，輸入「功能」即可。"
     )
+
 
 def is_help_request(text):
     compact = re.sub(r"\s+", "", str(text or "").lower())
@@ -2114,18 +2123,22 @@ def get_help_reply():
     p3 = _pick_players(1)[0]
     _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
     return (
-        "📚 大漢訂書小幫手｜功能\n\n"
-        "常用的幾個都可以直接點下面按鈕，或直接用一般口語講就好，"
-        "不用先打指令，例如：\n\n"
-        "📚 訂書 →「王老師701、703訂國一數學講義」\n"
-        "👨‍🏫 查老師 →「謝明清有幾個班」\n"
-        "📅 查訂單 →「查001」或「昨天的訂單」\n"
-        "📖 查版本 →「華興七年級英文版本」\n"
-        "📊 查人數 →「天母七年級人數」\n\n"
-        "其他還有：🏫 補習班訂書、📚 多書訂購（一班一本不同的書）、"
-        f"📦 其他訂單（例如「天母{p3}老師書面紙20張」）、📊 今日統計、📷 照片訂書。\n\n"
-        "原本固定指令永遠優先；只有規則接不住時，才會用智慧理解協助。"
+        "📚 大漢訂書小幫手｜功能一覽\n\n"
+        "不用背指令，直接用平常說話的方式告訴我就可以。\n\n"
+        "📚 訂書\n  王老師701、703訂國一數學講義\n"
+        "👨‍🏫 查老師\n  謝明清有幾個班\n"
+        "📅 查訂單\n  查001／昨天的訂單\n"
+        "📖 查版本\n  華興七年級英文版本\n"
+        "📊 查人數\n  天母七年級人數\n\n"
+        "更多功能\n"
+        "🏫 補習班訂書\n"
+        "📚 多書訂購（一個班配一本不同的書）\n"
+        f"📦 其他訂單｜例如：天母{p3}老師書面紙20張\n"
+        "📊 今日訂單統計\n"
+        "📷 照片訂書\n\n"
+        "任何時候輸入「主選單」可以離開目前流程；輸入「重來」會清除目前進度。"
     )
+
 
 # =========================================================
 # 訂書流程
@@ -2612,6 +2625,18 @@ def handle_order_flow(user_id, text):
         recent = conversation_context.get(user_id)
         if recent and looks_like_contextual_class_book(clean, recent):
             parsed = parse_contextual_class_book(clean, recent)
+        elif recent and _looks_like_order_for_known_teacher_no_class(clean, recent):
+            # 這句話完全沒提到任何班級，純粹只有書名（例如「訂段考王
+            # 國文6」），預設成這位老師的全部班級——跟既有一步一步
+            # 訂書流程「沒指定班級就預設全部班」的行為一致。最後還是
+            # 會先出確認畫面列出全部班級，使用者按確認才會真的寫入。
+            parsed = dict(parsed)
+            parsed["teacher"] = recent.get("teacher", "")
+            parsed["school"] = recent.get("school", "")
+            parsed["classes"] = [
+                str(item.get("class_name"))
+                for item in recent.get("classes", [])
+            ]
 
     if user_id in order_flow_context:
         parsed = merge_followup_into_parsed(clean, parsed, draft)
@@ -2663,31 +2688,26 @@ def handle_order_flow(user_id, text):
 
 
 def make_order_guide_reply(draft):
-    lines = ["📚 訂書", ""]
-
-    if draft.get("teacher"):
-        teacher_display = str(draft.get("teacher") or "").strip()
-        school_display = str(draft.get("school") or "").strip()
-        if school_display:
-            lines.append(f"老師：{teacher_display}（{school_display}）")
-        else:
-            lines.append(f"老師：{teacher_display}")
-    if draft.get("publisher"):
-        lines.append(f"出版社：{draft['publisher']}")
-    if draft.get("book"):
-        lines.append(f"書名：{draft['book']}")
-
-    if len(lines) > 2:
-        lines.append("")
-
-    if not draft.get("teacher"):
-        lines.append("請告訴我是哪一位老師？")
-    elif not draft.get("book"):
-        lines.append("請告訴我要訂哪一本書？")
-    elif not draft.get("publisher"):
-        lines.append("這本書目前無法從資料庫確認出版社，請告訴我出版社。")
-
+    lines = ["📚 訂書進度", ""]
+    teacher = str(draft.get("teacher") or "").strip()
+    school = str(draft.get("school") or "").strip()
+    publisher = str(draft.get("publisher") or "").strip()
+    book = str(draft.get("book") or "").strip()
+    lines.append(f"{'✅' if teacher else '⬜'} 老師：{teacher or '尚未提供'}")
+    if school:
+        lines.append(f"   學校：{school}")
+    lines.append(f"{'✅' if book else '⬜'} 書名：{book or '尚未提供'}")
+    if publisher:
+        lines.append(f"   出版社：{publisher}")
+    lines.append("")
+    if not teacher:
+        lines.append("👉 請告訴我是哪一位老師？")
+    elif not book:
+        lines.append("👉 請告訴我要訂哪一本書？")
+    elif not publisher:
+        lines.append("👉 目前無法確認出版社，請告訴我出版社名稱。")
     return "\n".join(lines)
+
 
 
 def parse_order_message(text):
@@ -3089,19 +3109,12 @@ def make_cram_items_progress_reply(draft):
 def make_cram_order_confirmation(draft):
     items = draft.get("items", [])
     total = sum(int(item.get("quantity", 0) or 0) for item in items)
-
-    lines = ["📚 補習班訂購確認", "", f"補習班：{draft.get('cram_school', '')}", ""]
+    lines = ["📚 補習班訂單｜請確認", "", f"🏫 補習班：{draft.get('cram_school', '')}", "", "📖 訂購內容"]
     for i, item in enumerate(items, start=1):
-        lines.append(
-            f"{i}. [{item.get('publisher', '')}] {item.get('book', '')}"
-            f" x{int(item.get('quantity', 0) or 0)}本"
-        )
-    lines.append("")
-    lines.append(f"共 {len(items)} 種書，總數量：{total}本")
-    lines.append("")
-    lines.append("確認無誤請回覆「確認」。")
-    lines.append("若要調整，可以說「刪除2」刪掉第2項，或直接告訴我下一本的出版社繼續加。")
+        lines.append(f"{i}. [{item.get('publisher', '')}] {item.get('book', '')}｜{int(item.get('quantity', 0) or 0)}本")
+    lines += ["", f"📦 共 {len(items)} 種｜合計 {total} 本", "", "確認無誤 → 回覆「確認」", "刪除品項 → 例如「刪除2」", "繼續加書 → 直接輸入下一本書"]
     return "\n".join(lines)
+
 
 
 def validate_cram_school_input(user_id, raw_text, draft):
@@ -4128,6 +4141,19 @@ def _find_and_strip_letter_classes(text, known_class_names):
     return unique_list(found), remaining
 
 
+def _looks_like_order_for_known_teacher_no_class(text, context):
+    """
+    完全沒提到任何班級（數字或文字班級都沒有），但句子本身看起來就
+    是要訂書（例如「訂段考王國文6」），而且剛好知道這是哪位老師。
+    只有 context 裡真的有老師＋班級資料才會成立；判斷「像不像要訂書」
+    直接沿用 parse_order_message() 既有的規則，不另外發明一套。
+    """
+    if not context.get("teacher") or not context.get("classes"):
+        return False
+    parsed = parse_order_message(text)
+    return bool(parsed.get("has_order_intent") and parsed.get("book"))
+
+
 def looks_like_contextual_class_book(text, context):
     known = [
         str(item.get("class_name"))
@@ -4303,22 +4329,19 @@ def sort_class_items(items):
 # 新訂單確認／修改
 # =========================================================
 def make_order_confirmation(order):
-    class_lines = [
-        f"{item['class_name']}：{int(item['students'])}本"
-        for item in sort_class_items(order.get("classes", []))
-    ]
-
+    class_lines = [f"• {item['class_name']}｜{int(item['students'])} 本" for item in sort_class_items(order.get("classes", []))]
     return (
         "📚 訂購確認\n\n"
-        f"老師：{order['teacher']}\n"
-        f"學校：{order['school']}\n"
-        f"書名：{order['book']}\n"
-        f"出版社：{order['publisher']}\n\n"
-        + "\n".join(class_lines)
-        + f"\n\n總數量：{int(order.get('quantity', 0))}本\n\n"
-        "確認無誤請回覆「確認」。\n"
-        "若班級不對，直接告訴我要保留、增加或取消哪些班級。"
+        f"🏫 學校：{order['school']}\n"
+        f"👨‍🏫 老師：{order['teacher']}\n"
+        f"📖 書名：{order['book']}\n"
+        f"🏢 出版社：{order['publisher']}\n\n"
+        "📋 班級與數量\n" + "\n".join(class_lines) +
+        f"\n\n📦 總數量：{int(order.get('quantity', 0))} 本\n\n"
+        "確認無誤 → 回覆「確認」\n"
+        "需要修改 → 直接告訴我要增加、取消或更改哪些班級。"
     )
+
 
 
 def make_purchase_order_text(offer):
@@ -4969,47 +4992,26 @@ def handle_teacher_followup(user_id):
 def make_teacher_reply(school, teacher, classes):
     total = calculate_total(classes)
     display_teacher = re.sub(r"老師$", "", str(teacher or "").strip())
-
     subjects = []
     for item in classes or []:
         item_subjects = item.get("subjects", [])
-        if isinstance(item_subjects, str):
-            item_subjects = [item_subjects]
-
+        if isinstance(item_subjects, str): item_subjects = [item_subjects]
         single_subject = str(item.get("subject", "") or "").strip()
-        if single_subject:
-            item_subjects = list(item_subjects or []) + [single_subject]
-
+        if single_subject: item_subjects = list(item_subjects or []) + [single_subject]
         for subject in item_subjects or []:
             subject = str(subject or "").strip()
-            if subject and subject not in subjects:
-                subjects.append(subject)
-
-    lines = [
-        f"• {item['class_name']}班：{int(item['students'])}人"
-        for item in classes
-    ]
-
-    subject_line = (
-        f"科目：{'、'.join(subjects)}\n"
-        if subjects else ""
-    )
-
+            if subject and subject not in subjects: subjects.append(subject)
+    lines = [f"• {item['class_name']}班｜{int(item['students'])} 人" for item in classes]
+    subject_line = f"📘 科目：{'、'.join(subjects)}\n" if subjects else ""
     return (
-        ""
-        "👨‍🏫 老師資料庫\n"
-        f"學校：{school}\n"
-        f"老師：{display_teacher}\n"
-        + subject_line
-        + "\n"
-        f"📚 班級總數：{len(classes)}個班\n\n"
-        "各班人數：\n"
-        + "\n".join(lines)
-        + f"\n\n👥 總學生人數：{total}人\n\n"
-        "以上是目前 Google「老師班級資料」中的完整資料。\n\n"
-        "💡 要幫他訂書的話，可以直接輸入「班級＋書名」（例如「701康軒英文」），"
-        "不用再打一次「我要訂書」；單純查詢的話不用理會這行。"
+        "👨‍🏫 老師資料\n\n"
+        f"🏫 學校：{school}\n"
+        f"👤 老師：{display_teacher}\n" + subject_line +
+        f"📚 班級：{len(classes)} 個｜👥 共 {total} 人\n\n"
+        "班級人數\n" + "\n".join(lines) +
+        "\n\n💡 要幫這位老師訂書，直接輸入「班級＋書名」即可。"
     )
+
 
 
 # =========================================================
@@ -5182,25 +5184,19 @@ def confirm_history_update(user_id):
 
 
 def make_history_update_confirmation(original_order, new_order, changes):
-    lines = [
-        f"{item['class_name']}：{int(item['students'])}本"
-        for item in new_order.get("classes", [])
-    ]
-
+    lines = [f"• {item['class_name']}｜{int(item['students'])} 本" for item in new_order.get("classes", [])]
     return (
-        "🔄 訂單修改確認\n\n"
-        f"訂單編號：{new_order['order_number']}\n"
-        f"老師：{new_order['teacher']}\n"
-        f"書名：{new_order['book']}\n\n"
-        "修改內容：\n"
-        + "\n".join(changes)
-        + "\n\n修改後：\n"
-        + "\n".join(lines)
-        + f"\n\n原總數：{original_order['quantity']}本"
-        + f"\n新總數：{new_order['quantity']}本\n\n"
-        "如果正確，請回覆「確認」或「確認修改」\n"
-        "不要修改請回覆「取消修改」"
+        "✏️ 訂單修改｜請確認\n\n"
+        f"📋 訂單：{new_order['order_number']}\n"
+        f"👨‍🏫 老師：{new_order['teacher']}\n"
+        f"📖 書名：{new_order['book']}\n\n"
+        "本次修改\n" + "\n".join(changes) +
+        "\n\n修改後\n" + "\n".join(lines) +
+        f"\n\n📦 總數量：{original_order['quantity']} → {new_order['quantity']} 本\n\n"
+        "確認修改 → 回覆「確認」\n"
+        "放棄修改 → 回覆「取消修改」"
     )
+
 
 
 def make_historical_order_with_offer(user_id, order):
@@ -5232,38 +5228,25 @@ def make_historical_order_with_offer(user_id, order):
 
 
 def make_historical_order_reply(order):
-    lines = [
-        f"{item['class_name']}：{int(item['students'])}本"
-        for item in order.get("classes", [])
-    ]
-
+    lines = [f"• {item['class_name']}｜{int(item['students'])} 本" for item in order.get("classes", [])]
     message = (
-        "📋 歷史訂單\n\n"
-        f"訂單編號：{order['order_number']}\n"
-        f"老師：{order.get('teacher', '')}\n"
-        f"學校：{order.get('school', '')}\n"
-        f"書名：{order.get('book', '')}\n"
-        f"出版社：{order.get('publisher', '')}\n\n"
-        + "\n".join(lines)
-        + f"\n\n總數量：{int(order.get('quantity', 0))}本\n"
-        + f"狀態：{order.get('status', '')}"
+        "📋 訂單明細\n\n"
+        f"🔢 訂單編號：{order['order_number']}\n"
+        f"🏫 學校：{order.get('school', '')}\n"
+        f"👨‍🏫 老師：{order.get('teacher', '')}\n"
+        f"📖 書名：{order.get('book', '')}\n"
+        f"🏢 出版社：{order.get('publisher', '')}\n\n"
+        "班級與數量\n" + "\n".join(lines) +
+        f"\n\n📦 總數量：{int(order.get('quantity', 0))} 本\n"
+        f"📌 狀態：{order.get('status', '')}"
     )
-
-    if order.get("order_time"):
-        message += f"\n訂購時間：{order['order_time']}"
-    if order.get("last_modified"):
-        message += f"\n最後修改：{order['last_modified']}"
-    if order.get("modification_log"):
-        message += f"\n修改紀錄：{order['modification_log']}"
-    if order.get("note"):
-        message += f"\n備註：{order['note']}"
-
-    message += (
-        "\n\n如果要調整，可以直接說：\n"
-        "701改28本\n"
-        "如果整張不要，可以說：取消這張"
-    )
+    if order.get("order_time"): message += f"\n🕒 訂購時間：{order['order_time']}"
+    if order.get("last_modified"): message += f"\n✏️ 最後修改：{order['last_modified']}"
+    if order.get("modification_log"): message += f"\n📝 修改紀錄：{order['modification_log']}"
+    if order.get("note"): message += f"\n📎 備註：{order['note']}"
+    message += "\n\n可直接操作：\n• 修改數量：例如「701改28本」\n• 取消整張：輸入「取消這張」"
     return message
+
 
 
 def parse_teacher_book_order_query(text):
@@ -5408,14 +5391,15 @@ def parse_history_cancel_request(text):
 
 def make_history_cancel_confirmation(order):
     return (
-        "⚠️ 歷史訂單取消確認\n\n"
-        f"訂單編號：{order.get('order_number', '')}\n"
-        f"老師：{order.get('teacher', '')}\n"
-        f"書名：{order.get('book', '')}\n"
-        f"總數量：{int(order.get('quantity', 0) or 0)}本\n\n"
-        "如果確定整張取消，請回覆「確認取消」\n"
-        "不要取消請回覆「取消修改」"
+        "⚠️ 取消訂單｜請再次確認\n\n"
+        f"🔢 訂單：{order.get('order_number', '')}\n"
+        f"👨‍🏫 老師：{order.get('teacher', '')}\n"
+        f"📖 書名：{order.get('book', '')}\n"
+        f"📦 總數量：{int(order.get('quantity', 0) or 0)} 本\n\n"
+        "確定取消整張 → 回覆「確認取消」\n"
+        "保留訂單 → 回覆「取消修改」"
     )
+
 
 
 def confirm_history_cancel(user_id):
@@ -5850,15 +5834,14 @@ def parse_other_order(user_id, text):
 
 def make_other_order_confirmation(order):
     return (
-        "🧾 其他訂單確認\n\n"
-        f"學校：{order['school']}\n"
-        f"老師：{order['teacher']}\n"
-        f"項目：{order['item']}\n"
-        "進度：（空白）\n"
-        "備註：（空白）\n\n"
-        "如果正確，請回覆「確認」\n"
-        "不要這筆請回覆「取消」"
+        "📦 其他訂單｜請確認\n\n"
+        f"🏫 學校：{order['school']}\n"
+        f"👨‍🏫 老師：{order['teacher']}\n"
+        f"🧾 品項：{order['item']}\n\n"
+        "確認新增 → 回覆「確認」\n"
+        "不要這筆 → 回覆「取消」"
     )
+
 
 
 def confirm_other_order(user_id):
@@ -7120,35 +7103,16 @@ def lookup_orders_by_date(date_text):
 def get_today_order_stats_reply():
     date_text = datetime.now().strftime("%Y-%m-%d")
     orders = lookup_orders_by_date(date_text)
-
-    if orders is None:
-        return "⚠️ 訂單統計暫時查詢失敗，請稍後再試一次。"
-
-    if not orders:
-        return f"📊 {date_text} 目前還沒有任何訂書訂單。"
-
+    if orders is None: return "⚠️ 今日訂單統計暫時無法讀取，請稍後再試。"
+    if not orders: return f"📊 今日訂單統計｜{date_text}\n\n目前還沒有訂書訂單。"
     total_books = sum(int(o.get("quantity", 0) or 0) for o in orders)
-
     publisher_counts = {}
     for o in orders:
         publisher = str(o.get("publisher", "") or "未標示出版社").strip()
         publisher_counts[publisher] = publisher_counts.get(publisher, 0) + 1
+    publisher_lines = [f"• {name}｜{count} 筆" for name, count in sorted(publisher_counts.items(), key=lambda x: -x[1])]
+    return "\n".join([f"📊 今日訂單統計｜{date_text}", "", f"🧾 訂單：{len(orders)} 筆", f"📚 總數：{total_books} 本", "", "出版社分布", *publisher_lines])
 
-    publisher_lines = [
-        f"• {name}：{count} 筆"
-        for name, count in sorted(publisher_counts.items(), key=lambda x: -x[1])
-    ]
-
-    lines = [
-        f"📊 {date_text} 訂單統計",
-        "",
-        f"訂單筆數：{len(orders)} 筆",
-        f"總計本數：{total_books} 本",
-        "",
-        "依出版社："
-    ] + publisher_lines
-
-    return "\n".join(lines)
 
 
 def cancel_google_order(order_number):
@@ -7683,46 +7647,20 @@ def generate_cram_purchase_order_pdf(offer):
 
 
 def build_purchase_order_reply(offer):
-    """
-    產生 PDF 後決定怎麼交付。目前只有 "link" 模式：給下載連結，
-    使用者自己存檔後手動 email 給出版社／補習班。
-
-    offer 若帶 kind="cram"，走補習班版排版（generate_cram_purchase_order_pdf）；
-    否則走學校版（generate_purchase_order_pdf）。兩者共用同一顆印章。
-
-    之後要新增「機器人直接寄信給出版社」時：
-    1. 需要一份「出版社 -> email」對照表（建議另開 Google 試算表分頁，
-       Apps Script 加一個 action="lookup_publisher_email" 供這裡查表）。
-    2. 需要 SMTP 寄件帳密（建議申請專用 email 帳號，不要用私人信箱），
-       放在環境變數，不要寫死在程式碼裡。
-    3. 寫一個 send_purchase_order_email(offer, pdf_path) 函式負責寄信，
-       在下面 PURCHASE_ORDER_DELIVERY_MODE == "email" 分支呼叫它；
-       寄信成功才回傳「已寄出」訊息，失敗要 fallback 回連結模式，
-       避免使用者誤以為已經寄出去了。
-    """
-    if offer.get("kind") == "cram":
-        token, path = generate_cram_purchase_order_pdf(offer)
-    else:
-        token, path = generate_purchase_order_pdf(offer)
-
-    if not token:
-        return "❌ 訂購單 PDF 產生失敗，請稍後再試一次。"
-
-    if PURCHASE_ORDER_DELIVERY_MODE == "email":
-        # TODO：尚未實作，見上方函式說明。目前先 fallback 回連結模式。
-        logger.warning("email delivery mode not implemented yet, falling back to link")
-
+    if offer.get("kind") == "cram": token, path = generate_cram_purchase_order_pdf(offer)
+    else: token, path = generate_purchase_order_pdf(offer)
+    if not token: return "❌ 訂購單 PDF 產生失敗，請稍後再試一次。"
+    if PURCHASE_ORDER_DELIVERY_MODE == "email": logger.warning("email delivery mode not implemented yet, falling back to link")
     base_url = (PUBLIC_BASE_URL or request.url_root).rstrip("/")
     download_url = f"{base_url}/purchase-order/{token}.pdf"
-
     recipient = "出版社" if offer.get("kind") != "cram" else "補習班或出版社"
-
     return (
-        "📄 訂購單 PDF 已經產生好了\n\n"
+        "📄 訂購單 PDF 已產生\n\n"
         f"{download_url}\n\n"
-        f"點開後存到手機/電腦，再用信箱 App 把這個 PDF 附加上去 email 給{recipient}。\n"
-        f"這個連結 {_purchase_order_ttl_display()}內有效，過期要回來重新產生一次。"
+        f"請開啟連結下載 PDF，再附加到 Email 寄給{recipient}。\n"
+        f"⏳ 連結有效期限：{_purchase_order_ttl_display()}。過期後可回 LINE 重新產生。"
     )
+
 
 
 # =========================================================
