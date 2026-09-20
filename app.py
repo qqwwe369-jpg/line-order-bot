@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v53-reviewed-crashfix"
+APP_VERSION = "2026-09-20-v53-po-sixers-style"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -9039,6 +9039,11 @@ STAMP_PHONE = os.environ.get("STAMP_PHONE", "電話：(02) 2833-3838")
 STAMP_ADDRESS = os.environ.get("STAMP_ADDRESS", "台北市士林區美崙街96號")
 STAMP_COLOR = colors.Color(0.72, 0.06, 0.06)  # 印章紅
 
+# 訂購單版面配色：道奇藍（Dodger Blue），取代原本置中復古風的黑白配色。
+PO_ACCENT_COLOR = colors.HexColor("#ED174C")
+PO_ACCENT_LIGHT = colors.HexColor("#FCE7EC")
+PO_SECONDARY_COLOR = colors.HexColor("#006BB6")
+
 
 def _draw_purchase_order_stamp(c, doc):
     """
@@ -9072,21 +9077,20 @@ def _draw_purchase_order_stamp(c, doc):
         2 * mm, stroke=1, fill=0
     )
 
-    c.setFont(CJK_FONT_NAME, 13)
-    c.drawCentredString(stamp_width / 2, stamp_height - 9 * mm, STAMP_COMPANY_NAME)
+    c.setFont(CJK_FONT_NAME, 17)
+    c.drawCentredString(stamp_width / 2, stamp_height - 10 * mm, STAMP_COMPANY_NAME)
 
-    c.setFont(CJK_FONT_NAME, 6.3)
-    c.drawCentredString(stamp_width / 2, stamp_height - 15.2 * mm, STAMP_ADDRESS)
-    c.drawCentredString(stamp_width / 2, stamp_height - 19.6 * mm, STAMP_PHONE)
+    c.setFont(CJK_FONT_NAME, 8.5)
+    c.drawCentredString(stamp_width / 2, stamp_height - 17.3 * mm, STAMP_ADDRESS)
+    c.drawCentredString(stamp_width / 2, stamp_height - 22.3 * mm, STAMP_PHONE)
 
     c.restoreState()
 
 
 def generate_purchase_order_pdf(offer):
     """把訂購單內容畫成 A5（約 A4 一半）大小的 PDF，回傳 (token, path)；
-    失敗回傳 (None, None)。版面刻意抓真實訂購單的樣子：標題＋雙欄
-    資訊區＋品項表＋合計＋簽章欄，右下角再蓋一個仿印章的紅色戳記，
-    不追求完整正式格式，但至少讓出版社收到時一眼就看得出是正式單據。
+    失敗回傳 (None, None)。版面：左靠標題＋道奇藍資訊區塊＋道奇藍表頭
+    品項表＋合計＋簽章欄，右下角再蓋一個仿印章的紅色戳記。
     """
     if not _CJK_FONT_READY:
         logger.error("purchase order pdf skipped: CJK font not registered")
@@ -9104,21 +9108,25 @@ def generate_purchase_order_pdf(offer):
 
     doc = SimpleDocTemplate(
         path, pagesize=A5,
-        topMargin=13 * mm, bottomMargin=42 * mm,
+        topMargin=18 * mm, bottomMargin=42 * mm,
         leftMargin=14 * mm, rightMargin=14 * mm
     )
 
     title_style = ParagraphStyle(
-        "title", fontName=CJK_FONT_NAME, fontSize=17, leading=22,
-        alignment=1, spaceAfter=2
+        "title", fontName=CJK_FONT_NAME, fontSize=21, leading=26,
+        alignment=0, textColor=PO_SECONDARY_COLOR
     )
     subtitle_style = ParagraphStyle(
-        "subtitle", fontName=CJK_FONT_NAME, fontSize=9, leading=13,
-        alignment=1, textColor=colors.grey, spaceAfter=10
+        "subtitle", fontName=CJK_FONT_NAME, fontSize=10.5, leading=15,
+        alignment=0, textColor=colors.grey, spaceAfter=8
     )
-    label_style = ParagraphStyle("label", fontName=CJK_FONT_NAME, fontSize=10, leading=16)
+    label_style = ParagraphStyle("label", fontName=CJK_FONT_NAME, fontSize=12, leading=18)
+    label_bold_style = ParagraphStyle(
+        "label_bold", fontName=CJK_FONT_NAME, fontSize=12, leading=18,
+        textColor=PO_SECONDARY_COLOR
+    )
     small_style = ParagraphStyle(
-        "small", fontName=CJK_FONT_NAME, fontSize=8.5, leading=13, textColor=colors.grey
+        "small", fontName=CJK_FONT_NAME, fontSize=10, leading=15, textColor=colors.grey
     )
 
     elements = [
@@ -9127,19 +9135,24 @@ def generate_purchase_order_pdf(offer):
     ]
 
     info_data = [
-        [f"訂購人：士林大漢", f"日期：{date_str}"],
-        [f"學校：{school}", f"出版社：{publisher}"],
+        ["訂購人", "士林大漢", "日期", date_str],
+        ["學校", school, "出版社", publisher],
     ]
-    info_table = Table(info_data, colWidths=[48 * mm, 48 * mm])
+    info_table = Table(info_data, colWidths=[18 * mm, 42 * mm, 18 * mm, 42 * mm])
     info_table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), CJK_FONT_NAME),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LINEBELOW", (0, -1), (-1, -1), 0.8, colors.black),
+        ("FONTSIZE", (0, 0), (-1, -1), 12),
+        ("TEXTCOLOR", (0, 0), (0, -1), PO_SECONDARY_COLOR),
+        ("TEXTCOLOR", (2, 0), (2, -1), PO_SECONDARY_COLOR),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("BACKGROUND", (0, 0), (-1, -1), PO_ACCENT_LIGHT),
+        ("BOX", (0, 0), (-1, -1), 0.6, PO_ACCENT_COLOR),
+        ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.white),
     ]))
     elements.append(info_table)
-    elements.append(Spacer(1, 10))
+    elements.append(Spacer(1, 12))
 
     table_data = [["書名", "班級", "數量"]]
     for item in classes:
@@ -9151,23 +9164,25 @@ def generate_purchase_order_pdf(offer):
     table = Table(table_data, colWidths=[62 * mm, 22 * mm, 22 * mm])
     table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), CJK_FONT_NAME),
-        ("FONTSIZE", (0, 0), (-1, -1), 9.5),
-        ("GRID", (0, 0), (-1, -2), 0.6, colors.HexColor("#999999")),
-        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.black),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
+        ("FONTSIZE", (0, 0), (-1, -1), 11.5),
+        ("BACKGROUND", (0, 0), (-1, 0), PO_ACCENT_COLOR),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, PO_ACCENT_LIGHT]),
+        ("LINEABOVE", (0, -1), (-1, -1), 1, PO_SECONDARY_COLOR),
+        ("TEXTCOLOR", (0, -1), (-1, -1), PO_SECONDARY_COLOR),
         ("ALIGN", (1, 0), (2, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LINEBELOW", (0, 1), (-1, -2), 0.4, colors.HexColor("#CCCCCC")),
     ]))
     elements.append(table)
-    elements.append(Spacer(1, 12))
+    elements.append(Spacer(1, 14))
 
-    elements.append(Paragraph("備註：麻煩教用貨單集中", label_style))
-    elements.append(Paragraph(f"外箱備註：{school}", label_style))
+    elements.append(Paragraph("備註　麻煩教用貨單集中", label_style))
+    elements.append(Paragraph(f"外箱備註　{school}", label_style))
     elements.append(Spacer(1, 10))
-    elements.append(Paragraph("以上訂單　麻煩幫我處理", label_style))
-    elements.append(Paragraph("感謝！！！", label_style))
+    elements.append(Paragraph("以上訂單　麻煩幫我處理　感謝！！！", label_bold_style))
     elements.append(Spacer(1, 20))
     elements.append(Paragraph("訂購人簽章：＿＿＿＿＿＿＿＿＿＿＿＿", small_style))
 
@@ -9213,21 +9228,25 @@ def generate_cram_purchase_order_pdf(offer):
 
     doc = SimpleDocTemplate(
         path, pagesize=A5,
-        topMargin=13 * mm, bottomMargin=42 * mm,
+        topMargin=18 * mm, bottomMargin=42 * mm,
         leftMargin=14 * mm, rightMargin=14 * mm
     )
 
     title_style = ParagraphStyle(
-        "title", fontName=CJK_FONT_NAME, fontSize=17, leading=22,
-        alignment=1, spaceAfter=2
+        "title", fontName=CJK_FONT_NAME, fontSize=21, leading=26,
+        alignment=0, textColor=PO_SECONDARY_COLOR
     )
     subtitle_style = ParagraphStyle(
-        "subtitle", fontName=CJK_FONT_NAME, fontSize=9, leading=13,
-        alignment=1, textColor=colors.grey, spaceAfter=10
+        "subtitle", fontName=CJK_FONT_NAME, fontSize=10.5, leading=15,
+        alignment=0, textColor=colors.grey, spaceAfter=8
     )
-    label_style = ParagraphStyle("label", fontName=CJK_FONT_NAME, fontSize=10, leading=16)
+    label_style = ParagraphStyle("label", fontName=CJK_FONT_NAME, fontSize=12, leading=18)
+    label_bold_style = ParagraphStyle(
+        "label_bold", fontName=CJK_FONT_NAME, fontSize=12, leading=18,
+        textColor=PO_SECONDARY_COLOR
+    )
     small_style = ParagraphStyle(
-        "small", fontName=CJK_FONT_NAME, fontSize=8.5, leading=13, textColor=colors.grey
+        "small", fontName=CJK_FONT_NAME, fontSize=10, leading=15, textColor=colors.grey
     )
 
     elements = [
@@ -9236,19 +9255,25 @@ def generate_cram_purchase_order_pdf(offer):
     ]
 
     info_data = [
-        [f"訂購人：士林大漢", f"日期：{date_str}"],
-        [f"補習班：{cram_school}", ""],
+        ["訂購人", "士林大漢", "日期", date_str],
+        ["補習班", cram_school, "", ""],
     ]
-    info_table = Table(info_data, colWidths=[48 * mm, 48 * mm])
+    info_table = Table(info_data, colWidths=[18 * mm, 42 * mm, 18 * mm, 42 * mm])
     info_table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), CJK_FONT_NAME),
-        ("FONTSIZE", (0, 0), (-1, -1), 10),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
-        ("LINEBELOW", (0, -1), (-1, -1), 0.8, colors.black),
+        ("FONTSIZE", (0, 0), (-1, -1), 12),
+        ("TEXTCOLOR", (0, 0), (0, -1), PO_SECONDARY_COLOR),
+        ("TEXTCOLOR", (2, 0), (2, -1), PO_SECONDARY_COLOR),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("BACKGROUND", (0, 0), (-1, -1), PO_ACCENT_LIGHT),
+        ("BOX", (0, 0), (-1, -1), 0.6, PO_ACCENT_COLOR),
+        ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.white),
+        ("SPAN", (1, 1), (3, 1)),
     ]))
     elements.append(info_table)
-    elements.append(Spacer(1, 10))
+    elements.append(Spacer(1, 12))
 
     table_data = [["出版社", "書名", "數量"]]
     for item in items:
@@ -9262,20 +9287,22 @@ def generate_cram_purchase_order_pdf(offer):
     table = Table(table_data, colWidths=[24 * mm, 60 * mm, 22 * mm])
     table.setStyle(TableStyle([
         ("FONTNAME", (0, 0), (-1, -1), CJK_FONT_NAME),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
-        ("GRID", (0, 0), (-1, -2), 0.6, colors.HexColor("#999999")),
-        ("LINEABOVE", (0, -1), (-1, -1), 0.8, colors.black),
-        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#f0f0f0")),
+        ("FONTSIZE", (0, 0), (-1, -1), 11),
+        ("BACKGROUND", (0, 0), (-1, 0), PO_ACCENT_COLOR),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, PO_ACCENT_LIGHT]),
+        ("LINEABOVE", (0, -1), (-1, -1), 1, PO_SECONDARY_COLOR),
+        ("TEXTCOLOR", (0, -1), (-1, -1), PO_SECONDARY_COLOR),
         ("ALIGN", (2, 0), (2, -1), "CENTER"),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("TOPPADDING", (0, 0), (-1, -1), 4),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LINEBELOW", (0, 1), (-1, -2), 0.4, colors.HexColor("#CCCCCC")),
     ]))
     elements.append(table)
-    elements.append(Spacer(1, 12))
+    elements.append(Spacer(1, 14))
 
-    elements.append(Paragraph("以上訂單　麻煩幫我處理", label_style))
-    elements.append(Paragraph("感謝！！！", label_style))
+    elements.append(Paragraph("以上訂單　麻煩幫我處理　感謝！！！", label_bold_style))
     elements.append(Spacer(1, 20))
     elements.append(Paragraph("訂購人簽章：＿＿＿＿＿＿＿＿＿＿＿＿", small_style))
 
