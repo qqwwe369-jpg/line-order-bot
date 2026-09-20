@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v53-image-ai-timeout-fix"
+APP_VERSION = "2026-09-20-v53-photo-book-candidates-fix"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -7341,6 +7341,28 @@ def _resolve_photo_book(book, publisher=""):
         return {"status": "publisher_choice", "book": top_value, "publishers": top_pubs}
     if top_score >= 0.78 and top_value and str(top.get("publisher", "") or "").strip():
         return {"status": "ok", "book": top_value, "publisher": str(top.get("publisher", "") or "").strip()}
+
+    # 完全沒有精準符合、信心也不夠高時，改成列出資料庫裡最接近的
+    # 候選讓使用者挑，而不是直接判定整本查無資料、放棄這批訂單。
+    # AI 讀圖辨識出來的字（尤其書名裡的字詞順序）常常跟資料庫的
+    # 正式登記不完全一樣，例如「國文講義新挑戰5」vs資料庫的
+    # 「新挑戰國文5」，這種情況精準比對一定失敗，但使用者一看就
+    # 知道是同一本，不該讓使用者重打一次。
+    book_choices = []
+    seen_bp = set()
+    for c in candidates[:5]:
+        value = str(c.get("value", "") or "").strip()
+        pub = str(c.get("publisher", "") or "").strip()
+        if not value:
+            continue
+        key = (value, pub)
+        if key in seen_bp:
+            continue
+        seen_bp.add(key)
+        book_choices.append({"book": value, "publisher": pub})
+    if book_choices:
+        return {"status": "book_choice", "book": book, "choices": book_choices}
+
     return {"status": "none", "book": book}
 
 
@@ -7391,6 +7413,8 @@ def _photo_school_batch_confirmation(batch):
             lines.append(f"   📝 {item['note']}")
     if batch.get("note"):
         lines.extend(["", f"📝 共同備註：{batch['note']}"])
+    if batch.get("dropped"):
+        lines.extend(["", f"⚠️ 以下書名資料庫查無資料，需要你自己另外處理：{'、'.join(batch['dropped'])}"])
     lines.extend(["", "以上資料正確請回覆「確認」。", "需要取消請回覆「取消」。"])
     return "\n".join(lines)
 
@@ -7405,6 +7429,8 @@ def _photo_cram_batch_confirmation(batch):
             lines.append(f"   📝 {item['note']}")
     if batch.get("note"):
         lines.extend(["", f"📝 共同備註：{batch['note']}"])
+    if batch.get("dropped"):
+        lines.extend(["", f"⚠️ 以下書名資料庫查無資料，需要你自己另外處理：{'、'.join(batch['dropped'])}"])
     lines.extend(["", "以上資料正確請回覆「確認」。", "需要取消請回覆「取消」。"])
     return "\n".join(lines)
 
@@ -7414,7 +7440,10 @@ def _continue_photo_resolution(user_id):
     if not batch:
         return None
 
-    for idx, item in enumerate(batch.get("items", [])):
+    items = batch.get("items", [])
+    drop_indexes = []
+
+    for idx, item in enumerate(items):
         if item.get("publisher"):
             continue
         resolved = _resolve_photo_book(item.get("book", ""))
@@ -7428,15 +7457,48 @@ def _continue_photo_resolution(user_id):
                 lines.append(f"{i}. {pub}")
             lines.extend(["", f"請回覆 1～{len(resolved['publishers'])}"])
             return "\n".join(lines)
+        if resolved["status"] == "book_choice":
+            batch["awaiting_book_index"] = idx
+            batch["book_options"] = resolved["choices"]
+            pending_photo_orders[user_id] = batch
+            lines = [
+                "📚 找不到完全一樣的書名", "",
+                f"我讀到的是：{resolved['book']}", "",
+                "資料庫裡比較接近的有："
+            ]
+            for i, opt in enumerate(resolved["choices"], 1):
+                pub_label = f"[{opt['publisher']}] " if opt.get("publisher") else ""
+                lines.append(f"{i}. {pub_label}{opt['book']}")
+            lines.append(f"{len(resolved['choices']) + 1}. 都不是，我直接用文字告訴你完整書名")
+            lines.extend(["", f"請回覆 1～{len(resolved['choices']) + 1}"])
+            return "\n".join(lines)
         if resolved["status"] != "ok":
-            pending_photo_orders.pop(user_id, None)
-            return f"⚠️ 我無法從書籍資料庫確認「{item.get('book','')}」。\n\n請改用文字輸入這本書的完整書名。"
+            # 這一本真的完全查不到，記下來之後跳過，不要因為一本
+            # 查不到就把整批（其他已經確認過的書）也一起丟掉。
+            drop_indexes.append(idx)
+            continue
         item["book"] = resolved["book"]
         item["publisher"] = resolved["publisher"]
 
+    dropped_books = [items[i].get("book", "") for i in drop_indexes]
+    if drop_indexes:
+        batch["items"] = [x for i, x in enumerate(items) if i not in drop_indexes]
+        batch["dropped"] = batch.get("dropped", []) + dropped_books
+
     batch.pop("awaiting_publisher_index", None)
     batch.pop("publisher_options", None)
+    batch.pop("awaiting_book_index", None)
+    batch.pop("book_options", None)
     pending_photo_orders[user_id] = batch
+
+    if not batch.get("items"):
+        pending_photo_orders.pop(user_id, None)
+        names = "、".join(batch.get("dropped", [])) or "這批書"
+        return (
+            f"⚠️ 「{names}」都無法從書籍資料庫確認。\n\n"
+            "請改用文字輸入完整書名。"
+        )
+
     if batch.get("kind") == "school":
         return _photo_school_batch_confirmation(batch)
     return _photo_cram_batch_confirmation(batch)
@@ -7446,7 +7508,7 @@ def handle_pending_photo_order(user_id, text):
     batch = pending_photo_orders.get(user_id)
     if not batch:
         return None
-    clean = re.sub(r"[\\s，,。.!！?？]+", "", str(text or ""))
+    clean = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
 
     if clean in {"取消", "不要了", "這筆不要", "取消訂單"}:
         pending_photo_orders.pop(user_id, None)
@@ -7469,6 +7531,45 @@ def handle_pending_photo_order(user_id, text):
         batch.pop("publisher_options", None)
         pending_photo_orders[user_id] = batch
         return _continue_photo_resolution(user_id)
+
+    book_idx = batch.get("awaiting_book_index")
+    if book_idx is not None:
+        choices = batch.get("book_options", [])
+        if clean.isdigit():
+            n = int(clean)
+            if 1 <= n <= len(choices):
+                chosen = choices[n - 1]
+                batch["items"][book_idx]["book"] = chosen["book"]
+                batch["items"][book_idx]["publisher"] = chosen["publisher"]
+                batch.pop("awaiting_book_index", None)
+                batch.pop("book_options", None)
+                pending_photo_orders[user_id] = batch
+                return _continue_photo_resolution(user_id)
+            if n == len(choices) + 1:
+                batch.pop("awaiting_book_index", None)
+                batch.pop("book_options", None)
+                batch["awaiting_manual_book_index"] = book_idx
+                pending_photo_orders[user_id] = batch
+                return "請直接輸入這本書的完整書名。"
+        return f"請回覆 1～{len(choices) + 1} 選擇書名。"
+
+    manual_idx = batch.get("awaiting_manual_book_index")
+    if manual_idx is not None:
+        resolved = _resolve_photo_book(text)
+        if resolved["status"] == "ok":
+            batch["items"][manual_idx]["book"] = resolved["book"]
+            batch["items"][manual_idx]["publisher"] = resolved["publisher"]
+            batch.pop("awaiting_manual_book_index", None)
+            pending_photo_orders[user_id] = batch
+            return _continue_photo_resolution(user_id)
+        if resolved["status"] in ("publisher_choice", "book_choice"):
+            # 使用者手動輸入的書名一樣有歧義，沿用同一套選擇流程繼續問，
+            # 不用另外再寫一次選擇邏輯。
+            batch["items"][manual_idx]["book"] = resolved["book"]
+            batch.pop("awaiting_manual_book_index", None)
+            pending_photo_orders[user_id] = batch
+            return _continue_photo_resolution(user_id)
+        return f"⚠️ 還是查不到「{text}」，請確認書名是否正確，或輸入「取消」放棄這筆訂單。"
 
     if _is_confirm_word(clean):
         return confirm_photo_order(user_id)
