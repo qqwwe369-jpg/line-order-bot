@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v8-bare-book-no-class"
+APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v9-ai-safety-net"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1561,6 +1561,12 @@ def handle_guided_version_lookup(user_id, text):
     clean = str(text or "").strip()
     school = extract_school_name(clean)
     if not school:
+        # 固定規則抓不到學校名稱，先讓 AI 試試看能不能從口語裡
+        # 理解使用者要查哪個學校／年級／科目的版本，接不住才退回
+        # 格式提示。
+        smart_reply = _guided_mode_smart_rescue(user_id, text, "version_lookup")
+        if smart_reply is not None:
+            return smart_reply
         return (
             "📖 教科書版本查詢\n\n"
             "我還在「查版本」模式。\n"
@@ -1612,6 +1618,9 @@ def handle_guided_version_lookup(user_id, text):
 def handle_guided_stats_lookup(user_id, text):
     query = parse_school_stats_query(user_id, str(text or "").strip(), require_keyword=False)
     if not query:
+        smart_reply = _guided_mode_smart_rescue(user_id, text, "stats_lookup")
+        if smart_reply is not None:
+            return smart_reply
         return (
             "📊 學生人數查詢\n\n"
             "我還在「查人數」模式。\n"
@@ -1735,6 +1744,10 @@ def handle_guided_other_order(user_id, text):
     if parsed:
         pending_other_orders[user_id] = parsed
         return make_other_order_confirmation(parsed)
+
+    smart_reply = _guided_mode_smart_rescue(user_id, text, "other_order")
+    if smart_reply is not None:
+        return smart_reply
 
     return (
         "📦 其他訂單\n\n"
@@ -2098,6 +2111,12 @@ def handle_guided_teacher_lookup(user_id,text):
         return reply + "\n\n我還在「查老師」模式，可以繼續查下一位老師，或打「主選單」離開。"
     name=normalize_teacher_name_input(text)
     if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}",name):
+        # 格式不像「2~4個中文字姓名」（例如使用者直接打書名、或用
+        # 比較口語的方式問），先讓 AI 試試看能不能理解，不要一律
+        # 卡死要求固定格式；AI 也接不住才退回格式提示。
+        smart_reply = handle_smart_teacher_lookup(user_id, text, keep_mode=True)
+        if smart_reply is not None:
+            return smart_reply
         return "👨‍🏫 老師查詢\n\n我還在查老師模式。\n請直接輸入 2～4 個中文字的老師姓名。"
     matches=lookup_teacher_matches(name+"老師",school="")
     if len(matches)==1: return finish_teacher_lookup(user_id,matches[0])
@@ -2267,7 +2286,20 @@ def validate_order_teacher_input(user_id, raw_text, draft):
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
     clean = re.sub(r"老師$", "", clean).strip()
     if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}", clean):
-        return "請輸入老師姓名，例如：蔡書玄"
+        # 格式不像「2~4個中文字姓名」，先讓 AI 試試看能不能從這句話
+        # 理解出老師姓名——只取姓名本身，不套用 AI 猜的書名／班級，
+        # 避免蓋掉這個草稿已經收集到的其他欄位；接不住才退回格式
+        # 提示。
+        if OPENAI_API_KEY:
+            ai_data = smart_parse_function_text(raw_text, user_id=user_id)
+            if isinstance(ai_data, dict) and ai_data.get("intent") in {"teacher_lookup", "school_order"}:
+                guessed_teacher = re.sub(
+                    r"老師$", "", str(ai_data.get("teacher", "") or "").strip()
+                )
+                if re.fullmatch(r"[\u4e00-\u9fff]{2,4}", guessed_teacher):
+                    clean = guessed_teacher
+        if not re.fullmatch(r"[\u4e00-\u9fff]{2,4}", clean):
+            return "請輸入老師姓名，例如：蔡書玄"
 
     school = str(draft.get("school") or "").strip()
 
@@ -7169,6 +7201,48 @@ def handle_smart_history_lookup(user_id, text, keep_mode=False, parsed_data=None
         if keep_mode:
             reply += "\n\n我還在「查訂單」模式，可以繼續查其他日期、編號或老師。"
         return reply
+    return None
+
+
+def _guided_mode_smart_rescue(user_id, text, expected_intent):
+    """
+    在「查版本／查人數／其他訂單」這幾個沒有自己專屬 AI 兜底函式的
+    引導模式裡，固定規則解析不出來時，讓 AI 意圖分類器試一次。
+    只有分類結果剛好符合「目前這個模式該做的事」（expected_intent）
+    才會真的執行、把結果寫回去；AI 判斷成別的意圖（例如使用者其實
+    是想查老師）一律不處理，回傳 None 讓呼叫端退回原本的格式提示，
+    避免 AI 自己把使用者帶離目前所在的模式。
+    """
+    if not OPENAI_API_KEY:
+        return None
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if compact in CONFIRM_WORDS or compact in EXIT_WORDS or len(compact) < 2:
+        return None
+
+    data = smart_parse_function_text(text, user_id=user_id)
+    if not isinstance(data, dict) or data.get("intent") != expected_intent:
+        return None
+
+    normalized = str(data.get("normalized_query", "") or "").strip()
+
+    if expected_intent == "version_lookup" and normalized:
+        query = parse_school_version_query(user_id, normalized)
+        if query:
+            reply = handle_school_version_query(query)
+            return reply + "\n\n我還在「查版本」模式，可以繼續輸入下一個學校／年級，或打「主選單」離開。"
+
+    if expected_intent == "stats_lookup" and normalized:
+        query = parse_school_stats_query(user_id, normalized)
+        if query:
+            reply = handle_school_stats_query(query)
+            return reply + "\n\n我還在「查人數」模式，可以繼續輸入下一個學校／年級，或打「主選單」離開。"
+
+    if expected_intent == "other_order" and normalized:
+        parsed = parse_other_order(user_id, normalized)
+        if parsed:
+            pending_other_orders[user_id] = parsed
+            return make_other_order_confirmation(parsed)
+
     return None
 
 
