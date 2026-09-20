@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v12-three-tier-menu"
+APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v14-cram-header-skip"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -3490,6 +3490,8 @@ def validate_cram_item_publisher_input(user_id, raw_text, draft):
         draft["current_publisher"] = value
         pending_name_confirmations.pop(user_id, None)
         cram_order_context[user_id] = draft
+        if draft.get("current_book"):
+            return f"出版社：{value}\n書名：{draft['current_book']}\n\n要幾本？"
         return "請告訴我書名？"
 
     if value and score >= 0.52:
@@ -6995,6 +6997,14 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
             quantity = int(item.get("quantity", 0) or 0)
         except Exception:
             quantity = 0
+
+        # 只有書名文字、完全沒有出版社也沒有數量（例如「國文第五冊」），
+        # 比較像是在說明後面幾本書屬於哪個科目／冊次的分類標題，不是
+        # 一本真的要訂的書。真的缺資料的書至少會有出版社或數量其中
+        # 一項，只有這種「兩項都空」的才跳過，不會誤刪真正不完整的書。
+        if book and not publisher and quantity <= 0:
+            continue
+
         if publisher or book or quantity:
             items.append({"publisher": publisher, "book": book, "quantity": quantity})
 
@@ -7010,6 +7020,16 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
     incomplete = next((x for x in items if not x["publisher"] or not x["book"] or x["quantity"] <= 0), None)
     if incomplete:
         if not incomplete["publisher"]:
+            # 書名如果已經有辨識到，先記住（current_book），等使用者
+            # 補上出版社時才不會遺失、也不用再問一次書名；訊息也直接
+            # 點名是哪一本，使用者才不用反問「哪一本」。
+            if incomplete["book"]:
+                draft["current_book"] = incomplete["book"]
+                cram_order_context[user_id] = draft
+                return (
+                    "我已經先記住能辨識的內容。\n\n"
+                    f"還有「{incomplete['book']}」缺出版社，請告訴我出版社。"
+                )
             return "我已經先記住能辨識的內容。\n\n還有一本缺出版社，請告訴我出版社。"
         if not incomplete["book"]:
             draft["current_publisher"] = incomplete["publisher"]
@@ -7640,6 +7660,8 @@ def handle_name_confirmation(user_id, text):
                 return "✅ 已確認名稱。請重新輸入剛才的補習班訂書內容。"
             draft["current_publisher"] = str(chosen.get("value", "") or "").strip()
             cram_order_context[user_id] = draft
+            if draft.get("current_book"):
+                return f"出版社：{draft['current_publisher']}\n書名：{draft['current_book']}\n\n要幾本？"
             return "請告訴我書名？"
 
         if pending.get("purpose") == "cram_book":
