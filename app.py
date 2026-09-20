@@ -73,28 +73,6 @@ multi_book_order_context 草稿字典，不共用 order_flow_context：
   假設一張訂單只有一本書），之後真的需要可以再擴充
   generate_purchase_order_pdf()。
 
-【AI Agent pilot（2026-09-20 新增，v42）】
-在既有「規則優先、AI 當最後容錯」的架構上，這次多加兩件事：
-  1. AI_AGENT_ENABLED（環境變數，預設開）：開啟後，原本的智慧路由／
-     圖片辨識改用 _openai_agent_json()／_openai_agent_chat()，會帶
-     上這個使用者最近幾輪對話（ai_agent_history，見 _remember_ai_turn），
-     讓「他呢？」「那本呢？」這種代名詞、省略主詞的講法也能被理解。
-     關掉這個環境變數會整個退回 v41 的單輪呼叫邏輯（_openai_json）。
-  2. 「一般對話」fallback：當規則跟意圖分類器都判斷不出來要做什麼
-     （intent 是 chat 或 unknown）時，才會讓 AI 自由對話一次——
-     system prompt 明確禁止它虛構老師／班級／訂單等公司資料，也
-     禁止在聊天裡宣稱訂單已建立/修改/取消（那些一定要走既有確認
-     流程）。這不影響「14. 明確代寫請求直接擋下」那道更早、更嚴格
-     的防線，兩者是分開的機制。
-  另外，圖片辨識新增「正式訂購單」（image_type=purchase_order）
-  這個分類：這種圖片本身就列好了班級與數量，直接採用圖片上的值，
-  不會像口語辨識那樣拿老師姓名回頭去資料庫查班級人數覆蓋掉——避免
-  正式訂購單上「這次只訂 20 本」被誤植成資料庫裡那個班「平常」的
-  人數。老師欄位如果圖片上真的是空的，會標成「未填寫」讓使用者在
-  確認畫面上看清楚，而不是自己亂猜一個老師名字；確認後這個字串會
-  照樣寫進 Google，如果不想要「未填寫」出現在正式紀錄裡，請在確認
-  前先手動補上老師姓名。
-
 【訂購單交付方式（2026-09 新增）】
 訂單確認完成後，使用者可以選擇讓機器人生成一張 PDF 版的訂購單，
 用來 email 給出版社（取代原本純文字、傳給業務轉單的做法）。
@@ -149,7 +127,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v2-reviewed"
+APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v1"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1291,11 +1269,7 @@ def _route_message(user_id, user_text):
 
         return make_teacher_book_orders_reply(teacher, orders)
 
-    # 14. 明確的「幫我寫訊息／代寫」請求仍直接擋下，不讓 AI 代筆。
-    #     （注意：這不等於 AI 完全不能聊天——v42 新增的 AI Agent
-    #     在所有規則都接不住時，會允許 OpenAI 做一般對話，見
-    #     handle_smart_function_fallback() 的 intent == "chat"/"unknown"
-    #     分支，那邊有另外的 system prompt 禁止虛構公司資料。）
+    # 14. AI 功能已停用：草擬／自由問答不再呼叫 OpenAI
     if is_ai_writing_request(text):
         return FIXED_FALLBACK_MESSAGE
 
@@ -6289,7 +6263,7 @@ def _apply_smart_school_order(user_id, data, source_label="口語"):
     guided_mode[user_id] = "order_flow"
 
     if not draft["teacher"]:
-        return f"📷 {source_label}內容已收到。\n\n我還缺老師姓名，請直接告訴我是哪一位老師？"
+        return f"📷 {source_label}內容已收到。\\n\\n我還缺老師姓名，請直接告訴我是哪一位老師？"
 
     # 資訊不完整時先把老師 canonicalize，例如「張建國老師」→「張建國」，
     # 並取得學校/班級；接著只追問缺少的書名。
@@ -6329,23 +6303,23 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
     guided_mode[user_id] = "cram_order_flow"
 
     if not cram_school:
-        return f"📷 {source_label}內容已收到。\n\n我還缺補習班名稱，請告訴我是哪一間補習班？"
+        return f"📷 {source_label}內容已收到。\\n\\n我還缺補習班名稱，請告訴我是哪一間補習班？"
 
     incomplete = next((x for x in items if not x["publisher"] or not x["book"] or x["quantity"] <= 0), None)
     if incomplete:
         if not incomplete["publisher"]:
-            return "我已經先記住能辨識的內容。\n\n還有一本缺出版社，請告訴我出版社。"
+            return "我已經先記住能辨識的內容。\\n\\n還有一本缺出版社，請告訴我出版社。"
         if not incomplete["book"]:
             draft["current_publisher"] = incomplete["publisher"]
             cram_order_context[user_id] = draft
-            return f"我已經先記住能辨識的內容。\n\n出版社：{incomplete['publisher']}\n請告訴我書名。"
+            return f"我已經先記住能辨識的內容。\\n\\n出版社：{incomplete['publisher']}\\n請告訴我書名。"
         draft["current_publisher"] = incomplete["publisher"]
         draft["current_book"] = incomplete["book"]
         cram_order_context[user_id] = draft
-        return f"我已經先記住能辨識的內容。\n\n[{incomplete['publisher']}] {incomplete['book']} 要幾本？"
+        return f"我已經先記住能辨識的內容。\\n\\n[{incomplete['publisher']}] {incomplete['book']} 要幾本？"
 
     if not draft["items"]:
-        return "我有辨識到補習班，但還沒有足夠的書名／數量。\n\n請直接告訴我要訂的第一本書。"
+        return "我有辨識到補習班，但還沒有足夠的書名／數量。\\n\\n請直接告訴我要訂的第一本書。"
 
     return _enter_cram_confirm_stage(user_id, draft)
 
@@ -6470,7 +6444,7 @@ def handle_smart_teacher_lookup(user_id, text, keep_mode=False, parsed_data=None
     """AI 只把口語整理成既有老師查詢；真正答案仍由 Google 老師資料庫提供。"""
     if not OPENAI_API_KEY:
         return None
-    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text, user_id=user_id)
+    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text)
     if not isinstance(data, dict) or data.get("intent") != "teacher_lookup":
         return None
     query = _smart_teacher_query_from_data(data)
@@ -6517,7 +6491,7 @@ def handle_smart_history_lookup(user_id, text, keep_mode=False, parsed_data=None
     """AI 只理解查單意圖；訂單內容仍全部來自 Google 訂單資料。"""
     if not OPENAI_API_KEY:
         return None
-    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text, user_id=user_id)
+    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text)
     if not isinstance(data, dict) or data.get("intent") != "history_lookup":
         return None
 
