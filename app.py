@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v49-publisher-choice-direct-confirm"
+APP_VERSION = "2026-09-20-v50-other-order-natural-route-fix"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1114,6 +1114,12 @@ def _route_message(user_id, user_text):
         if escape_reply is not None:
             return escape_reply
         return handle_guided_history_lookup(user_id, text)
+
+    # v50：進入「其他訂單」模式後，先跑自然語言解析。
+    # 「藍明月老師要買一盒彩色筆」不再被舊的「學校＋老師＋品項」提示擋住。
+    natural_other = parse_other_order(user_id, text)
+    if natural_other:
+        return natural_other
 
     if current_mode == "other_order":
         if text in ["回主選單", "主選單", "離開"]:
