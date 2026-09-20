@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v14-cram-header-skip"
+APP_VERSION = "2026-09-20-v43-other-order-natural-language"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1001,8 +1001,9 @@ def _route_message(user_id, user_text):
         guided_mode[user_id] = "other_order"
         return (
             "📦 其他訂單\n\n"
-            "請直接輸入：學校＋老師＋品項。\n"
-            "例如：天母國中王老師買書面紙20張\n\n"
+            "直接告訴我哪位老師要買什麼即可，學校可以省略。\n"
+            "例如：張新莊要買一罐膠水\n"
+            "也可以：華興張新莊老師買書面紙20張\n\n"
             "我會先整理成確認畫面，等你回覆「確認」後才寫入 Google。"
         )
 
@@ -1780,8 +1781,9 @@ def handle_guided_other_order(user_id, text):
     return (
         "📦 其他訂單\n\n"
         "我還在「其他訂單」模式。\n"
-        "請輸入：學校＋老師＋品項。\n"
-        "例如：天母國中王老師買書面紙20張\n\n"
+        "直接告訴我哪位老師要買什麼即可，學校可以省略。\n"
+        "例如：張新莊要買一罐膠水\n"
+        "也可以：華興張新莊老師買書面紙20張\n\n"
         "如果要離開，輸入「主選單」。"
     )
 
@@ -6561,53 +6563,153 @@ def get_context_school(user_id):
 # =========================================================
 # 其他訂單
 # =========================================================
-def parse_other_order(user_id, text):
-    clean = text.strip()
+def _match_other_order_school_prefix(left_text):
+    """從「華興張新莊」這類前綴中辨識學校。
 
-    m = re.fullmatch(
-        r"(.+?(?:國中|高中|國小|中學))"
-        r"([\u4e00-\u9fff]{1,4})(?:老師)?"
-        r"\s*(?:買|購買|要買)\s*(.+)",
+    允許使用完整校名，也允許省略「國中／高中／國小／中學／女中」等尾綴，
+    例如資料庫是「華興中學」，使用者只打「華興」也能辨識。
+    """
+    left = re.sub(r"[\s，,。.!！?？：:]+", "", str(left_text or ""))
+    if not left:
+        return "", left
+
+    schools = get_school_catalog() or []
+    aliases = []
+    for school in schools:
+        school = str(school or "").strip()
+        if not school:
+            continue
+        compact = re.sub(r"\s+", "", school)
+        variants = {compact}
+        short = re.sub(r"(?:國民中學|國民小學|高級中學|國中|高中|國小|中學|女中)$", "", compact)
+        if len(short) >= 2:
+            variants.add(short)
+        for alias in variants:
+            aliases.append((alias, school))
+
+    # 最長的別名優先，避免短校名先吃掉長校名。
+    aliases.sort(key=lambda x: len(x[0]), reverse=True)
+    for alias, canonical in aliases:
+        if left.startswith(alias):
+            return canonical, left[len(alias):]
+
+    return "", left
+
+
+def _resolve_other_order_teacher(user_id, teacher_text, school_hint=""):
+    """把其他訂單裡的口語老師名稱解析成資料庫正式老師＋學校。
+
+    解析原則：
+    1. 有學校提示時先限定學校查，避免同名老師誤配。
+    2. 沒寫學校時直接跨校查老師；唯一命中就自動帶入學校。
+    3. 若前一輪剛查過同一位老師，也可沿用 context。
+    4. 多筆同名時不亂猜，交回上層讓 AI rescue / 引導訊息處理。
+    """
+    raw = re.sub(r"[\s，,。.!！?？：:]+", "", str(teacher_text or ""))
+    raw = re.sub(r"^(?:幫|請幫|麻煩幫|我要幫)", "", raw)
+    raw = re.sub(r"(?:老師)?(?:那邊)?(?:幫我)?$", "", raw)
+    raw = re.sub(r"老師$", "", raw)
+    if not raw:
+        return None
+
+    query = raw + "老師"
+    matches = lookup_teacher_matches(query, school=school_hint)
+
+    if len(matches) == 1:
+        item = matches[0]
+        return {
+            "school": str(item.get("school", "") or school_hint).strip(),
+            "teacher": str(item.get("teacher", "") or query).strip()
+        }
+
+    # 有學校提示但完全查不到時，再試一次既有模糊姓名機制。
+    if not matches:
+        fuzzy = resolve_fuzzy_name("teacher", query, school=school_hint)
+        if fuzzy.get("status") == "auto":
+            canonical = str(fuzzy.get("value", "") or "").strip()
+            if canonical:
+                fuzzy_matches = lookup_teacher_matches(canonical, school=school_hint)
+                if len(fuzzy_matches) == 1:
+                    item = fuzzy_matches[0]
+                    return {
+                        "school": str(item.get("school", "") or school_hint).strip(),
+                        "teacher": str(item.get("teacher", "") or canonical).strip()
+                    }
+
+    context = teacher_lookup_context.get(user_id) or conversation_context.get(user_id, {})
+    context_teacher = str(context.get("teacher", "") or "").strip()
+    if context_teacher and normalize_teacher_name_input(context_teacher) == normalize_teacher_name_input(query):
+        return {
+            "school": str(context.get("school", "") or school_hint).strip(),
+            "teacher": context_teacher
+        }
+
+    return None
+
+
+def parse_other_order(user_id, text):
+    """解析「其他訂單」自然語言。
+
+    支援例如：
+      張新莊要買一罐膠水
+      張新莊老師要一罐膠水
+      華興張新莊要買一罐膠水
+      華興張新莊老師買膠水一罐
+      幫張新莊老師訂一箱A4紙
+      張新莊那邊要書面紙20張
+
+    安全原則：老師若跨校同名或無法唯一確認，不會自行亂猜。
+    """
+    clean = re.sub(r"[\r\n]+", " ", str(text or "")).strip()
+    clean = re.sub(r"^[\s，,。.!！?？]+|[\s，,。.!！?？]+$", "", clean)
+    if not clean:
+        return None
+
+    # 去掉不影響語意的開頭口語。
+    clean = re.sub(r"^(?:幫我|請幫我|麻煩幫我|幫忙|我要幫)", "", clean).strip()
+
+    # 先找「人／學校」與「品項」的分界。長詞放前面避免「要買」被「要」先吃掉。
+    m = re.match(
+        r"^(.+?)(?:老師)?(?:那邊)?\s*(?:幫我)?\s*(?:要購買|要買|購買|買|需要|要|訂購|訂)\s*(.+)$",
         clean
     )
-
-    if m:
-        school = m.group(1).strip()
-        teacher = m.group(2).strip() + "老師"
-        item = m.group(3).strip()
-    else:
-        m = re.fullmatch(
-            r"([\u4e00-\u9fff]{1,4})(?:老師)?"
-            r"\s*(?:買|購買|要買)\s*(.+)",
-            clean
-        )
-
-        if not m:
-            return None
-
-        teacher = m.group(1).strip() + "老師"
-        item = m.group(2).strip()
-
-        context = (
-            teacher_lookup_context.get(user_id)
-            or conversation_context.get(user_id, {})
-        )
-        if context.get("teacher") != teacher:
-            return None
-
-        school = context.get("school", "")
-
-    if not school:
+    if not m:
         return None
+
+    left = m.group(1).strip()
+    item = m.group(2).strip()
+    item = re.sub(r"^(?:買|購買|訂購|訂)\s*", "", item).strip()
+    if not left or not item:
+        return None
+
+    # 先看左側是否含完整／簡稱學校，例如「華興張新莊」。
+    school_hint, teacher_part = _match_other_order_school_prefix(left)
+    if not teacher_part:
+        return None
+
+    resolved = _resolve_other_order_teacher(user_id, teacher_part, school_hint=school_hint)
+    if not resolved:
+        return None
+
+    school = str(resolved.get("school", "") or "").strip()
+    teacher = str(resolved.get("teacher", "") or "").strip()
+    if not school or not teacher:
+        return None
+
+    # 最後再以既有老師資料確認一次；避免 AI / 模糊比對產生不存在的老師。
     if not get_teacher_classes(school, teacher):
         return None
+
+    # 成功解析後同步保存老師 context，下一句自然接續時可直接沿用。
+    context = {"school": school, "teacher": teacher, "classes": copy_classes(get_teacher_classes(school, teacher) or [])}
+    teacher_lookup_context[user_id] = context
+    conversation_context[user_id] = context
 
     return {
         "school": school,
         "teacher": teacher,
         "item": item
     }
-
 
 def make_other_order_confirmation(order):
     return (
