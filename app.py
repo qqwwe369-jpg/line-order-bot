@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v46-photo-multi-book"
+APP_VERSION = "2026-09-20-v47-book-publisher-pair"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -2689,110 +2689,100 @@ def validate_order_book_input(user_id, raw_text, draft):
     publisher = str(draft.get("publisher") or "").strip()
     candidates = lookup_book_candidates_enhanced(query, publisher=publisher)
 
+    value = ""
+    score = 0.0
     if candidates:
         first = candidates[0]
         value = str(first.get("value", "") or "").strip()
         score = float(first.get("score", 0) or 0)
 
-        # 完全一樣時，如果同書名存在多家出版社，不能自動拿第一筆。
-        if value == query:
-            if not publisher:
-                variants = _exact_book_variants(value)
-                ask = _ask_duplicate_book_publisher(user_id, draft, value, variants)
-                if ask:
-                    draft["book"] = value
-                    return ask
-                if variants and variants[0].get("publisher"):
-                    draft["publisher"] = variants[0]["publisher"]
-            draft["book"] = value
-            pending_name_confirmations.pop(user_id, None)
-            order_flow_context[user_id] = draft
-            if draft.get("teacher") and draft.get("book"):
-                result = build_order_from_draft(user_id, draft)
-                if user_id in pending_orders:
-                    order_flow_context.pop(user_id, None)
-                return result
-            return make_order_guide_reply(draft)
-    else:
-        value, score = "", 0.0
-
-    # v38：若第一名高度可信且明顯領先，直接採用正式書名，
-    # 例如「段考王英文3」→「段考王英語(3)」，不必再多選一次。
-    if value and score >= 0.64:
-        second_score = float(candidates[1].get("score", 0) or 0) if len(candidates) > 1 else 0.0
-        if len(candidates) == 1 or (score - second_score) >= 0.12:
-            draft["book"] = value
-            if not publisher:
-                variants = _exact_book_variants(value)
-                ask = _ask_duplicate_book_publisher(user_id, draft, value, variants)
-                if ask:
-                    return ask
-                candidate_publisher = str(variants[0].get("publisher", "") or "").strip() if variants else str(first.get("publisher", "") or "").strip()
-            else:
-                candidate_publisher = str(first.get("publisher", "") or "").strip()
-            if candidate_publisher:
-                draft["publisher"] = candidate_publisher
-            pending_name_confirmations.pop(user_id, None)
-            order_flow_context[user_id] = draft
-
-            if draft.get("teacher") and draft.get("book"):
-                result = build_order_from_draft(user_id, draft)
-                if user_id in pending_orders:
-                    order_flow_context.pop(user_id, None)
-                return result
-            return make_order_guide_reply(draft)
-
-    db_options = []
-    if value and score >= 0.52:
-        threshold = max(0.52, score - 0.08)
+        # Same canonical title + multiple publishers => publisher choice.
+        same = []
         seen = set()
-        for c in candidates[:4]:
-            c_value = str(c.get("value", "") or "").strip()
-            c_score = float(c.get("score", 0) or 0)
-
-            if not c_value or c_value in seen:
+        for c in candidates:
+            cv=str(c.get("value","") or "").strip()
+            cp=str(c.get("publisher","") or "").strip()
+            cs=float(c.get("score",0) or 0)
+            if cv != value or cs < max(0.52, score-0.08):
                 continue
-            if c_value != value and c_score < threshold:
-                continue
+            if (cv,cp) not in seen:
+                seen.add((cv,cp)); same.append({"value":cv,"publisher":cp})
+        pubs=unique_list([x["publisher"] for x in same if x["publisher"]])
+        if not publisher and len(pubs)>1:
+            options=[{"value":value,"publisher":p} for p in pubs]
+            pending_name_confirmations[user_id]={
+                "field":"book","purpose":"order_book_publisher",
+                "options":options,"original":query
+            }
+            order_flow_context[user_id]=draft
+            lines=["📚 找到相同書名","",f"書名：{value}","",
+                   "這本書有不同出版社："]
+            for i,p in enumerate(pubs,1): lines.append(f"{i}. {p}")
+            lines.extend(["",f"請回覆 1～{len(pubs)}"])
+            return "\n".join(lines)
 
-            seen.add(c_value)
-            db_options.append({
-                "value": c_value,
-                "publisher": str(c.get("publisher", "") or "")
-            })
+        if value == query:
+            draft["book"]=value
+            if not draft.get("publisher") and first.get("publisher"):
+                draft["publisher"]=str(first.get("publisher") or "").strip()
+            pending_name_confirmations.pop(user_id,None)
+            order_flow_context[user_id]=draft
+            if draft.get("teacher") and draft.get("book"):
+                result=build_order_from_draft(user_id,draft)
+                if user_id in pending_orders: order_flow_context.pop(user_id,None)
+                return result
+            return make_order_guide_reply(draft)
 
-            if len(db_options) >= 3:
-                break
+    db_options=[]
+    if value and score>=0.52:
+        threshold=max(0.52,score-0.08)
+        seen=set()
+        for c in candidates[:8]:
+            cv=str(c.get("value","") or "").strip()
+            cp=str(c.get("publisher","") or "").strip()
+            cs=float(c.get("score",0) or 0)
+            key=(cv,cp)
+            if not cv or key in seen: continue
+            if cv != value and cs < threshold: continue
+            seen.add(key)
+            db_options.append({"value":cv,"publisher":cp})
+            if len(db_options)>=5: break
 
-    # 不管資料庫有沒有找到接近的候選，最後都保留一個「都不是，直接用
-    # 我打的當書名」的選項——書籍資料庫不可能什麼書都事先登記好，
-    # 遇到資料庫裡真的沒有這本書時，還是要能直接照使用者輸入的繼續
-    # 往下訂，而不是卡在「查不到」死路。這個選項一律排在候選清單最後。
-    options = list(db_options)
-    options.append({"value": query, "publisher": "", "raw": True})
+    # Fuzzy canonical match can also have multiple publishers.
+    if db_options and not publisher:
+        best=db_options[0]["value"]
+        pubs=unique_list([x["publisher"] for x in db_options
+                          if x["value"]==best and x.get("publisher")])
+        if len(pubs)>1:
+            options=[{"value":best,"publisher":p} for p in pubs]
+            pending_name_confirmations[user_id]={
+                "field":"book","purpose":"order_book_publisher",
+                "options":options,"original":query
+            }
+            order_flow_context[user_id]=draft
+            lines=["📚 找到相同書名","",f"書名：{best}","",
+                   "這本書有不同出版社："]
+            for i,p in enumerate(pubs,1): lines.append(f"{i}. {p}")
+            lines.extend(["",f"請回覆 1～{len(pubs)}"])
+            return "\n".join(lines)
 
-    pending_name_confirmations[user_id] = {
-        "field": "book", "purpose": "order_book",
-        "options": options,
-        "original": query
+    options=list(db_options)
+    options.append({"value":query,"publisher":"","raw":True})
+    pending_name_confirmations[user_id]={
+        "field":"book","purpose":"order_book","options":options,"original":query
     }
-    order_flow_context[user_id] = draft
-
-    raw_index = len(options)
-
+    order_flow_context[user_id]=draft
+    raw_index=len(options)
     if db_options:
-        lines = ["🔎 找到接近的書名", "", f"你輸入：{query}", ""]
-        for i, opt in enumerate(db_options, start=1):
-            lines.append(f"{i}. {opt['value']}")
+        lines=["🔎 找到接近的書名","",f"你輸入：{query}",""]
+        for i,opt in enumerate(db_options,1):
+            label=opt["value"]+(f"｜{opt['publisher']}" if opt.get("publisher") else "")
+            lines.append(f"{i}. {label}")
         lines.append(f"{raw_index}. 使用原本輸入：{query}")
-        lines.extend(["", f"請回覆 1～{raw_index}"])
+        lines.extend(["",f"請回覆 1～{raw_index}"])
     else:
-        lines = [
-            "🔎 資料庫沒有相符書名", "",
-            f"你輸入：{query}", "",
-            f"1. 使用原本輸入：{query}", "",
-            "請回覆 1"
-        ]
+        lines=["🔎 資料庫沒有相符書名","",f"你輸入：{query}","",
+               "1. 使用原本輸入："+query,"","請回覆 1"]
     return "\n".join(lines)
 
 def handle_order_flow(user_id, text):
@@ -8037,31 +8027,24 @@ def lookup_book_candidates_enhanced(query, publisher=""):
     query = str(query or "").strip()
     if not query:
         return []
-
     candidates = lookup_fuzzy_candidates("book", query, publisher=publisher)
-
     if not candidates:
         core = book_core_text(query)
         if core and core != query:
             candidates = lookup_fuzzy_candidates("book", core, publisher=publisher)
 
+    # v47: same title from different publishers must remain separate.
     merged = {}
     for item in candidates:
         value = str(item.get("value", "") or "").strip()
+        pub = str(item.get("publisher", "") or "").strip()
         if not value:
             continue
-        local_score = book_keyword_score(query, value)
-        remote_score = float(item.get("score", 0) or 0)
-        score = max(local_score, remote_score * 0.85)
-        item_publisher = str(item.get("publisher", "") or "").strip()
-        merge_key = item_publisher + "||" + value
-        merged[merge_key] = {
-            "value": value,
-            "publisher": item_publisher,
-            "school": "",
-            "score": score
-        }
-
+        score = max(book_keyword_score(query, value),
+                    float(item.get("score", 0) or 0) * 0.85)
+        key = (value, pub)
+        if key not in merged or score > merged[key]["score"]:
+            merged[key] = {"value": value, "publisher": pub, "school": "", "score": score}
     return sorted(merged.values(), key=lambda x: x["score"], reverse=True)[:10]
 
 def resolve_fuzzy_name(kind, query, school=""):
