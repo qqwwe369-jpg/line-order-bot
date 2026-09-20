@@ -73,6 +73,28 @@ multi_book_order_context 草稿字典，不共用 order_flow_context：
   假設一張訂單只有一本書），之後真的需要可以再擴充
   generate_purchase_order_pdf()。
 
+【AI Agent pilot（2026-09-20 新增，v42）】
+在既有「規則優先、AI 當最後容錯」的架構上，這次多加兩件事：
+  1. AI_AGENT_ENABLED（環境變數，預設開）：開啟後，原本的智慧路由／
+     圖片辨識改用 _openai_agent_json()／_openai_agent_chat()，會帶
+     上這個使用者最近幾輪對話（ai_agent_history，見 _remember_ai_turn），
+     讓「他呢？」「那本呢？」這種代名詞、省略主詞的講法也能被理解。
+     關掉這個環境變數會整個退回 v41 的單輪呼叫邏輯（_openai_json）。
+  2. 「一般對話」fallback：當規則跟意圖分類器都判斷不出來要做什麼
+     （intent 是 chat 或 unknown）時，才會讓 AI 自由對話一次——
+     system prompt 明確禁止它虛構老師／班級／訂單等公司資料，也
+     禁止在聊天裡宣稱訂單已建立/修改/取消（那些一定要走既有確認
+     流程）。這不影響「14. 明確代寫請求直接擋下」那道更早、更嚴格
+     的防線，兩者是分開的機制。
+  另外，圖片辨識新增「正式訂購單」（image_type=purchase_order）
+  這個分類：這種圖片本身就列好了班級與數量，直接採用圖片上的值，
+  不會像口語辨識那樣拿老師姓名回頭去資料庫查班級人數覆蓋掉——避免
+  正式訂購單上「這次只訂 20 本」被誤植成資料庫裡那個班「平常」的
+  人數。老師欄位如果圖片上真的是空的，會標成「未填寫」讓使用者在
+  確認畫面上看清楚，而不是自己亂猜一個老師名字；確認後這個字串會
+  照樣寫進 Google，如果不想要「未填寫」出現在正式紀錄裡，請在確認
+  前先手動補上老師姓名。
+
 【訂購單交付方式（2026-09 新增）】
 訂單確認完成後，使用者可以選擇讓機器人生成一張 PDF 版的訂購單，
 用來 email 給出版社（取代原本純文字、傳給業務轉單的做法）。
@@ -127,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v1"
+APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v5-grade-teacher-candidates"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1269,7 +1291,11 @@ def _route_message(user_id, user_text):
 
         return make_teacher_book_orders_reply(teacher, orders)
 
-    # 14. AI 功能已停用：草擬／自由問答不再呼叫 OpenAI
+    # 14. 明確的「幫我寫訊息／代寫」請求仍直接擋下，不讓 AI 代筆。
+    #     （注意：這不等於 AI 完全不能聊天——v42 新增的 AI Agent
+    #     在所有規則都接不住時，會允許 OpenAI 做一般對話，見
+    #     handle_smart_function_fallback() 的 intent == "chat"/"unknown"
+    #     分支，那邊有另外的 system prompt 禁止虛構公司資料。）
     if is_ai_writing_request(text):
         return FIXED_FALLBACK_MESSAGE
 
@@ -2663,6 +2689,22 @@ def handle_order_flow(user_id, text):
             return "這本書目前無法從資料庫確認出版社，請告訴我出版社。"
 
     if user_id in order_flow_context and not draft.get("teacher"):
+        candidates = draft.get("teacher_candidates") or []
+        if candidates:
+            picked = _resolve_order_teacher_candidate_choice(clean, candidates)
+            if picked:
+                draft["teacher"] = picked["teacher"]
+                draft["school"] = picked["school"]
+                draft["teacher_classes"] = copy_classes(picked["classes"])
+                draft["classes"] = []
+                draft["teacher_candidates"] = []
+                order_flow_context[user_id] = draft
+                if draft["teacher"] and draft["book"]:
+                    result = build_order_from_draft(user_id, draft)
+                    if user_id in pending_orders:
+                        order_flow_context.pop(user_id, None)
+                    return result
+                return make_order_guide_reply(draft)
         return validate_order_teacher_input(user_id, clean, draft)
 
     # v38：知道老師後先收「書名」。書名若存在資料庫，直接自動帶出版社，
@@ -2724,6 +2766,9 @@ def handle_order_flow(user_id, text):
     if parsed.get("school"):
         draft["school"] = parsed["school"]
 
+    if parsed.get("grade") and not draft.get("teacher"):
+        draft["grade"] = parsed["grade"]
+
     if parsed.get("classes"):
         draft["classes"] = unique_list(parsed["classes"])
 
@@ -2757,6 +2802,36 @@ def handle_order_flow(user_id, text):
             order_flow_context.pop(user_id, None)
         return result
 
+    # 只給了「學校＋年級」、沒講老師姓名：直接從資料庫抓這個年級的
+    # 老師候選，讓使用者用點選數字或打姓名的方式選，不用自己想起
+    # 正確姓名。只有一位候選時直接採用，不用多問一輪。
+    if not draft.get("teacher") and draft.get("grade") and draft.get("school"):
+        if not draft.get("teacher_candidates"):
+            candidates = _lookup_order_teacher_candidates(
+                draft["school"], draft["grade"]
+            )
+            if len(candidates) == 1:
+                picked = candidates[0]
+                draft["teacher"] = picked["teacher"]
+                draft["school"] = picked["school"]
+                draft["teacher_classes"] = copy_classes(picked["classes"])
+                draft["classes"] = []
+                order_flow_context[user_id] = draft
+                if draft["teacher"] and draft["book"]:
+                    result = build_order_from_draft(user_id, draft)
+                    if user_id in pending_orders:
+                        order_flow_context.pop(user_id, None)
+                    return result
+                return make_order_guide_reply(draft)
+
+            draft["teacher_candidates"] = candidates
+            order_flow_context[user_id] = draft
+
+        if draft.get("teacher_candidates"):
+            return make_order_teacher_candidates_reply(draft)
+        # 這個年級資料庫裡查不到任何老師，退回原本的提示，讓使用者
+        # 自己輸入老師姓名。
+
     return make_order_guide_reply(draft)
 
 
@@ -2788,6 +2863,18 @@ def parse_order_message(text):
     teacher, school = extract_teacher_and_school(clean)
     classes = extract_classes(clean)
 
+    # 完全沒抓到老師姓名時，試試看是不是「學校＋年級」的講法
+    # （例如「華興七年級」），書名擷取要用拿掉這段之後的文字，
+    # 不然書名會被污染成「華興七年級 3800應用題套書」。
+    grade = ""
+    text_for_book = clean
+    if not teacher:
+        g_school, g_grade, remainder = extract_school_grade_no_teacher(clean)
+        if g_school and g_grade:
+            school = g_school
+            grade = g_grade
+            text_for_book = remainder
+
     order_words = [
         "訂書", "要訂", "想訂", "幫我訂", "我要訂", "訂講義",
         "訂評量", "訂教材", "下單", "幫我下單"
@@ -2808,12 +2895,13 @@ def parse_order_message(text):
     )
 
     has_order_intent = has_order_word or oral_order
-    book = extract_book_candidate(clean, teacher, classes) if has_order_intent else ""
+    book = extract_book_candidate(text_for_book, teacher, classes) if has_order_intent else ""
 
     return {
         "has_order_intent": has_order_intent,
         "teacher": teacher,
         "school": school,
+        "grade": grade,
         "classes": classes,
         "publisher": "",
         "book": book
@@ -2945,7 +3033,7 @@ def build_order_from_draft(user_id, draft):
         teacher_classes = copy_classes(exact.get("classes", []))
         draft["teacher"] = teacher
         draft["school"] = school
-    elif school:
+    elif school and not teacher_classes:
         teacher_classes = get_teacher_classes(school, teacher) or []
 
     if not teacher_classes:
@@ -4340,6 +4428,126 @@ def extract_teacher_and_school(text):
     return "", ""
 
 
+_GRADE_KEYWORD_PATTERN = re.compile(
+    "|".join(sorted([
+        "高中一年級", "高中二年級", "高中三年級",
+        "七年級", "八年級", "九年級",
+        "10年級", "11年級", "12年級",
+        "7年級", "8年級", "9年級",
+        "國一", "國二", "國三", "高一", "高二", "高三",
+    ], key=len, reverse=True))
+)
+
+
+def _strip_school_grade_prefix(text, school, grade):
+    """
+    給定已經解析出的 school／grade，把它們在原始文字裡對應到的片段
+    拿掉，剩下的部分才拿去當書名候選，避免「華興七年級」這種學校＋
+    年級文字污染書名欄位（例如書名被誤判成「華興七年級 3800應用題
+    套書」，而不是單純的「3800應用題套書」）。
+    """
+    remaining = text
+
+    if school:
+        aliases = [school]
+        short = re.sub(r"(?:國中|高中|國小|中學)$", "", school)
+        if short and short != school:
+            aliases.append(short)
+        aliases.sort(key=len, reverse=True)
+        for alias in aliases:
+            if alias and alias in remaining:
+                remaining = remaining.replace(alias, " ", 1)
+                break
+
+    if grade:
+        m = _GRADE_KEYWORD_PATTERN.search(remaining)
+        if m:
+            remaining = remaining[:m.start()] + " " + remaining[m.end():]
+
+    return remaining.strip()
+
+
+def extract_school_grade_no_teacher(text):
+    """
+    句子裡完全沒有老師姓名，但有「學校＋年級」（例如「華興七年級」
+    「衛理九年級」），先把這兩個抓出來——之後問老師時可以直接從
+    資料庫列出這個年級的老師候選，不用使用者自己想起正確姓名（見
+    handle_order_flow 裡對 teacher_candidates 的處理）。只有兩個都
+    抓到才會採用，單獨抓到學校或單獨抓到年級都太容易誤判，不使用。
+    """
+    school = extract_school_name(text)
+    grade = extract_grade_text(text)
+    if not school or not grade:
+        return "", "", text
+    remaining = _strip_school_grade_prefix(text, school, grade)
+    return school, grade, remaining
+
+
+def _lookup_order_teacher_candidates(school, grade):
+    """
+    使用者只給了「學校＋年級」、沒有講老師姓名時，從資料庫抓出這個
+    年級所有老師的候選清單，讓使用者用點選數字或直接打姓名的方式
+    選，不用自己想起正確姓名。只保留這個年級底下真的有班級的老師。
+    """
+    matches = lookup_teacher_matches("", school=school, grade=grade)
+    candidates = []
+    for item in matches or []:
+        selected = [
+            c for c in item.get("classes", [])
+            if _class_matches_grade(c.get("class_name", ""), grade)
+        ]
+        if not selected:
+            continue
+        subjects = []
+        for c in selected:
+            for s in c.get("subjects", []) or []:
+                s = str(s or "").strip()
+                if s == "英語":
+                    s = "英文"
+                elif s == "地球科學":
+                    s = "地科"
+                if s and s not in subjects:
+                    subjects.append(s)
+        candidates.append({
+            "teacher": str(item.get("teacher", "")).strip(),
+            "school": str(item.get("school", "") or school).strip(),
+            "classes": selected,
+            "subjects": subjects,
+        })
+    return candidates
+
+
+def _resolve_order_teacher_candidate_choice(text, candidates):
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(text or ""))
+    if re.fullmatch(r"\d{1,2}", clean):
+        idx = int(clean)
+        if 1 <= idx <= len(candidates):
+            return candidates[idx - 1]
+        return None
+    for c in candidates:
+        if clean and normalize_person_name(clean) == normalize_person_name(c["teacher"]):
+            return c
+    return None
+
+
+def make_order_teacher_candidates_reply(draft):
+    candidates = draft.get("teacher_candidates", [])
+    lines = ["📚 訂書進度", ""]
+    school = str(draft.get("school") or "").strip()
+    grade = str(draft.get("grade") or "").strip()
+    book = str(draft.get("book") or "").strip()
+    lines.append(f"🏫 學校：{school}｜{grade}")
+    lines.append(f"{'✅' if book else '⬜'} 書名：{book or '尚未提供'}")
+    lines.append("")
+    lines.append(f"{school}｜{grade} 目前登記的老師：")
+    for i, c in enumerate(candidates, start=1):
+        subj = "、".join(c.get("subjects", []))
+        lines.append(f"{i}. {c['teacher']}" + (f"（{subj}）" if subj else ""))
+    lines.append("")
+    lines.append("👉 請回覆數字選老師，或直接打老師姓名。")
+    return "\n".join(lines)
+
+
 def extract_classes(text):
     matches = re.findall(r"(?<!\d)([789]\d{2})(?!\d)", str(text or ""))
     return unique_list(matches)
@@ -4557,16 +4765,38 @@ def handle_pending_order_edit(user_id, text):
     class_pattern = _pending_order_class_pattern(class_names)
 
     if any(word in text for word in ["只要", "保留", "就要", "只留"]):
-        wanted = []
-        remaining = text
-        for name in class_names:
-            if name and name in remaining:
-                if name not in wanted:
-                    wanted.append(name)
-                remaining = remaining.replace(name, " ", 1)
-        for digit_class in re.findall(r"(?<!\d)([789]\d{2})(?!\d)", remaining):
-            if digit_class not in wanted:
-                wanted.append(digit_class)
+        # 跟「新增」用同一套 shorthand 展開，比對「這位老師實際教的
+        # 班級」（context），才能正確處理「只留國三戊己」這種省略
+        # 共同字首的簡寫——原本只用逐一字串比對，「國三己」這種沒有
+        # 完整重複出現年級字的寫法會被漏掉。
+        keep_word = next(
+            (w for w in ["只要", "保留", "就要", "只留"] if w in text),
+            ""
+        )
+        remaining_text = (
+            text.replace(keep_word, "", 1).strip() if keep_word else text.strip()
+        )
+
+        teacher_class_names = [
+            str(item.get("class_name", "")).strip()
+            for item in context.get("classes", [])
+            if str(item.get("class_name", "")).strip()
+        ]
+        wanted = _expand_class_shorthand(remaining_text, teacher_class_names) or []
+        wanted = unique_list(wanted)
+
+        if not wanted:
+            # 展開失敗（例如文字班級簡寫比對不到），退回原本的逐一
+            # 字串比對＋數字班級，維持舊版相容。
+            remaining = text
+            for name in class_names:
+                if name and name in remaining:
+                    if name not in wanted:
+                        wanted.append(name)
+                    remaining = remaining.replace(name, " ", 1)
+            for digit_class in re.findall(r"(?<!\d)([789]\d{2})(?!\d)", remaining):
+                if digit_class not in wanted:
+                    wanted.append(digit_class)
 
         if wanted:
             available = {
@@ -4580,13 +4810,13 @@ def handle_pending_order_edit(user_id, text):
                     + "、".join(missing)
                 )
 
-            order["classes"] = [
+            order["classes"] = sort_class_items([
                 {
                     "class_name": name,
                     "students": int(available[name].get("students", 0))
                 }
                 for name in wanted
-            ]
+            ])
             refresh_order_total(order)
             return make_order_confirmation(order)
 
@@ -4663,6 +4893,124 @@ def handle_pending_order_edit(user_id, text):
         ]
         refresh_order_total(order)
         return make_order_confirmation(order)
+
+    # 一次新增一個或多個班級。跟上面「取消」用同一套 shorthand 展開
+    # 機制，支援：
+    #   新增國三甲 / 國三甲新增
+    #   新增國三甲乙丙丁庚 / 國三甲乙丙丁庚新增
+    #
+    # v42 之前的問題：加班級只有一支「剛好一個班」的正規表示式，
+    # 不支援一次加多個／簡寫寫法，而且比對名單只看「訂單裡已經有的
+    # 班級」，不是「這位老師實際教的班級」，只要沒完全對上就整個
+    # regex 不 match、函式回傳 None，最後掉到最外層完全看不懂的
+    # AI fallback 訊息，使用者看不出問題到底出在哪。
+    add_verbs = ("新增", "增加", "加入", "加")
+    matched_add_verb = None
+    add_remaining = ""
+
+    for verb in add_verbs:
+        if text.startswith(verb) and text != verb:
+            matched_add_verb = verb
+            add_remaining = text[len(verb):].strip()
+            break
+        if text.endswith(verb) and text != verb:
+            matched_add_verb = verb
+            add_remaining = text[:-len(verb)].strip()
+            break
+
+    if matched_add_verb and add_remaining:
+        # 加班級要比對「這位老師實際教的班級」（context），不是訂單
+        # 裡已經有的班級（class_names 是給上面「取消」用的）。
+        teacher_class_names = [
+            str(item.get("class_name", "")).strip()
+            for item in context.get("classes", [])
+            if str(item.get("class_name", "")).strip()
+        ]
+        found = _expand_class_shorthand(add_remaining, teacher_class_names)
+
+        if found:
+            unique_found = unique_list(found)
+            already_in_order = [
+                name for name in unique_found if find_order_class(order, name)
+            ]
+            to_add = [name for name in unique_found if name not in already_in_order]
+
+            if not to_add:
+                return "⚠️ " + "、".join(unique_found) + " 已經都在這筆訂單裡了。"
+
+            source_lookup = {
+                str(item.get("class_name")): item
+                for item in context.get("classes", [])
+            }
+            order["classes"] = sort_class_items(order.get("classes", []) + [
+                {
+                    "class_name": name,
+                    "students": int(source_lookup[name].get("students", 0))
+                }
+                for name in to_add
+            ])
+            refresh_order_total(order)
+
+            note = ""
+            if already_in_order:
+                note = "（" + "、".join(already_in_order) + " 本來就已經在訂單裡，跳過）\n\n"
+
+            return (
+                "✅ 已新增：" + "、".join(to_add) + "\n\n"
+                + note
+                + make_order_confirmation(order)
+            )
+
+        if teacher_class_names:
+            # 這位老師名下查不到這個班，可能是老師班級資料表還沒
+            # 更新、但這個班其實真的存在（例如代課、臨時加開）。
+            # 這裡改去查「整個學校」的班級人數資料庫（不限老師，
+            # 跟「查人數」共用同一份），找到的話直接用真實人數，
+            # 不用叫使用者自己猜。查不到、或 Google 暫時連不上，
+            # 才退回原本「這位老師沒有這個班」的錯誤訊息。
+            school_lookup = None
+            try:
+                school_lookup = lookup_school_classes(
+                    order.get("school", ""), class_name=add_remaining
+                )
+            except Exception:
+                school_lookup = None
+
+            school_classes = (school_lookup or {}).get("classes", [])
+            if len(school_classes) == 1:
+                found_class = school_classes[0]
+                class_name = found_class["class_name"]
+
+                if find_order_class(order, class_name):
+                    return f"⚠️ {class_name} 已經在這筆訂單裡了。"
+
+                order["classes"] = sort_class_items(order.get("classes", []) + [{
+                    "class_name": class_name,
+                    "students": found_class["students"]
+                }])
+                refresh_order_total(order)
+
+                return (
+                    f"✅ 已新增：{class_name}（{found_class['students']} 本，"
+                    f"依學校班級資料庫人數，{order.get('teacher', '')} 名下"
+                    "目前沒有登記這個班，建議之後回 Google 試算表補上對應關係）\n\n"
+                    + make_order_confirmation(order)
+                )
+
+            if len(school_classes) > 1:
+                options = "、".join(
+                    f"{c['class_name']}（{c['students']}人）" for c in school_classes
+                )
+                return (
+                    f"⚠️ 學校資料庫裡「{add_remaining}」對到不只一筆，"
+                    "請講清楚一點是哪一班：\n\n" + options
+                )
+
+            return (
+                f"⚠️ {order.get('teacher', '')} 沒有「{add_remaining}」這個班，"
+                "學校班級資料庫也查不到。\n\n"
+                f"{order.get('teacher', '')} 目前班級：{'、'.join(teacher_class_names)}"
+            )
 
     m = re.fullmatch(rf"(?:加|加入|增加)\s*({class_pattern})", text)
     if m:
@@ -6263,7 +6611,7 @@ def _apply_smart_school_order(user_id, data, source_label="口語"):
     guided_mode[user_id] = "order_flow"
 
     if not draft["teacher"]:
-        return f"📷 {source_label}內容已收到。\\n\\n我還缺老師姓名，請直接告訴我是哪一位老師？"
+        return f"📷 {source_label}內容已收到。\n\n我還缺老師姓名，請直接告訴我是哪一位老師？"
 
     # 資訊不完整時先把老師 canonicalize，例如「張建國老師」→「張建國」，
     # 並取得學校/班級；接著只追問缺少的書名。
@@ -6303,23 +6651,23 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
     guided_mode[user_id] = "cram_order_flow"
 
     if not cram_school:
-        return f"📷 {source_label}內容已收到。\\n\\n我還缺補習班名稱，請告訴我是哪一間補習班？"
+        return f"📷 {source_label}內容已收到。\n\n我還缺補習班名稱，請告訴我是哪一間補習班？"
 
     incomplete = next((x for x in items if not x["publisher"] or not x["book"] or x["quantity"] <= 0), None)
     if incomplete:
         if not incomplete["publisher"]:
-            return "我已經先記住能辨識的內容。\\n\\n還有一本缺出版社，請告訴我出版社。"
+            return "我已經先記住能辨識的內容。\n\n還有一本缺出版社，請告訴我出版社。"
         if not incomplete["book"]:
             draft["current_publisher"] = incomplete["publisher"]
             cram_order_context[user_id] = draft
-            return f"我已經先記住能辨識的內容。\\n\\n出版社：{incomplete['publisher']}\\n請告訴我書名。"
+            return f"我已經先記住能辨識的內容。\n\n出版社：{incomplete['publisher']}\n請告訴我書名。"
         draft["current_publisher"] = incomplete["publisher"]
         draft["current_book"] = incomplete["book"]
         cram_order_context[user_id] = draft
-        return f"我已經先記住能辨識的內容。\\n\\n[{incomplete['publisher']}] {incomplete['book']} 要幾本？"
+        return f"我已經先記住能辨識的內容。\n\n[{incomplete['publisher']}] {incomplete['book']} 要幾本？"
 
     if not draft["items"]:
-        return "我有辨識到補習班，但還沒有足夠的書名／數量。\\n\\n請直接告訴我要訂的第一本書。"
+        return "我有辨識到補習班，但還沒有足夠的書名／數量。\n\n請直接告訴我要訂的第一本書。"
 
     return _enter_cram_confirm_stage(user_id, draft)
 
@@ -6444,7 +6792,7 @@ def handle_smart_teacher_lookup(user_id, text, keep_mode=False, parsed_data=None
     """AI 只把口語整理成既有老師查詢；真正答案仍由 Google 老師資料庫提供。"""
     if not OPENAI_API_KEY:
         return None
-    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text)
+    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text, user_id=user_id)
     if not isinstance(data, dict) or data.get("intent") != "teacher_lookup":
         return None
     query = _smart_teacher_query_from_data(data)
@@ -6491,7 +6839,7 @@ def handle_smart_history_lookup(user_id, text, keep_mode=False, parsed_data=None
     """AI 只理解查單意圖；訂單內容仍全部來自 Google 訂單資料。"""
     if not OPENAI_API_KEY:
         return None
-    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text)
+    data = parsed_data if isinstance(parsed_data, dict) else smart_parse_function_text(text, user_id=user_id)
     if not isinstance(data, dict) or data.get("intent") != "history_lookup":
         return None
 
