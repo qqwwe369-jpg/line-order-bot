@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v47-book-publisher-pair"
+APP_VERSION = "2026-09-20-v48-publisher-selection-fix"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -2108,6 +2108,21 @@ def handle_subject_teacher_query(query):
     filtered = []
     for item in matches:
         selected = []
+
+        # v48：同書名多出版社的選擇是「選出版社」，不是一般欄位候選。
+        # selected 內容為 {value: 正式書名, publisher: 出版社}，兩個欄位要一起寫回。
+        if pending.get("purpose") == "order_book_publisher":
+            draft = order_flow_context.get(user_id, {})
+            draft["book"] = str(selected.get("value", "") or "").strip()
+            draft["publisher"] = str(selected.get("publisher", "") or "").strip()
+            pending_name_confirmations.pop(user_id, None)
+            order_flow_context[user_id] = draft
+            if draft.get("teacher") and draft.get("book") and draft.get("publisher"):
+                result = build_order_from_draft(user_id, draft)
+                if user_id in pending_orders:
+                    order_flow_context.pop(user_id, None)
+                return result
+            return make_order_guide_reply(draft)
         for c in item.get("classes", []):
             if not _class_matches_grade(c.get("class_name", ""), query["grade"]):
                 continue
