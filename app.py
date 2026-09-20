@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v45-confirm-edit-and-publisher-choice"
+APP_VERSION = "2026-09-20-v46-photo-multi-book"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -931,6 +931,12 @@ def _route_message(user_id, user_text):
 
         if user_id in pending_orders:
             return confirm_new_order(user_id)
+
+    # 0.3 拍照訂書待確認／出版社選擇：優先於一般文字流程。
+    if user_id in pending_photo_orders:
+        photo_reply = handle_pending_photo_order(user_id, text)
+        if photo_reply is not None:
+            return photo_reply
 
     # 0.5 引導式功能入口：主選單六個指令都一定有下一步
     if is_teacher_mode_start(text):
@@ -2269,14 +2275,20 @@ def is_photo_order_help_request(text):
 def get_photo_order_help_reply():
     return (
         "📷 拍照訂書\n\n"
-        "不用先輸入指令，直接把訂書圖片傳給我就可以。\n\n"
-        "我可以嘗試讀取：\n"
-        "• 系統產生的訂購單\n"
-        "• 老師傳來的 LINE 對話截圖\n"
-        "• 手寫或列印的訂書資料\n"
-        "• 書名、出版社、班級與數量\n\n"
-        "辨識完成後，我會先整理成「訂購確認」，不會直接寫入 Google。\n"
-        "資料有錯時，直接告訴我要改哪一項即可。\n\n"
+        "請直接上傳訂書照片，我會先辨識內容，再查資料庫補齊資料。\n\n"
+        "🏫【學校訂書】\n"
+        "照片至少要看得到：\n"
+        "• 老師姓名\n"
+        "• 書名（可以一次寫多本）\n\n"
+        "學校、出版社、老師授課班級與各班人數，我會從資料庫自動查詢。\n"
+        "如果某一本只訂部分班級、數量不同或有備註，請寫在那本書旁邊。\n\n"
+        "🏢【補習班訂書】\n"
+        "照片至少要看得到：\n"
+        "• 補習班名稱\n"
+        "• 書名（可以一次寫多本）\n"
+        "• 每一本的訂購數量\n\n"
+        "出版社會從書籍資料庫自動查詢；同書名有不同出版社時，我會再請你選擇。\n\n"
+        "辨識完成後一定先顯示「訂購確認」，不會直接寫入 Google。\n"
         "👉 現在直接傳圖片給我就可以了。"
     )
 
@@ -7047,7 +7059,27 @@ def smart_parse_order_image(image_bytes):
 - unknown：無法判斷
 
 intent 只能是 school_order、cram_order、unknown。
-學校訂單固定輸出：
+
+一般學校訂書（聊天截圖／手寫紙條）固定輸出：
+{
+  "intent":"school_order",
+  "image_type":"handwritten_order",
+  "school":"",
+  "teacher":"",
+  "books":[
+    {
+      "book":"",
+      "publisher":"",
+      "classes":[],
+      "class_items":[{"class_name":"","quantity":0}],
+      "note":""
+    }
+  ],
+  "note":"",
+  "confidence":"high"
+}
+
+正式、只有一本書的學校訂購單也相容舊欄位：
 {
   "intent":"school_order",
   "image_type":"purchase_order",
@@ -7058,26 +7090,43 @@ intent 只能是 school_order、cram_order、unknown。
   "classes":[],
   "class_items":[{"class_name":"","quantity":0}],
   "total_quantity":0,
+  "note":"",
+  "confidence":"high"
+}
+
+補習班訂單固定輸出：
+{
+  "intent":"cram_order",
+  "image_type":"handwritten_order",
+  "cram_school":"",
+  "items":[
+    {"publisher":"","book":"","quantity":0,"note":""}
+  ],
+  "note":"",
   "confidence":"high"
 }
 
 重要規則：
-1. 如果是正式訂購單，優先讀取訂購單表格本身，不要把公司章、店章、訂購人或頁尾文字誤認成老師。
-2. teacher 只能取「老師/教師」欄位；「訂購人」不是老師。
-3. class_items 要保存圖片上每個班級實際寫的數量；不要用老師資料庫人數推測。
-4. 如果表格每列都有同一本書但不同班級，book 放共同書名，class_items 分別放班級與數量。
-5. 正式訂購單即使老師欄空白，只要學校、書名、班級與數量足夠，也可以判定 school_order；不要猜老師。
-6. confidence 只能 high、medium、low。關鍵欄位看不清楚就用 low。
-7. 補習班訂單使用：
-{"intent":"cram_order","image_type":"purchase_order","cram_school":"","items":[{"publisher":"","book":"","quantity":0}],"confidence":"high"}
+1. 學校一般拍照訂書，只要看得到「老師姓名＋至少一本書名」就可判定 school_order；不要因為沒寫學校、出版社、班級、數量就判定資料不足，這些會由後端資料庫補。
+2. 一張照片如果同一位老師寫了兩本以上書，每一本都要分開放進 books，不可只保留第一本。
+3. 如果某一本旁邊明確寫「只訂某班／某些班」，放進該本的 classes；如果沒寫班級，classes 留空，後端會套用該老師全部授課班級。
+4. 如果某一本旁邊明確寫了班級與數量，放進該本 class_items；沒有寫就留空，後端會用老師資料庫人數。
+5. 出版社沒有寫就留空，不要猜；後端會用書名查書籍資料庫。
+6. 補習班照片至少需要「補習班名稱＋書名＋每本數量」。出版社沒有寫就留空，後端查資料庫。
+7. 同一張補習班照片有多本書時，items 每一本都要保留各自 quantity。
+8. 備註如果明確屬於某一本，放該項 note；整張單共同備註放最外層 note。
+9. 如果是正式訂購單，優先讀取訂購單表格本身，不要把公司章、店章、訂購人或頁尾文字誤認成老師。
+10. teacher 只能取「老師/教師」欄位；「訂購人」不是老師。
+11. 正式訂購單的 class_items 要保存圖片上每個班級實際寫的數量，不要用老師資料庫人數推測。
+12. confidence 只能 high、medium、low。關鍵文字真的看不清楚才用 low。
 """
     return _openai_json([
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": [
-            {"type": "text", "text": "請仔細讀取這張圖片。先判斷圖片類型，再整理成訂單 JSON。正式訂購單請以表格內容為主要依據。"},
+            {"type": "text", "text": "請仔細讀取這張圖片。辨識所有書名，不要只取第一本；再依規則整理成訂單 JSON。"},
             {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
         ]},
-    ], max_output_tokens=1200)
+    ], max_output_tokens=1800)
 
 
 def _image_class_items(data):
@@ -7148,97 +7197,380 @@ def _apply_purchase_order_image(user_id, data):
     )
 
 
-def _apply_smart_school_order(user_id, data, source_label="口語"):
-    draft = {
-        "teacher": str(data.get("teacher", "") or "").strip(),
-        "school": str(data.get("school", "") or "").strip(),
-        "classes": unique_list([str(x or "").strip() for x in data.get("classes", []) if str(x or "").strip()]),
-        "publisher": str(data.get("publisher", "") or "").strip(),
-        "book": str(data.get("book", "") or "").strip(),
-    }
 
-    # AI 只提供線索；老師仍要交給既有資料庫正規化。
-    order_flow_context[user_id] = draft
-    guided_mode[user_id] = "order_flow"
+# 圖片多書訂單暫存：只有使用者最後確認後才寫入 Google。
+pending_photo_orders = {}
+_SESSION_DICTS["pending_photo_orders"] = pending_photo_orders
 
-    if not draft["teacher"]:
-        return f"📷 {source_label}內容已收到。\n\n我還缺老師姓名，請直接告訴我是哪一位老師？"
 
-    # 資訊不完整時先把老師 canonicalize，例如「張建國老師」→「張建國」，
-    # 並取得學校/班級；接著只追問缺少的書名。
-    if not draft["book"]:
-        raw_teacher = draft["teacher"]
-        draft["teacher"] = ""
-        order_flow_context[user_id] = draft
-        return validate_order_teacher_input(user_id, raw_teacher, draft)
-
-    # 有足夠欄位後仍走原本 build_order_from_draft；出版社可由書籍資料庫自動帶出。
-    result = build_order_from_draft(user_id, draft)
-    if user_id in pending_orders:
-        order_flow_context.pop(user_id, None)
+def _photo_book_entries(data):
+    raw = data.get("books", []) if isinstance(data, dict) else []
+    result = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            book = clean_book_name(str(item.get("book", "") or "").strip())
+            if not book:
+                continue
+            result.append({
+                "book": book,
+                "publisher": str(item.get("publisher", "") or "").strip(),
+                "classes": unique_list([str(x or "").strip() for x in item.get("classes", []) if str(x or "").strip()]),
+                "class_items": item.get("class_items", []) if isinstance(item.get("class_items", []), list) else [],
+                "note": str(item.get("note", "") or "").strip(),
+            })
+    # 舊版單一本圖片 JSON 相容
+    if not result:
+        book = clean_book_name(str(data.get("book", "") or "").strip())
+        if book:
+            result.append({
+                "book": book,
+                "publisher": str(data.get("publisher", "") or "").strip(),
+                "classes": unique_list([str(x or "").strip() for x in data.get("classes", []) if str(x or "").strip()]),
+                "class_items": data.get("class_items", []) if isinstance(data.get("class_items", []), list) else [],
+                "note": str(data.get("note", "") or "").strip(),
+            })
     return result
+
+
+def _resolve_photo_teacher(teacher, school=""):
+    teacher = normalize_person_name(teacher)
+    if not teacher:
+        return None
+    matches = lookup_teacher_matches(teacher, school=school)
+    exact = [m for m in matches if normalize_person_name(m.get("teacher", "")) == teacher]
+    pool = exact or matches
+    if len(pool) == 1:
+        m = pool[0]
+        return {
+            "teacher": str(m.get("teacher", "") or teacher).strip(),
+            "school": str(m.get("school", "") or school).strip(),
+            "classes": copy_classes(m.get("classes", []))
+        }
+    return None
+
+
+def _resolve_photo_book(book, publisher=""):
+    book = clean_book_name(book)
+    publisher = str(publisher or "").strip()
+    candidates = lookup_book_candidates_enhanced(book, publisher=publisher)
+    if not candidates:
+        return {"status": "none", "book": book}
+
+    qnorm = normalize_book_match_text(book)
+    exact = []
+    seen = set()
+    for c in candidates:
+        value = str(c.get("value", "") or "").strip()
+        pub = str(c.get("publisher", "") or "").strip()
+        if normalize_book_match_text(value) != qnorm:
+            continue
+        key = (value, pub)
+        if key not in seen:
+            seen.add(key)
+            exact.append({"book": value, "publisher": pub})
+
+    if publisher:
+        exact_pub = [x for x in exact if x["publisher"] == publisher]
+        if len(exact_pub) == 1:
+            return {"status": "ok", **exact_pub[0]}
+
+    pubs = unique_list([x["publisher"] for x in exact if x["publisher"]])
+    if len(exact) >= 2 and len(pubs) >= 2:
+        return {"status": "publisher_choice", "book": exact[0]["book"], "publishers": pubs}
+    if len(exact) == 1 and exact[0]["publisher"]:
+        return {"status": "ok", **exact[0]}
+
+    # 非完全相同時只在高信心且沒有出版社歧義時自動採用。
+    top = candidates[0]
+    top_score = float(top.get("score", 0) or 0)
+    top_value = str(top.get("value", "") or "").strip()
+    same_top = [c for c in candidates if str(c.get("value", "") or "").strip() == top_value]
+    top_pubs = unique_list([str(c.get("publisher", "") or "").strip() for c in same_top if str(c.get("publisher", "") or "").strip()])
+    if len(top_pubs) > 1:
+        return {"status": "publisher_choice", "book": top_value, "publishers": top_pubs}
+    if top_score >= 0.78 and top_value and str(top.get("publisher", "") or "").strip():
+        return {"status": "ok", "book": top_value, "publisher": str(top.get("publisher", "") or "").strip()}
+    return {"status": "none", "book": book}
+
+
+def _classes_for_photo_book(entry, teacher_classes):
+    lookup = {str(x.get("class_name", "") or "").strip(): x for x in teacher_classes}
+    # 圖片明確寫了班級＋數量，以圖片數量為準。
+    explicit = []
+    for x in entry.get("class_items", []):
+        if not isinstance(x, dict):
+            continue
+        name = str(x.get("class_name", "") or "").strip()
+        try:
+            qty = int(x.get("quantity", 0) or 0)
+        except Exception:
+            qty = 0
+        if name and qty > 0:
+            explicit.append({"class_name": name, "students": qty})
+    if explicit:
+        return sort_class_items(explicit)
+
+    # 只寫部分班級，數量沒寫：用老師資料庫人數。
+    wanted = entry.get("classes", [])
+    if wanted:
+        selected = []
+        for name in wanted:
+            if name in lookup:
+                selected.append({"class_name": name, "students": int(lookup[name].get("students", 0) or 0)})
+        return sort_class_items(selected)
+
+    # 沒寫班級：預設老師全部授課班級。
+    return sort_class_items(copy_classes(teacher_classes))
+
+
+def _photo_school_batch_confirmation(batch):
+    lines = [
+        "📷 照片辨識完成", "",
+        f"學校：{batch.get('school','')}",
+        f"老師：{batch.get('teacher','')}", "",
+        "📚 訂購書籍"
+    ]
+    for i, item in enumerate(batch.get("items", []), 1):
+        lines.append(f"{i}. {item['book']}｜{item['publisher']}")
+        for c in item.get("classes", []):
+            lines.append(f"   • {c['class_name']}：{c['students']}本")
+        if item.get("note"):
+            lines.append(f"   📝 {item['note']}")
+    if batch.get("note"):
+        lines.extend(["", f"📝 共同備註：{batch['note']}"])
+    lines.extend(["", "以上資料正確請回覆「確認」。", "需要取消請回覆「取消」。"])
+    return "\n".join(lines)
+
+
+def _photo_cram_batch_confirmation(batch):
+    lines = ["📷 照片辨識完成", "", f"補習班：{batch.get('cram_school','')}", "", "📚 訂購書籍"]
+    for i, item in enumerate(batch.get("items", []), 1):
+        lines.append(f"{i}. {item['book']}｜{item['publisher']}｜{item['quantity']}本")
+        if item.get("note"):
+            lines.append(f"   📝 {item['note']}")
+    if batch.get("note"):
+        lines.extend(["", f"📝 共同備註：{batch['note']}"])
+    lines.extend(["", "以上資料正確請回覆「確認」。", "需要取消請回覆「取消」。"])
+    return "\n".join(lines)
+
+
+def _continue_photo_resolution(user_id):
+    batch = pending_photo_orders.get(user_id)
+    if not batch:
+        return None
+
+    for idx, item in enumerate(batch.get("items", [])):
+        if item.get("publisher"):
+            continue
+        resolved = _resolve_photo_book(item.get("book", ""))
+        if resolved["status"] == "publisher_choice":
+            batch["awaiting_publisher_index"] = idx
+            batch["publisher_options"] = resolved["publishers"]
+            item["book"] = resolved["book"]
+            pending_photo_orders[user_id] = batch
+            lines = ["📚 找到相同書名", "", f"書名：{resolved['book']}", "", "這本書有不同出版社："]
+            for i, pub in enumerate(resolved["publishers"], 1):
+                lines.append(f"{i}. {pub}")
+            lines.extend(["", f"請回覆 1～{len(resolved['publishers'])}"])
+            return "\n".join(lines)
+        if resolved["status"] != "ok":
+            pending_photo_orders.pop(user_id, None)
+            return f"⚠️ 我無法從書籍資料庫確認「{item.get('book','')}」。\\n\\n請改用文字輸入這本書的完整書名。"
+        item["book"] = resolved["book"]
+        item["publisher"] = resolved["publisher"]
+
+    batch.pop("awaiting_publisher_index", None)
+    batch.pop("publisher_options", None)
+    pending_photo_orders[user_id] = batch
+    if batch.get("kind") == "school":
+        return _photo_school_batch_confirmation(batch)
+    return _photo_cram_batch_confirmation(batch)
+
+
+def handle_pending_photo_order(user_id, text):
+    batch = pending_photo_orders.get(user_id)
+    if not batch:
+        return None
+    clean = re.sub(r"[\\s，,。.!！?？]+", "", str(text or ""))
+
+    if clean in {"取消", "不要了", "這筆不要", "取消訂單"}:
+        pending_photo_orders.pop(user_id, None)
+        return "❌ 已取消這筆拍照訂單，Google 沒有寫入。"
+
+    idx = batch.get("awaiting_publisher_index")
+    if idx is not None:
+        options = batch.get("publisher_options", [])
+        choice = None
+        if clean.isdigit():
+            n = int(clean)
+            if 1 <= n <= len(options):
+                choice = options[n - 1]
+        elif clean in options:
+            choice = clean
+        if not choice:
+            return f"請回覆 1～{len(options)} 選擇出版社。"
+        batch["items"][idx]["publisher"] = choice
+        batch.pop("awaiting_publisher_index", None)
+        batch.pop("publisher_options", None)
+        pending_photo_orders[user_id] = batch
+        return _continue_photo_resolution(user_id)
+
+    if _is_confirm_word(clean):
+        return confirm_photo_order(user_id)
+
+    return (_photo_school_batch_confirmation(batch) if batch.get("kind") == "school"
+            else _photo_cram_batch_confirmation(batch))
+
+
+def confirm_photo_order(user_id):
+    batch = pending_photo_orders.get(user_id)
+    if not batch:
+        return "⚠️ 找不到等待確認的拍照訂單。"
+
+    if batch.get("kind") == "cram":
+        draft = _new_cram_draft()
+        draft["cram_school"] = batch.get("cram_school", "")
+        draft["items"] = [
+            {"publisher": x["publisher"], "book": x["book"], "quantity": x["quantity"]}
+            for x in batch.get("items", [])
+        ]
+        success, order_number = write_cram_order_to_google(draft)
+        if not success:
+            return "❌ 補習班訂單寫入失敗，請稍後再試。"
+        pending_photo_orders.pop(user_id, None)
+        return f"✅ 補習班拍照訂單已確認\\n\\n訂單編號：{order_number}\\n共 {len(draft['items'])} 個書籍品項，已成功寫入 Google。"
+
+    results = []
+    for item in batch.get("items", []):
+        order = {
+            "teacher": batch.get("teacher", ""),
+            "school": batch.get("school", ""),
+            "book": item["book"],
+            "publisher": item["publisher"],
+            "classes": copy_classes(item.get("classes", [])),
+            "note": item.get("note") or batch.get("note", "")
+        }
+        success, order_number = write_to_google_sheet(order)
+        if success and order.get("note"):
+            mark_order_note(order_number, order["note"])
+        results.append((success, order_number, item["book"]))
+
+    pending_photo_orders.pop(user_id, None)
+    ok = [x for x in results if x[0]]
+    fail = [x for x in results if not x[0]]
+    lines = ["✅ 學校拍照訂單已處理", "", f"成功 {len(ok)} 筆／共 {len(results)} 筆"]
+    for success, number, book in ok:
+        lines.append(f"✔️ {book}｜訂單編號 {number}")
+    for success, number, book in fail:
+        lines.append(f"❌ {book}｜寫入失敗")
+    return "\n".join(lines)
+
+
+def _apply_smart_school_order(user_id, data, source_label="口語"):
+    teacher_raw = str(data.get("teacher", "") or "").strip()
+    school_hint = str(data.get("school", "") or "").strip()
+    entries = _photo_book_entries(data)
+    common_note = str(data.get("note", "") or "").strip()
+
+    if not teacher_raw:
+        return f"📷 {source_label}內容已收到。\\n\\n我還缺老師姓名，請直接告訴我是哪一位老師？"
+    if not entries:
+        return f"📷 {source_label}內容已收到。\\n\\n我有看到老師，但還沒辨識到書名，請直接告訴我要訂哪一本書？"
+
+    teacher_info = _resolve_photo_teacher(teacher_raw, school_hint)
+    if not teacher_info:
+        return (
+            "📷 我有辨識到老師姓名，但目前無法唯一確認老師資料。\\n\\n"
+            f"你輸入／圖片辨識：{teacher_raw}\\n"
+            "請直接用文字補上完整老師姓名；如果有同名老師，也請加上學校名稱。"
+        )
+
+    batch_items = []
+    for entry in entries:
+        classes = _classes_for_photo_book(entry, teacher_info["classes"])
+        if not classes:
+            return (
+                f"⚠️ 「{entry['book']}」指定的班級無法對上 {teacher_info['teacher']} 的授課資料。\\n\\n"
+                "請用文字告訴我要訂哪些班。"
+            )
+        publisher = entry.get("publisher", "")
+        if publisher:
+            resolved = _resolve_photo_book(entry["book"], publisher)
+            if resolved["status"] == "ok":
+                entry["book"] = resolved["book"]
+                publisher = resolved["publisher"]
+            else:
+                publisher = ""
+        batch_items.append({
+            "book": entry["book"],
+            "publisher": publisher,
+            "classes": classes,
+            "note": entry.get("note", "")
+        })
+
+    pending_photo_orders[user_id] = {
+        "kind": "school",
+        "teacher": teacher_info["teacher"],
+        "school": teacher_info["school"],
+        "items": batch_items,
+        "note": common_note
+    }
+    return _continue_photo_resolution(user_id)
 
 
 def _apply_smart_cram_order(user_id, data, source_label="口語"):
     cram_school = str(data.get("cram_school", "") or "").strip()
     raw_items = data.get("items", []) if isinstance(data.get("items", []), list) else []
-    items = []
-    for item in raw_items:
-        if not isinstance(item, dict):
-            continue
-        publisher = str(item.get("publisher", "") or "").strip()
-        book = str(item.get("book", "") or "").strip()
-        try:
-            quantity = int(item.get("quantity", 0) or 0)
-        except Exception:
-            quantity = 0
-
-        # 只有書名文字、完全沒有出版社也沒有數量（例如「國文第五冊」），
-        # 比較像是在說明後面幾本書屬於哪個科目／冊次的分類標題，不是
-        # 一本真的要訂的書。真的缺資料的書至少會有出版社或數量其中
-        # 一項，只有這種「兩項都空」的才跳過，不會誤刪真正不完整的書。
-        if book and not publisher and quantity <= 0:
-            continue
-
-        if publisher or book or quantity:
-            items.append({"publisher": publisher, "book": book, "quantity": quantity})
-
-    draft = _new_cram_draft()
-    draft["cram_school"] = cram_school
-    draft["items"] = [x for x in items if x["publisher"] and x["book"] and x["quantity"] > 0]
-    cram_order_context[user_id] = draft
-    guided_mode[user_id] = "cram_order_flow"
+    common_note = str(data.get("note", "") or "").strip()
 
     if not cram_school:
-        return f"📷 {source_label}內容已收到。\n\n我還缺補習班名稱，請告訴我是哪一間補習班？"
+        return f"📷 {source_label}內容已收到。\\n\\n我還缺補習班名稱，請告訴我是哪一間補習班？"
 
-    incomplete = next((x for x in items if not x["publisher"] or not x["book"] or x["quantity"] <= 0), None)
-    if incomplete:
-        if not incomplete["publisher"]:
-            # 書名如果已經有辨識到，先記住（current_book），等使用者
-            # 補上出版社時才不會遺失、也不用再問一次書名；訊息也直接
-            # 點名是哪一本，使用者才不用反問「哪一本」。
-            if incomplete["book"]:
-                draft["current_book"] = incomplete["book"]
-                cram_order_context[user_id] = draft
-                return (
-                    "我已經先記住能辨識的內容。\n\n"
-                    f"還有「{incomplete['book']}」缺出版社，請告訴我出版社。"
-                )
-            return "我已經先記住能辨識的內容。\n\n還有一本缺出版社，請告訴我出版社。"
-        if not incomplete["book"]:
-            draft["current_publisher"] = incomplete["publisher"]
-            cram_order_context[user_id] = draft
-            return f"我已經先記住能辨識的內容。\n\n出版社：{incomplete['publisher']}\n請告訴我書名。"
-        draft["current_publisher"] = incomplete["publisher"]
-        draft["current_book"] = incomplete["book"]
-        cram_order_context[user_id] = draft
-        return f"我已經先記住能辨識的內容。\n\n[{incomplete['publisher']}] {incomplete['book']} 要幾本？"
+    items = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        book = clean_book_name(str(raw.get("book", "") or "").strip())
+        try:
+            quantity = int(raw.get("quantity", 0) or 0)
+        except Exception:
+            quantity = 0
+        if not book:
+            continue
+        if quantity <= 0:
+            return (
+                f"📷 我有辨識到「{book}」，但沒有看到這本要訂幾本。\\n\\n"
+                "補習班訂書每一本都需要數量，請直接用文字補充。"
+            )
+        publisher = str(raw.get("publisher", "") or "").strip()
+        if publisher:
+            resolved = _resolve_photo_book(book, publisher)
+            if resolved["status"] == "ok":
+                book, publisher = resolved["book"], resolved["publisher"]
+            else:
+                publisher = ""
+        items.append({
+            "book": book,
+            "publisher": publisher,
+            "quantity": quantity,
+            "note": str(raw.get("note", "") or "").strip()
+        })
 
-    if not draft["items"]:
-        return "我有辨識到補習班，但還沒有足夠的書名／數量。\n\n請直接告訴我要訂的第一本書。"
+    if not items:
+        return (
+            "📷 我有辨識到補習班名稱，但還沒有讀到「書名＋數量」。\\n\\n"
+            "請重新拍清楚一點，或直接用文字補充。"
+        )
 
-    return _enter_cram_confirm_stage(user_id, draft)
+    pending_photo_orders[user_id] = {
+        "kind": "cram",
+        "cram_school": cram_school,
+        "items": items,
+        "note": common_note
+    }
+    return _continue_photo_resolution(user_id)
 
 
 
@@ -7602,7 +7934,9 @@ def handle_image_message(user_id, message_id):
                     return f"📷 我看起來收到的是書籍照片。\n\n可能的書名：{book}\n\n如果你要訂這本，請再告訴我老師或班級。"
             return (
                 "📷 我有收到圖片，但目前無法確認裡面有完整的訂書需求。\n\n"
-                "你可以傳：訂購單、老師的 LINE 訂書截圖、手寫訂單，或直接用文字補充。"
+                "🏫 學校訂書：照片至少要有「老師姓名＋書名」，書名可以一次多本。\n"
+                "🏢 補習班訂書：照片至少要有「補習班名稱＋書名＋每本數量」。\n\n"
+                "學校、出版社、授課班級與人數等可由資料庫補齊；辨識後我會先給你確認，不會直接下單。"
             )
         finally:
             _persist_session(user_id)
