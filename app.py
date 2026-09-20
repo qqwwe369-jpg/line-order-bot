@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v10-more-menu-buttons"
+APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v11-cram-image-items-fix"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -3332,7 +3332,13 @@ def get_cram_school_catalog(force_refresh=False):
     return list(cram_school_catalog_cache.get("schools", []))
 
 
-def cram_next_item_prompt(draft, first=False):
+def cram_next_item_prompt(user_id, draft, first=False):
+    if first and draft.get("items"):
+        # 草稿已經有完整品項了（例如拍照訂書辨識出來的內容，補習班
+        # 名稱是之後才補上的），不要再假裝是空白開始、重新問「第一
+        # 本書的出版社」——那樣使用者會以為機器人把圖片辨識結果忘了。
+        # 直接進確認畫面讓使用者看已經有的內容，要加書可以直接繼續講。
+        return _enter_cram_confirm_stage(user_id, draft)
     if first:
         return (
             f"補習班：{draft.get('cram_school', '')}\n\n"
@@ -3372,7 +3378,7 @@ def validate_cram_school_input(user_id, raw_text, draft):
         draft["cram_school"] = clean
         pending_name_confirmations.pop(user_id, None)
         cram_order_context[user_id] = draft
-        return cram_next_item_prompt(draft, first=True)
+        return cram_next_item_prompt(user_id, draft, first=True)
 
     candidates = lookup_fuzzy_candidates("cram_school", clean)
 
@@ -3400,14 +3406,14 @@ def validate_cram_school_input(user_id, raw_text, draft):
         draft["cram_school"] = value
         pending_name_confirmations.pop(user_id, None)
         cram_order_context[user_id] = draft
-        return cram_next_item_prompt(draft, first=True)
+        return cram_next_item_prompt(user_id, draft, first=True)
 
     # 高可信且明顯領先第二名：直接自動採用，不用多問一次。
     if value and score >= 0.78 and (len(candidates) == 1 or score - second_score >= 0.12):
         draft["cram_school"] = value
         pending_name_confirmations.pop(user_id, None)
         cram_order_context[user_id] = draft
-        return cram_next_item_prompt(draft, first=True)
+        return cram_next_item_prompt(user_id, draft, first=True)
 
     options = []
     if value and score >= 0.55:
@@ -3621,7 +3627,7 @@ def handle_cram_confirm_stage(user_id, clean, draft):
     if clean in {"加", "繼續加", "再加一本", "加一本"}:
         draft["confirming"] = False
         cram_order_context[user_id] = draft
-        return cram_next_item_prompt(draft)
+        return cram_next_item_prompt(user_id, draft)
 
     # 使用者直接輸入了出版社名稱想加下一本，不用先打「加」。
     draft["confirming"] = False
@@ -7603,7 +7609,7 @@ def handle_name_confirmation(user_id, text):
                 return "✅ 已確認名稱。請重新輸入剛才的補習班訂書內容。"
             draft["cram_school"] = str(chosen.get("value", "") or "").strip()
             cram_order_context[user_id] = draft
-            return cram_next_item_prompt(draft, first=True)
+            return cram_next_item_prompt(user_id, draft, first=True)
 
         if pending.get("purpose") == "cram_publisher":
             draft = cram_order_context.get(user_id)
