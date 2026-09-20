@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v11-cram-image-items-fix"
+APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v12-three-tier-menu"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -292,14 +292,27 @@ def _request_budget_exceeded():
 # =========================================================
 _quick_reply_state = threading.local()
 
-# 優先順序（使用者實際排定）：訂書 → 查老師 → 查訂單 → 查版本 → 查人數
+# 第一層按鈕（使用者實際排定）：學校訂書、補習班訂書、新增其他訂單、
+# 查詢資料（點下去換出下面 QUICK_REPLY_QUERY_ITEMS 那組查詢類按鈕）、
+# 更多功能。標籤文字（第一個值）是給使用者看的，觸發文字（第二個值）
+# 是點了之後實際送出去的訊息，兩者刻意分開，方便標籤取更口語的名稱
+# 而不用另外新增一堆觸發詞判斷。
 QUICK_REPLY_MAIN_ITEMS = [
-    ("📚 訂書", "我要訂書"),
+    ("📚 學校訂書", "我要訂書"),
+    ("🏫 補習班訂書", "補習班訂書"),
+    ("📦 新增其他訂單", "其他訂單"),
+    ("🔍 查詢資料", "查詢資料"),
+    ("➕ 更多功能", "更多功能"),
+]
+
+# 點「查詢資料」之後換出來的第三組按鈕，把原本擠在第一層的四個查詢
+# 類功能集中放在這裡，讓第一層的「訂書 / 補習班訂書 / 其他訂單 /
+# 查詢資料」分類更清楚。
+QUICK_REPLY_QUERY_ITEMS = [
     ("👨‍🏫 查老師", "查老師"),
     ("📅 查訂單", "查訂單"),
     ("📖 查版本", "查版本"),
     ("📊 查人數", "查人數"),
-    ("➕ 更多功能", "更多功能"),
 ]
 
 # 「更多功能」按鈕點下去要出現的第二組按鈕——刻意跟 QUICK_REPLY_MAIN_ITEMS
@@ -841,6 +854,9 @@ def _route_message(user_id, user_text):
     # 0.1 純本地固定指令：絕對不能碰 Google / AI
     if is_greeting_request(text):
         return get_greeting_reply()
+
+    if is_query_menu_request(text):
+        return get_query_menu_reply()
 
     if is_help_request(text):
         return get_help_reply()
@@ -2184,18 +2200,25 @@ def get_greeting_reply():
         "📚 大漢訂書小幫手\n\n"
         "你好！不用背指令，直接告訴我今天要處理什麼。\n\n"
         "常用功能\n"
-        "📚 訂書　👨‍🏫 查老師　📅 查訂單\n"
-        "📖 查版本　📊 查人數\n\n"
-        "✨ 我還可以幫你\n"
-        "📷 拍照訂書｜直接傳訂購單、手寫單或 LINE 截圖\n"
-        "🧠 大漢 AI 助手｜直接講人話，我會自己判斷要查什麼\n"
-        "📚 多書訂購｜不同班級配不同本書\n"
-        "🏫 補習班訂書｜補習班教材下單\n"
-        "📦 其他訂單｜書面紙、文具等\n"
-        "📊 今日訂單統計\n\n"
+        "📚 學校訂書　🏫 補習班訂書\n"
+        "📦 新增其他訂單　🔍 查詢資料\n\n"
         f"💬 例如：{p1}老師701、703訂國一數學講義\n"
         "📷 有訂書照片的話，直接傳給我就可以。\n\n"
         "也可以點下面的快速按鈕 👇"
+    )
+
+
+def is_query_menu_request(text):
+    compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+    return compact in {"查詢資料", "查資料", "資料查詢", "查詢"}
+
+
+def get_query_menu_reply():
+    _set_quick_reply(QUICK_REPLY_QUERY_ITEMS)
+    return (
+        "🔍 查詢資料\n\n"
+        "要查什麼？點下面的按鈕，或直接打關鍵字也可以，"
+        "例如「謝明清有幾個班」「查001」。"
     )
 
 
