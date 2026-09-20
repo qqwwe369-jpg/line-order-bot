@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v53-photo-book-candidates-fix"
+APP_VERSION = "2026-09-20-v53-photo-order-edit-support"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -7504,6 +7504,29 @@ def _continue_photo_resolution(user_id):
     return _photo_cram_batch_confirmation(batch)
 
 
+def _manual_book_choice_for_item(book_text):
+    """
+    使用者明確說「這一項選錯了」，要求重新選。這裡不用
+    _resolve_photo_book() 那套「分數夠高就自動採用」的邏輯——那套
+    邏輯已經證實可能選到同名但不對的出版社版本——改成直接把資料庫裡
+    比對到的候選（不限單一本、不自動篩選）都列出來，讓使用者自己挑。
+    """
+    candidates = lookup_book_candidates_enhanced(book_text, publisher="")
+    choices = []
+    seen = set()
+    for c in candidates[:8]:
+        value = str(c.get("value", "") or "").strip()
+        pub = str(c.get("publisher", "") or "").strip()
+        if not value:
+            continue
+        key = (value, pub)
+        if key in seen:
+            continue
+        seen.add(key)
+        choices.append({"book": value, "publisher": pub})
+    return choices
+
+
 def handle_pending_photo_order(user_id, text):
     batch = pending_photo_orders.get(user_id)
     if not batch:
@@ -7570,6 +7593,43 @@ def handle_pending_photo_order(user_id, text):
             pending_photo_orders[user_id] = batch
             return _continue_photo_resolution(user_id)
         return f"⚠️ 還是查不到「{text}」，請確認書名是否正確，或輸入「取消」放棄這筆訂單。"
+
+    # 確認畫面上如果有一項選錯了（例如自動比對選到同名但不對的出版
+    # 社），使用者可以直接說「修改2」「改2」要求重選第幾項。
+    m = re.fullmatch(r"(?:修改|改)\s*(\d{1,2})|(\d{1,2})\s*(?:修改|改)", clean)
+    if m:
+        n = int(m.group(1) or m.group(2))
+        items = batch.get("items", [])
+        if not (1 <= n <= len(items)):
+            return f"⚠️ 目前只有 1～{len(items)} 項，請輸入正確的編號。"
+        idx = n - 1
+        current = items[idx]
+        choices = _manual_book_choice_for_item(current.get("book", ""))
+        # 把目前這個（可能選錯的）版本排除掉，不然候選清單裡還會出現
+        # 使用者剛剛才說不對的那個選項。
+        choices = [
+            c for c in choices
+            if not (c["book"] == current.get("book") and c["publisher"] == current.get("publisher"))
+        ]
+        if not choices:
+            return (
+                f"⚠️ 查不到跟「{current.get('book','')}」相關的其他候選。\n\n"
+                "請直接輸入正確的完整書名。"
+            )
+        batch["awaiting_book_index"] = idx
+        batch["book_options"] = choices
+        pending_photo_orders[user_id] = batch
+        lines = [
+            f"📚 第 {n} 項重新選擇", "",
+            f"目前是：{current.get('book','')}｜{current.get('publisher','')}", "",
+            "資料庫裡找到的其他候選："
+        ]
+        for i, opt in enumerate(choices, 1):
+            pub_label = f"[{opt['publisher']}] " if opt.get("publisher") else ""
+            lines.append(f"{i}. {pub_label}{opt['book']}")
+        lines.append(f"{len(choices) + 1}. 都不是，我直接用文字告訴你完整書名")
+        lines.extend(["", f"請回覆 1～{len(choices) + 1}"])
+        return "\n".join(lines)
 
     if _is_confirm_word(clean):
         return confirm_photo_order(user_id)
