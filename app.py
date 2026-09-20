@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v50-other-order-natural-route-fix"
+APP_VERSION = "2026-09-20-v51-other-order-natural-full-fix"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1803,20 +1803,29 @@ def handle_guided_history_lookup(user_id, text):
 
 
 def handle_guided_other_order(user_id, text):
-    parsed = parse_other_order(user_id, str(text or "").strip())
-    if parsed:
-        pending_other_orders[user_id] = parsed
-        return make_other_order_confirmation(parsed)
+    """
+    v51：
+    其他訂單模式不再要求使用者一定輸入「學校＋老師＋品項」。
+    先用既有 parse_other_order() 解析自然語言。
+    parse_other_order() 成功時本身已建立 pending_other_orders，
+    這裡不可再把它當 dict 重複塞入，直接回傳它產生的確認訊息即可。
+    """
+    natural_reply = parse_other_order(user_id, str(text or "").strip())
+    if natural_reply:
+        # v43+ 的 parse_other_order 已負責：
+        # 老師解析、學校反查、品項解析、建立 pending_other_orders、
+        # 並回傳「其他訂單確認」文字。
+        return natural_reply
 
     smart_reply = _guided_mode_smart_rescue(user_id, text, "other_order")
     if smart_reply is not None:
         return smart_reply
 
     return (
-        "📦 其他訂單\n\n"
-        "我還在「其他訂單」模式。\n"
-        "請輸入：學校＋老師＋品項。\n"
-        "例如：天母國中王老師買書面紙20張\n\n"
+        "📦 其他訂單\\n\\n"
+        "我目前還無法確認這筆需求。\\n"
+        "你可以直接說：藍明月老師要買一盒彩色筆\\n"
+        "也可以說：華興張新莊要書面紙20張\\n\\n"
         "如果要離開，輸入「主選單」。"
     )
 
