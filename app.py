@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v53-po-sixers-style"
+APP_VERSION = "2026-09-20-v53-image-ai-timeout-fix"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -380,6 +380,12 @@ AI_AGENT_ENABLED = os.environ.get("AI_AGENT_ENABLED", "true").strip().lower() in
 AI_AGENT_MODEL = os.environ.get("AI_AGENT_MODEL", "gpt-5.6-sol").strip()
 AI_AGENT_MAX_HISTORY = int(os.environ.get("AI_AGENT_MAX_HISTORY", "10"))
 AI_TIMEOUT_SECONDS = float(os.environ.get("AI_TIMEOUT_SECONDS", "12"))
+# 圖片辨識（上傳圖片＋視覺分析＋整理成多本書的 JSON）本來就比純文字
+# 判斷慢很多，沿用同一個 12 秒逾時常常來不及，AI 還沒回完就被判定
+# 逾時失敗（見 handle_image_message 的 "AI parse error: ... Read timed
+# out" log）。這裡另外設一個比較長的逾時，只給圖片辨識用，不影響
+# 一般文字判斷的反應速度。
+IMAGE_AI_TIMEOUT_SECONDS = float(os.environ.get("IMAGE_AI_TIMEOUT_SECONDS", "28"))
 
 for _env_name, _env_value in [
     ("LINE_CHANNEL_ACCESS_TOKEN / CHANNEL_ACCESS_TOKEN", CHANNEL_ACCESS_TOKEN),
@@ -7010,7 +7016,7 @@ def extract_referenced_order_number(text):
 # =========================================================
 # 智慧理解層（最後一道容錯，不取代原本規則）
 # =========================================================
-def _openai_json(messages, max_output_tokens=700):
+def _openai_json(messages, max_output_tokens=700, timeout=None):
     if not OPENAI_API_KEY:
         return None
 
@@ -7027,7 +7033,8 @@ def _openai_json(messages, max_output_tokens=700):
     try:
         response = HTTP.post(
             "https://api.openai.com/v1/chat/completions",
-            headers=headers, json=payload, timeout=AI_TIMEOUT_SECONDS
+            headers=headers, json=payload,
+            timeout=timeout if timeout is not None else AI_TIMEOUT_SECONDS
         )
         if response.status_code != 200:
             logger.warning("AI parse failed status=%s body=%s", response.status_code, response.text[:300])
@@ -7168,7 +7175,7 @@ intent 只能是 school_order、cram_order、unknown。
             {"type": "text", "text": "請仔細讀取這張圖片。辨識所有書名，不要只取第一本；再依規則整理成訂單 JSON。"},
             {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
         ]},
-    ], max_output_tokens=1800)
+    ], max_output_tokens=1800, timeout=IMAGE_AI_TIMEOUT_SECONDS)
 
 
 def _image_class_items(data):
