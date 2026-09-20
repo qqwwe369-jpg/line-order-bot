@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v52-complete-fix"
+APP_VERSION = "2026-09-20-v53-reviewed-crashfix"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -2108,21 +2108,6 @@ def handle_subject_teacher_query(query):
     filtered = []
     for item in matches:
         selected = []
-
-        # v48：同書名多出版社的選擇是「選出版社」，不是一般欄位候選。
-        # selected 內容為 {value: 正式書名, publisher: 出版社}，兩個欄位要一起寫回。
-        if pending.get("purpose") == "order_book_publisher":
-            draft = order_flow_context.get(user_id, {})
-            draft["book"] = str(selected.get("value", "") or "").strip()
-            draft["publisher"] = str(selected.get("publisher", "") or "").strip()
-            pending_name_confirmations.pop(user_id, None)
-            order_flow_context[user_id] = draft
-            if draft.get("teacher") and draft.get("book") and draft.get("publisher"):
-                result = build_order_from_draft(user_id, draft)
-                if user_id in pending_orders:
-                    order_flow_context.pop(user_id, None)
-                return result
-            return make_order_guide_reply(draft)
         for c in item.get("classes", []):
             if not _class_matches_grade(c.get("class_name", ""), query["grade"]):
                 continue
@@ -2680,7 +2665,7 @@ def _ask_duplicate_book_publisher(user_id, draft, book, variants, purpose="order
         if not pub or pub in seen:
             continue
         seen.add(pub)
-        options.append({"value": pub, "book": book})
+        options.append({"value": book, "publisher": pub})
     if len(options) <= 1:
         return None
     pending_name_confirmations[user_id] = {
@@ -2690,7 +2675,7 @@ def _ask_duplicate_book_publisher(user_id, draft, book, variants, purpose="order
     order_flow_context[user_id] = draft
     lines = ["📚 找到相同書名", "", f"書名：{book}", "", "這本書有不同出版社："]
     for i, opt in enumerate(options, 1):
-        lines.append(f"{i}. {opt['value']}")
+        lines.append(f"{i}. {opt['publisher']}")
     lines.extend(["", f"請回覆 1～{len(options)}"] )
     return "\n".join(lines)
 
@@ -7163,8 +7148,14 @@ intent 只能是 school_order、cram_order、unknown。
 3. 如果某一本旁邊明確寫「只訂某班／某些班」，放進該本的 classes；如果沒寫班級，classes 留空，後端會套用該老師全部授課班級。
 4. 如果某一本旁邊明確寫了班級與數量，放進該本 class_items；沒有寫就留空，後端會用老師資料庫人數。
 5. 出版社沒有寫就留空，不要猜；後端會用書名查書籍資料庫。
-6. 補習班照片至少需要「補習班名稱＋書名＋每本數量」。出版社沒有寫就留空，後端查資料庫。
-7. 同一張補習班照片有多本書時，items 每一本都要保留各自 quantity。
+6. 補習班照片只要文字中可辨識「補習班名稱＋至少一本書名＋該書數量」，就判定 cram_order。
+   「我是XX補習班」「XX補習班我要訂」「XX補習班要買」都代表 cram_school=XX補習班。
+   不需要老師、不需要班級。
+   出版社若直接寫在書名前（例如「南一學習標竿國文1本」「康軒國文講義新挑戰6本」「翰林超級悍將講義41本」），
+   要拆成 publisher 與 book，不可因為格式不像表格就判定 unknown。
+7. 同一張補習班照片有多本書時，items 每一本都要保留各自 book、publisher、quantity，不可只取第一本。
+   例如圖片寫「我是菁華補習班 我要訂 國文第五冊／南一學習標竿國文1本／康軒國文講義新挑戰6本／翰林超級悍將講義41本」，
+   應判定 cram_order；有明確數量的三本都要放入 items。「國文第五冊」若只是標題/年級冊次而沒有數量，不要誤當成獨立品項。
 8. 備註如果明確屬於某一本，放該項 note；整張單共同備註放最外層 note。
 9. 如果是正式訂購單，優先讀取訂購單表格本身，不要把公司章、店章、訂購人或頁尾文字誤認成老師。
 10. teacher 只能取「老師/教師」欄位；「訂購人」不是老師。
@@ -7377,8 +7368,10 @@ def _classes_for_photo_book(entry, teacher_classes):
 
 
 def _photo_school_batch_confirmation(batch):
+    source_label = batch.get("source_label", "照片")
+    icon = "📷" if source_label == "照片" else "🧠"
     lines = [
-        "📷 照片辨識完成", "",
+        f"{icon} {source_label}辨識完成", "",
         f"學校：{batch.get('school','')}",
         f"老師：{batch.get('teacher','')}", "",
         "📚 訂購書籍"
@@ -7396,7 +7389,9 @@ def _photo_school_batch_confirmation(batch):
 
 
 def _photo_cram_batch_confirmation(batch):
-    lines = ["📷 照片辨識完成", "", f"補習班：{batch.get('cram_school','')}", "", "📚 訂購書籍"]
+    source_label = batch.get("source_label", "照片")
+    icon = "📷" if source_label == "照片" else "🧠"
+    lines = [f"{icon} {source_label}辨識完成", "", f"補習班：{batch.get('cram_school','')}", "", "📚 訂購書籍"]
     for i, item in enumerate(batch.get("items", []), 1):
         lines.append(f"{i}. {item['book']}｜{item['publisher']}｜{item['quantity']}本")
         if item.get("note"):
@@ -7428,7 +7423,7 @@ def _continue_photo_resolution(user_id):
             return "\n".join(lines)
         if resolved["status"] != "ok":
             pending_photo_orders.pop(user_id, None)
-            return f"⚠️ 我無法從書籍資料庫確認「{item.get('book','')}」。\\n\\n請改用文字輸入這本書的完整書名。"
+            return f"⚠️ 我無法從書籍資料庫確認「{item.get('book','')}」。\n\n請改用文字輸入這本書的完整書名。"
         item["book"] = resolved["book"]
         item["publisher"] = resolved["publisher"]
 
@@ -7491,7 +7486,7 @@ def confirm_photo_order(user_id):
         if not success:
             return "❌ 補習班訂單寫入失敗，請稍後再試。"
         pending_photo_orders.pop(user_id, None)
-        return f"✅ 補習班拍照訂單已確認\\n\\n訂單編號：{order_number}\\n共 {len(draft['items'])} 個書籍品項，已成功寫入 Google。"
+        return f"✅ 補習班拍照訂單已確認\n\n訂單編號：{order_number}\n共 {len(draft['items'])} 個書籍品項，已成功寫入 Google。"
 
     results = []
     for item in batch.get("items", []):
@@ -7526,15 +7521,15 @@ def _apply_smart_school_order(user_id, data, source_label="口語"):
     common_note = str(data.get("note", "") or "").strip()
 
     if not teacher_raw:
-        return f"📷 {source_label}內容已收到。\\n\\n我還缺老師姓名，請直接告訴我是哪一位老師？"
+        return f"📷 {source_label}內容已收到。\n\n我還缺老師姓名，請直接告訴我是哪一位老師？"
     if not entries:
-        return f"📷 {source_label}內容已收到。\\n\\n我有看到老師，但還沒辨識到書名，請直接告訴我要訂哪一本書？"
+        return f"📷 {source_label}內容已收到。\n\n我有看到老師，但還沒辨識到書名，請直接告訴我要訂哪一本書？"
 
     teacher_info = _resolve_photo_teacher(teacher_raw, school_hint)
     if not teacher_info:
         return (
-            "📷 我有辨識到老師姓名，但目前無法唯一確認老師資料。\\n\\n"
-            f"你輸入／圖片辨識：{teacher_raw}\\n"
+            "📷 我有辨識到老師姓名，但目前無法唯一確認老師資料。\n\n"
+            f"你輸入／圖片辨識：{teacher_raw}\n"
             "請直接用文字補上完整老師姓名；如果有同名老師，也請加上學校名稱。"
         )
 
@@ -7543,7 +7538,7 @@ def _apply_smart_school_order(user_id, data, source_label="口語"):
         classes = _classes_for_photo_book(entry, teacher_info["classes"])
         if not classes:
             return (
-                f"⚠️ 「{entry['book']}」指定的班級無法對上 {teacher_info['teacher']} 的授課資料。\\n\\n"
+                f"⚠️ 「{entry['book']}」指定的班級無法對上 {teacher_info['teacher']} 的授課資料。\n\n"
                 "請用文字告訴我要訂哪些班。"
             )
         publisher = entry.get("publisher", "")
@@ -7566,7 +7561,8 @@ def _apply_smart_school_order(user_id, data, source_label="口語"):
         "teacher": teacher_info["teacher"],
         "school": teacher_info["school"],
         "items": batch_items,
-        "note": common_note
+        "note": common_note,
+        "source_label": source_label,
     }
     return _continue_photo_resolution(user_id)
 
@@ -7577,7 +7573,7 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
     common_note = str(data.get("note", "") or "").strip()
 
     if not cram_school:
-        return f"📷 {source_label}內容已收到。\\n\\n我還缺補習班名稱，請告訴我是哪一間補習班？"
+        return f"📷 {source_label}內容已收到。\n\n我還缺補習班名稱，請告訴我是哪一間補習班？"
 
     items = []
     for raw in raw_items:
@@ -7590,12 +7586,20 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
             quantity = 0
         if not book:
             continue
+        publisher = str(raw.get("publisher", "") or "").strip()
+
+        # 只有書名文字、完全沒有出版社也沒有數量（例如「國文第五冊」），
+        # 比較像是在說明後面幾本書屬於哪個科目／冊次的分類標題，不是
+        # 一本真的要訂的書。真的缺資料的書至少會有出版社或數量其中
+        # 一項，只有這種「兩項都空」的才跳過，不會誤刪真正不完整的書。
+        if not publisher and quantity <= 0:
+            continue
+
         if quantity <= 0:
             return (
-                f"📷 我有辨識到「{book}」，但沒有看到這本要訂幾本。\\n\\n"
+                f"📷 我有辨識到「{book}」，但沒有看到這本要訂幾本。\n\n"
                 "補習班訂書每一本都需要數量，請直接用文字補充。"
             )
-        publisher = str(raw.get("publisher", "") or "").strip()
         if publisher:
             resolved = _resolve_photo_book(book, publisher)
             if resolved["status"] == "ok":
@@ -7611,7 +7615,7 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
 
     if not items:
         return (
-            "📷 我有辨識到補習班名稱，但還沒有讀到「書名＋數量」。\\n\\n"
+            "📷 我有辨識到補習班名稱，但還沒有讀到「書名＋數量」。\n\n"
             "請重新拍清楚一點，或直接用文字補充。"
         )
 
@@ -7619,7 +7623,8 @@ def _apply_smart_cram_order(user_id, data, source_label="口語"):
         "kind": "cram",
         "cram_school": cram_school,
         "items": items,
-        "note": common_note
+        "note": common_note,
+        "source_label": source_label,
     }
     return _continue_photo_resolution(user_id)
 
@@ -7947,6 +7952,57 @@ def handle_smart_order_fallback(user_id, text):
     return None
 
 
+def _normalize_image_order_result(data):
+    """
+    v53：AI 即使 intent 判成 unknown，只要實際已抽出足夠欄位，
+    後端仍依資料結構判斷學校/補習班訂單，避免同一張圖偶發失敗。
+    """
+    if not isinstance(data, dict):
+        return data
+
+    intent = str(data.get("intent", "") or "").strip()
+    cram_school = str(data.get("cram_school", "") or "").strip()
+    items = data.get("items", [])
+    teacher = str(data.get("teacher", "") or "").strip()
+    books = data.get("books", [])
+
+    valid_cram_items = []
+    if isinstance(items, list):
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            book = str(item.get("book", "") or "").strip()
+            try:
+                qty = int(item.get("quantity", 0) or 0)
+            except Exception:
+                qty = 0
+            if book and qty > 0:
+                valid_cram_items.append(item)
+
+    valid_school_books = []
+    if isinstance(books, list):
+        valid_school_books = [
+            x for x in books
+            if isinstance(x, dict) and str(x.get("book", "") or "").strip()
+        ]
+
+    # 資料已足夠時，以欄位內容修正 AI 偶發的 intent 誤判。
+    if cram_school and valid_cram_items:
+        data["intent"] = "cram_order"
+        data["items"] = valid_cram_items
+        if not data.get("image_type") or data.get("image_type") == "unknown":
+            data["image_type"] = "chat_screenshot"
+        return data
+
+    if teacher and (valid_school_books or str(data.get("book", "") or "").strip()):
+        data["intent"] = "school_order"
+        if not data.get("image_type") or data.get("image_type") == "unknown":
+            data["image_type"] = "chat_screenshot"
+        return data
+
+    return data
+
+
 def handle_image_message(user_id, message_id):
     """圖片智慧訂書：先辨識圖片類型；永遠先確認，不直接寫 Google。"""
     _start_request_budget()
@@ -7963,6 +8019,7 @@ def handle_image_message(user_id, message_id):
             if not image_bytes:
                 return "⚠️ 圖片讀取失敗，請再傳一次。"
             data = smart_parse_order_image(image_bytes)
+            data = _normalize_image_order_result(data)
             if not isinstance(data, dict):
                 return (
                     "⚠️ 這張圖片我目前沒辦法可靠整理成訂單。\n\n"
@@ -7984,10 +8041,10 @@ def handle_image_message(user_id, message_id):
                 if book:
                     return f"📷 我看起來收到的是書籍照片。\n\n可能的書名：{book}\n\n如果你要訂這本，請再告訴我老師或班級。"
             return (
-                "📷 我有收到圖片，但目前無法確認裡面有完整的訂書需求。\n\n"
-                "🏫 學校訂書：照片至少要有「老師姓名＋書名」，書名可以一次多本。\n"
-                "🏢 補習班訂書：照片至少要有「補習班名稱＋書名＋每本數量」。\n\n"
-                "學校、出版社、授課班級與人數等可由資料庫補齊；辨識後我會先給你確認，不會直接下單。"
+                "📷 圖片已收到，但這次辨識沒有抓到足夠的訂書欄位。\n\n"
+                "🏫 學校：老師姓名＋書名即可（可一次多本）\n"
+                "🏢 補習班：補習班名稱＋每本書名＋數量即可（可一次多本）\n\n"
+                "請再傳一次原圖；辨識完成後我會先整理成確認畫面，不會直接下單。"
             )
         finally:
             _persist_session(user_id)
