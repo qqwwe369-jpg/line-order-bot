@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v48-publisher-selection-fix"
+APP_VERSION = "2026-09-20-v49-publisher-choice-direct-confirm"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -8226,14 +8226,24 @@ def handle_name_confirmation(user_id, text):
             return f"出版社：{draft['publisher']}\n\n請告訴我書名關鍵字，例如「歷史1測驗卷」。"
 
         if pending.get("purpose") == "order_book_publisher":
+            # v49：這個候選的資料形狀是：
+            # chosen["value"] = 正式書名
+            # chosen["publisher"] = 使用者選到的出版社
+            # 選完出版社代表書籍辨識已完整，直接建立訂購確認。
             draft = order_flow_context.get(user_id)
             if not draft:
                 return "⚠️ 找不到剛才的訂書草稿，請重新輸入訂書內容。"
-            draft["book"] = str(pending.get("book", "") or chosen.get("book", "") or "").strip()
-            draft["publisher"] = str(chosen.get("value", "") or "").strip()
+
+            draft["book"] = str(chosen.get("value", "") or "").strip()
+            draft["publisher"] = str(chosen.get("publisher", "") or "").strip()
             order_flow_context[user_id] = draft
-            if draft.get("teacher") and draft.get("book"):
-                return build_order_from_draft(user_id, draft)
+
+            if draft.get("teacher") and draft.get("book") and draft.get("publisher"):
+                result = build_order_from_draft(user_id, draft)
+                if user_id in pending_orders:
+                    order_flow_context.pop(user_id, None)
+                return result
+
             return make_order_guide_reply(draft)
 
         draft = order_flow_context.get(user_id)
