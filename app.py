@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v44-other-order-history-numbering"
+APP_VERSION = "2026-09-20-v45-confirm-edit-and-publisher-choice"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -2626,6 +2626,48 @@ def validate_order_publisher_input(user_id, raw_text, draft):
             "請重新輸入出版社名稱。")
 
 
+def _exact_book_variants(query, publisher=""):
+    """回傳同一正式書名的所有出版社版本；不可把同名不同出版社合併。"""
+    candidates = lookup_book_candidates_enhanced(query, publisher=publisher)
+    exact = []
+    seen = set()
+    qnorm = normalize_book_match_text(query)
+    for item in candidates:
+        value = str(item.get("value", "") or "").strip()
+        pub = str(item.get("publisher", "") or "").strip()
+        if normalize_book_match_text(value) != qnorm:
+            continue
+        key = (value, pub)
+        if key in seen:
+            continue
+        seen.add(key)
+        exact.append({"value": value, "publisher": pub})
+    return exact
+
+
+def _ask_duplicate_book_publisher(user_id, draft, book, variants, purpose="order_book_publisher"):
+    options = []
+    seen = set()
+    for item in variants:
+        pub = str(item.get("publisher", "") or "").strip()
+        if not pub or pub in seen:
+            continue
+        seen.add(pub)
+        options.append({"value": pub, "book": book})
+    if len(options) <= 1:
+        return None
+    pending_name_confirmations[user_id] = {
+        "field": "publisher", "purpose": purpose, "options": options,
+        "original": book, "book": book
+    }
+    order_flow_context[user_id] = draft
+    lines = ["📚 找到相同書名", "", f"書名：{book}", "", "這本書有不同出版社："]
+    for i, opt in enumerate(options, 1):
+        lines.append(f"{i}. {opt['value']}")
+    lines.extend(["", f"請回覆 1～{len(options)}"] )
+    return "\n".join(lines)
+
+
 def validate_order_book_input(user_id, raw_text, draft):
     query = clean_book_name(str(raw_text or "").strip())
     query = re.sub(r"^(?:我要訂|要訂|訂)", "", query).strip()
@@ -2640,8 +2682,16 @@ def validate_order_book_input(user_id, raw_text, draft):
         value = str(first.get("value", "") or "").strip()
         score = float(first.get("score", 0) or 0)
 
-        # 完全一樣，直接採用，不用多問。
+        # 完全一樣時，如果同書名存在多家出版社，不能自動拿第一筆。
         if value == query:
+            if not publisher:
+                variants = _exact_book_variants(value)
+                ask = _ask_duplicate_book_publisher(user_id, draft, value, variants)
+                if ask:
+                    draft["book"] = value
+                    return ask
+                if variants and variants[0].get("publisher"):
+                    draft["publisher"] = variants[0]["publisher"]
             draft["book"] = value
             pending_name_confirmations.pop(user_id, None)
             order_flow_context[user_id] = draft
@@ -2660,7 +2710,14 @@ def validate_order_book_input(user_id, raw_text, draft):
         second_score = float(candidates[1].get("score", 0) or 0) if len(candidates) > 1 else 0.0
         if len(candidates) == 1 or (score - second_score) >= 0.12:
             draft["book"] = value
-            candidate_publisher = str(first.get("publisher", "") or "").strip()
+            if not publisher:
+                variants = _exact_book_variants(value)
+                ask = _ask_duplicate_book_publisher(user_id, draft, value, variants)
+                if ask:
+                    return ask
+                candidate_publisher = str(variants[0].get("publisher", "") or "").strip() if variants else str(first.get("publisher", "") or "").strip()
+            else:
+                candidate_publisher = str(first.get("publisher", "") or "").strip()
             if candidate_publisher:
                 draft["publisher"] = candidate_publisher
             pending_name_confirmations.pop(user_id, None)
@@ -3142,15 +3199,17 @@ def build_order_from_draft(user_id, draft):
     book = clean_book_name(draft["book"])
     publisher = str(draft.get("publisher", "") or "").strip()
 
-    if publisher:
-        exact_matches = lookup_teacher_matches(teacher, school=school)
-    else:
-        parallel_results = _parallel_google_calls({
-            "teacher_matches": (lookup_teacher_matches, (teacher,), {"school": school}),
-            "publisher": (get_book_publisher, (book,), {})
-        })
-        exact_matches = parallel_results.get("teacher_matches") or []
-        publisher = str(parallel_results.get("publisher") or "").strip()
+    exact_matches = lookup_teacher_matches(teacher, school=school)
+
+    # 同一正式書名可能同時由翰林、南一等出版社出版。
+    # 沒有出版社時先檢查所有完全同名版本；多家就讓使用者選，絕不拿第一筆。
+    if not publisher:
+        variants = _exact_book_variants(book)
+        ask = _ask_duplicate_book_publisher(user_id, draft, book, variants)
+        if ask:
+            return ask
+        if len(variants) == 1:
+            publisher = str(variants[0].get("publisher", "") or "").strip()
 
     teacher_classes = copy_classes(draft.get("teacher_classes", []))
     if teacher_classes:
@@ -3273,7 +3332,8 @@ def build_order_from_draft(user_id, draft):
         "book": book,
         "publisher": publisher,
         "classes": selected,
-        "quantity": calculate_total(selected)
+        "quantity": calculate_total(selected),
+        "note": str(draft.get("note", "") or "").strip()
     }
 
     pending_orders[user_id] = order
@@ -4790,9 +4850,10 @@ def make_order_confirmation(order):
         f"📖 書名：{order['book']}\n"
         f"🏢 出版社：{order['publisher']}\n\n"
         "📋 班級與數量\n" + "\n".join(class_lines) +
-        f"\n\n📦 總數量：{int(order.get('quantity', 0))} 本\n\n"
-        "確認無誤 → 回覆「確認」\n"
-        "需要修改 → 直接告訴我要增加、取消或更改哪些班級。"
+        f"\n\n📦 總數量：{int(order.get('quantity', 0))} 本"
+        + (f"\n📝 備註：{order.get('note', '')}" if str(order.get('note', '') or '').strip() else "")
+        + "\n\n確認無誤 → 回覆「確認」\n"
+        "需要修改 → 可直接修改班級、數量、書名、出版社、老師、學校或加備註。"
     )
 
 
@@ -4841,6 +4902,11 @@ def confirm_new_order(user_id):
     if not success:
         return "❌ 訂單寫入失敗，請稍後再試。"
 
+    note = str(order.get("note", "") or "").strip()
+    note_saved = True
+    if note:
+        note_saved = mark_order_note(order_number, note)
+
     pending_orders.pop(user_id, None)
     order_flow_context.pop(user_id, None)
     pending_name_confirmations.pop(user_id, None)
@@ -4859,8 +4925,10 @@ def confirm_new_order(user_id):
         (
             "✅ 訂單已確認\n\n"
             f"訂單編號：{order_number}\n"
-            "已成功寫入 Google 試算表。\n\n"
-            f"之後可以直接問「查{order_number}」"
+            "已成功寫入 Google 試算表。\n"
+            + ((f"備註：{note}\n" if note else "") if note_saved else (f"⚠️ 訂單已建立，但備註寫入失敗：{note}\n"))
+            + "\n"
+            + f"之後可以直接問「查{order_number}」"
         ),
         (
             "需要幫你生成一份訂購單 PDF，讓你可以存下來 email 給出版社嗎？\n"
@@ -5482,16 +5550,78 @@ def handle_pending_order_edit(user_id, text):
             + make_order_confirmation(order)
         )
 
+    # 備註：確認前直接加／改，最後確認時會寫入 Google J 欄。
+    m = re.fullmatch(r"(?:加上?|新增|修改|改)?\s*備註[：:]?\s*(.+)", text)
+    if m:
+        order["note"] = m.group(1).strip()
+        return make_order_confirmation(order)
+
+    # 出版社修改：必須驗證「目前書名＋新出版社」確實存在。
+    m = re.fullmatch(r"(?:出版社)?(?:改成|改為|換成|改)\s*(.+)", text)
+    if m and not re.search(r"班|本|人", m.group(1)):
+        new_pub = re.sub(r"[，,。.!！?？\s]+", "", m.group(1))
+        variants = _exact_book_variants(order.get("book", ""), publisher=new_pub)
+        if not variants:
+            return f"⚠️ 資料庫找不到「{order.get('book','')}｜{new_pub}」這個版本，沒有修改。"
+        order["publisher"] = new_pub
+        return make_order_confirmation(order)
+
+    # 書名修改：重新查正式書名；同名多出版社時要求選出版社。
     m = re.fullmatch(r"(?:書名)?(?:改成|改為|換成|書改成)\s*(.+)", text)
     if m:
         new_book = clean_book_name(m.group(1))
-        publisher = get_book_publisher(new_book)
+        variants = _exact_book_variants(new_book)
+        if len(variants) > 1:
+            draft = {
+                "teacher": order.get("teacher", ""), "school": order.get("school", ""),
+                "book": new_book, "publisher": "",
+                "classes": [c.get("class_name", "") for c in order.get("classes", [])],
+                "teacher_classes": copy_classes(context.get("classes", [])),
+                "note": order.get("note", "")
+            }
+            pending_orders.pop(user_id, None)
+            ask = _ask_duplicate_book_publisher(user_id, draft, new_book, variants)
+            return ask
+        if len(variants) == 1:
+            order["book"] = variants[0]["value"]
+            order["publisher"] = variants[0]["publisher"]
+            return make_order_confirmation(order)
+        return "⚠️ 查不到這本書\n\n" f"書名：{new_book}"
 
-        if not publisher:
-            return "⚠️ 查不到這本書\n\n" f"書名：{new_book}"
+    # 老師修改：重新抓老師資料與班級，不只換畫面文字。
+    m = re.fullmatch(r"(?:老師)?(?:改成|改為|換成|改)\s*(.+?)(?:老師)?", text)
+    if m:
+        new_teacher = normalize_teacher_name_input(m.group(1))
+        matches = lookup_teacher_matches(new_teacher, school=order.get("school", ""))
+        if len(matches) != 1:
+            matches = lookup_teacher_matches(new_teacher)
+        if len(matches) != 1:
+            return f"⚠️ 無法唯一確認老師「{new_teacher}」，請把學校＋老師一起告訴我。"
+        item = matches[0]
+        order["teacher"] = item["teacher"]
+        order["school"] = item["school"]
+        order["classes"] = sort_class_items(copy_classes(item.get("classes", [])))
+        refresh_order_total(order)
+        new_context = {"school": item["school"], "teacher": item["teacher"], "classes": copy_classes(item.get("classes", []))}
+        conversation_context[user_id] = new_context
+        teacher_lookup_context[user_id] = new_context
+        return make_order_confirmation(order)
 
-        order["book"] = new_book
-        order["publisher"] = publisher
+    # 學校修改：重新驗證目前老師在新學校是否唯一存在。
+    m = re.fullmatch(r"(?:學校)?(?:改成|改為|換成|改)\s*(.+)", text)
+    if m:
+        new_school = m.group(1).strip()
+        matches = lookup_teacher_matches(order.get("teacher", ""), school=new_school)
+        if len(matches) != 1:
+            return f"⚠️ 在「{new_school}」無法確認 {order.get('teacher','')} 的班級資料，沒有修改。"
+        item = matches[0]
+        order["school"] = item["school"]
+        order["teacher"] = item["teacher"]
+        order["classes"] = sort_class_items(copy_classes(item.get("classes", [])))
+        refresh_order_total(order)
+        new_context = {"school": item["school"], "teacher": item["teacher"], "classes": copy_classes(item.get("classes", []))}
+        conversation_context[user_id] = new_context
+        teacher_lookup_context[user_id] = new_context
         return make_order_confirmation(order)
 
     return None
@@ -7589,9 +7719,11 @@ def lookup_book_candidates_enhanced(query, publisher=""):
         local_score = book_keyword_score(query, value)
         remote_score = float(item.get("score", 0) or 0)
         score = max(local_score, remote_score * 0.85)
-        merged[value] = {
+        item_publisher = str(item.get("publisher", "") or "").strip()
+        merge_key = item_publisher + "||" + value
+        merged[merge_key] = {
             "value": value,
-            "publisher": str(item.get("publisher", "") or ""),
+            "publisher": item_publisher,
             "school": "",
             "score": score
         }
@@ -7760,6 +7892,17 @@ def handle_name_confirmation(user_id, text):
             draft["publisher"] = str(chosen.get("value", "") or "").strip()
             multi_book_order_context[user_id] = draft
             return f"出版社：{draft['publisher']}\n\n請告訴我書名關鍵字，例如「歷史1測驗卷」。"
+
+        if pending.get("purpose") == "order_book_publisher":
+            draft = order_flow_context.get(user_id)
+            if not draft:
+                return "⚠️ 找不到剛才的訂書草稿，請重新輸入訂書內容。"
+            draft["book"] = str(pending.get("book", "") or chosen.get("book", "") or "").strip()
+            draft["publisher"] = str(chosen.get("value", "") or "").strip()
+            order_flow_context[user_id] = draft
+            if draft.get("teacher") and draft.get("book"):
+                return build_order_from_draft(user_id, draft)
+            return make_order_guide_reply(draft)
 
         draft = order_flow_context.get(user_id)
         if not draft:
