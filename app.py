@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v9-ai-safety-net"
+APP_VERSION = "2026-09-20-v42-ai-agent-pilot-v10-more-menu-buttons"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -300,6 +300,18 @@ QUICK_REPLY_MAIN_ITEMS = [
     ("📖 查版本", "查版本"),
     ("📊 查人數", "查人數"),
     ("➕ 更多功能", "更多功能"),
+]
+
+# 「更多功能」按鈕點下去要出現的第二組按鈕——刻意跟 QUICK_REPLY_MAIN_ITEMS
+# 完全不重複，展示常用清單裡沒放的次要功能，不然使用者點「更多功能」
+# 卻看到同一組按鈕，會覺得沒有作用。
+QUICK_REPLY_MORE_ITEMS = [
+    ("📷 拍照訂書", "拍照訂書"),
+    ("🧠 AI 助手", "AI助手"),
+    ("📚 多書訂購", "多書訂購"),
+    ("🏫 補習班訂書", "補習班訂書"),
+    ("📦 其他訂單", "其他訂單"),
+    ("📊 今日統計", "統計"),
 ]
 
 
@@ -2245,7 +2257,7 @@ def get_ai_assistant_help_reply():
 
 def get_help_reply():
     p3 = _pick_players(1)[0]
-    _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
+    _set_quick_reply(QUICK_REPLY_MORE_ITEMS)
     return (
         "📚 大漢訂書小幫手｜完整功能\n\n"
         "不用背指令，直接用平常說話的方式告訴我需求。\n\n"
