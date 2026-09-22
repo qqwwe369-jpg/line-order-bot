@@ -149,7 +149,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-20-v53-quickreply-dedup-mainmenu-nav"
+APP_VERSION = "2026-09-22-v53-full-regression-healthcheck"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -4495,13 +4495,17 @@ def _find_and_strip_letter_classes(text, known_class_names):
 
     remaining = text
     found = []
+    matched_prefixes = set()
 
     for prefix in sorted(prefixes, key=len, reverse=True):
         suffix_chars = "".join(sorted(re.escape(c) for c in prefixes[prefix]))
         if not suffix_chars:
             continue
         pattern = re.escape(prefix) + "[" + suffix_chars + "]+"
-        for m in re.finditer(pattern, remaining):
+        matches = list(re.finditer(pattern, remaining))
+        if matches:
+            matched_prefixes.add(prefix)
+        for m in matches:
             for ch in m.group(0)[len(prefix):]:
                 found.append(prefix + ch)
         remaining = re.sub(pattern, " ", remaining)
@@ -4509,8 +4513,14 @@ def _find_and_strip_letter_classes(text, known_class_names):
     # 只講年級本身、沒有列出字母（例如「國一」），代表這位老師底下
     # 這個年級的班級「全部」都要，不用一個一個打。上面那段已經把
     # 「年級＋字母」的寫法都吃掉了，這裡剩下的「國一」就是單純講
-    # 年級整體的情況。
+    # 年級整體的情況——但只有「這個年級第一輪完全沒比對到任何字母」
+    # 時才適用。如果第一輪已經比對到字母（代表使用者有指定特定
+    # 班級），剩下的文字裡如果剛好還留著同樣的年級字（例如書名剛好
+    # 也叫「國一數學講義」），不能誤判成「使用者還想要整個年級」，
+    # 那只是書名裡的巧合，不是班級指定。
     for prefix in sorted(prefixes, key=len, reverse=True):
+        if prefix in matched_prefixes:
+            continue
         if prefix in remaining:
             for suffix in sorted(prefixes[prefix]):
                 found.append(prefix + suffix)
@@ -4701,7 +4711,7 @@ def _strip_school_grade_prefix(text, school, grade):
 
     if school:
         aliases = [school]
-        short = re.sub(r"(?:國中|高中|國小|中學)$", "", school)
+        short = re.sub(r"(?:國民中學|國民小學|高級中學|國中|高中|國小|中學|女中)$", "", school)
         if short and short != school:
             aliases.append(short)
         aliases.sort(key=len, reverse=True)
@@ -6617,7 +6627,7 @@ def extract_school_name(text):
         if not canonical:
             continue
 
-        short = re.sub(r"(?:國中|高中|國小|中學)$", "", canonical)
+        short = re.sub(r"(?:國民中學|國民小學|高級中學|國中|高中|國小|中學|女中)$", "", canonical)
         aliases.append((canonical, canonical))
 
         if short and short != canonical:
@@ -6818,6 +6828,15 @@ def parse_other_order(user_id, text):
     teacher_raw=match.group("teacher").strip()
     item=match.group("item").strip()
     if not teacher_raw or not item:
+        return None
+
+    # 「要」這個字同時也是訂書流程判斷意圖的關鍵字之一，如果比對到的
+    # 品項緊接著又以「訂」開頭（例如「張建國老師要訂段考王英文1」，
+    # 觸發詞比對到「要」，item 變成「訂段考王英文1」），代表使用者
+    # 原本要表達的其實是「要訂＋書名」，不是「要＋某個品項」，這種
+    # 情況不該被判定成其他訂單，要讓給訂書流程去處理，不然書名會被
+    # 整段吞進「其他訂單」的品項欄位裡。
+    if item.startswith("訂"):
         return None
 
     resolved=_resolve_other_order_teacher(user_id,teacher_raw,school_hint)
@@ -8289,6 +8308,19 @@ def book_keyword_score(query, candidate):
     if q == c:
         return 1.0
 
+    subjects = ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]
+    q_subjects = {x for x in subjects if x in q}
+    c_subjects = {x for x in subjects if x in c}
+
+    # 查詢跟候選都有明確科目字，但科目對不上時，直接判定不合格。
+    # 不能只是「不加分」——原本只是少加 0.20 分，但拿掉科目字之後
+    # 剩下的核心文字（例如「自然1測驗卷」拿掉「自然」「測驗」只剩
+    # 「卷」）太短、太通用，光靠字串比對／數字比對／通用詞比對疊加
+    # 起來還是很容易超過門檻，導致「自然1測驗卷」比對到「新挑戰
+    # 測驗卷-國文」這種完全不同科目的書。
+    if q_subjects and c_subjects and not (q_subjects & c_subjects):
+        return 0.0
+
     score = 0.0
     qcore = book_core_text(query)
     ccore = book_core_text(candidate)
@@ -8301,9 +8333,6 @@ def book_keyword_score(query, candidate):
         else:
             score += 0.35 * SequenceMatcher(None, qcore, ccore).ratio()
 
-    subjects = ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]
-    q_subjects = {x for x in subjects if x in q}
-    c_subjects = {x for x in subjects if x in c}
     if q_subjects and c_subjects and q_subjects & c_subjects:
         score += 0.20
 
@@ -8330,6 +8359,10 @@ def lookup_book_candidates_enhanced(query, publisher=""):
         if core and core != query:
             candidates = lookup_fuzzy_candidates("book", core, publisher=publisher)
 
+    _subjects = ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]
+    q_norm = normalize_book_match_text(query)
+    q_subjects = {x for x in _subjects if x in q_norm}
+
     # v47: same title from different publishers must remain separate.
     merged = {}
     for item in candidates:
@@ -8337,6 +8370,20 @@ def lookup_book_candidates_enhanced(query, publisher=""):
         pub = str(item.get("publisher", "") or "").strip()
         if not value:
             continue
+
+        # 查詢有明確科目時，候選書名的科目一定要對得上（或候選本身
+        # 沒有標示科目字）才收，不管 Google 那邊回傳的原始分數多高。
+        # book_keyword_score() 內部也有同樣的科目檢查，但下面這行
+        # 取的是「本地算的分數」跟「Google 原始分數 * 0.85」兩者的
+        # 較高值——如果只在 book_keyword_score() 裡擋，Google 那邊
+        # 剛好給了高分的話，還是會被這個 max() 蓋過去，所以這裡再
+        # 擋一次，兩層都擋才保險。
+        if q_subjects:
+            c_norm = normalize_book_match_text(value)
+            c_subjects = {x for x in _subjects if x in c_norm}
+            if c_subjects and not (q_subjects & c_subjects):
+                continue
+
         score = max(book_keyword_score(query, value),
                     float(item.get("score", 0) or 0) * 0.85)
         key = (value, pub)
