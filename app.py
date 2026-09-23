@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-24-v77-google-stale-fallback"
+APP_VERSION = "2026-09-24-v78-teacher-empty-fallback"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -11107,6 +11107,25 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
 
             data = response.json()
 
+            # v78：老師查詢偶爾會出現「HTTP 200 + success:true + matches:[]」的假空結果。
+            # 若同一個查詢先前曾成功拿到老師資料，這種空陣列不應覆蓋正確快取，
+            # 而是直接回退到最近一次成功資料。真正從未命中過的老師仍會正常回空。
+            if (
+                action == "lookup_teacher_matches"
+                and isinstance(data, dict)
+                and data.get("success") is True
+                and not (data.get("matches") or [])
+                and str(payload.get("teacher", "") or "").strip()
+            ):
+                stale = _load_google_stale_cache(action, key) if cache_ttl > 0 else None
+                if isinstance(stale, dict) and (stale.get("matches") or []):
+                    logger.warning(
+                        "Google teacher empty-result fallback HIT: teacher=%s school=%s",
+                        str(payload.get("teacher", "") or "").strip(),
+                        str(payload.get("school", "") or "").strip(),
+                    )
+                    return stale
+
             if cache_ttl > 0 and isinstance(data, dict):
                 # data.get("success") is True：Apps Script 端偶爾會回
                 # HTTP 200 但 {"success": false, ...}（例如短暫出錯或
@@ -11118,6 +11137,10 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
                 # `is True`，這些讀取就會每次都重新打 Google，造成 1~3 秒累積延遲。
                 should_cache = data.get("success") is not False and not (
                     action == "lookup_fuzzy_candidates" and not data.get("candidates")
+                ) and not (
+                    action == "lookup_teacher_matches"
+                    and str(payload.get("teacher", "") or "").strip()
+                    and not (data.get("matches") or [])
                 )
                 if should_cache:
                     _google_read_cache[key] = {
@@ -12252,3 +12275,794 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
+
+# -*- coding: utf-8 -*-
+"""
+=============================================================
+大漢訂書小幫手 — 真實資料庫 + 速度測試
+版本：2026-09-24 real-db-speed-v5
+=============================================================
+
+用途
+1. 真的連到目前 Google Apps Script Web App（只做讀取，不建立正式訂單）
+2. 用目前三校真實老師資料驗證：
+   - 天母國中
+   - 衛理女中
+   - 華興中學
+3. 測試版本查詢、結構化多書搜尋、真實書名
+4. 測試完整對話到「確認前」，不寫入正式訂單
+5. 記錄每個 Google action 次數、耗時、整段對話耗時
+
+安全設計
+- 不呼叫 create_order / update_order / cancel_order / create_other_order /
+  update_other_order / create_cram_order / set_order_note。
+- 如果程式意外準備呼叫任何寫入 action，本測試會直接攔截並報錯。
+- 不需要 LINE token。
+- 不啟用 OpenAI API，避免測試產生成本或被 AI fallback 干擾。
+
+執行方式：
+    python test_dahan_real_db_speed_v6.py app_v78_老師空結果備援版.py
+
+如果本機沒有 GOOGLE_SCRIPT_URL，執行後會請你貼上 Apps Script Web App URL。
+=============================================================
+"""
+
+import os
+import re
+import sys
+import time
+import json
+import math
+import tempfile
+import statistics
+import importlib.util
+from collections import defaultdict
+
+APP_PATH = sys.argv[1] if len(sys.argv) > 1 else "app_v71_批次數量原子修正版.py"
+
+# ----------------------------------------------------------------------
+# 連線設定
+# ----------------------------------------------------------------------
+gas_url = os.environ.get("GOOGLE_SCRIPT_URL", "").strip()
+if not gas_url:
+    print("請貼上目前 Google Apps Script Web App URL（最後通常是 /exec）：")
+    gas_url = input("> ").strip()
+
+if not gas_url:
+    print("❌ 沒有 GOOGLE_SCRIPT_URL，無法做真實資料庫測試。")
+    sys.exit(2)
+
+os.environ["GOOGLE_SCRIPT_URL"] = gas_url
+os.environ["AI_AGENT_ENABLED"] = "false"
+os.environ.pop("OPENAI_API_KEY", None)
+
+state_path = os.path.join(
+    tempfile.gettempdir(),
+    f"dahan_real_db_speed_{os.getpid()}.sqlite3"
+)
+try:
+    if os.path.exists(state_path):
+        os.remove(state_path)
+except Exception:
+    pass
+os.environ["ORDER_STATE_DB_PATH"] = state_path
+
+if not os.path.exists(APP_PATH):
+    print(f"❌ 找不到 APP：{APP_PATH}")
+    sys.exit(2)
+
+spec = importlib.util.spec_from_file_location("dahan_live_app", APP_PATH)
+mod = importlib.util.module_from_spec(spec)
+sys.modules["dahan_live_app"] = mod
+spec.loader.exec_module(mod)
+
+print(f"測試對象：{APP_PATH}")
+print(f"程式版本：{getattr(mod, 'APP_VERSION', 'unknown')}")
+print("測試模式：真實 Google 資料庫（唯讀）＋速度分析 v5（含 v77 stale fallback 驗證）")
+print("=" * 72)
+
+# ----------------------------------------------------------------------
+# 真實資料 fixture
+# 來源：三校老師班級資料 115學年度第1學期版
+# ----------------------------------------------------------------------
+REAL_TEACHERS = [
+    {
+        "school": "華興中學",
+        "teacher": "陳映汝",
+        "classes": {
+            "國三甲", "國三乙", "國三丙", "國三丁",
+            "國三戊", "國三己", "國三庚", "高三乙",
+        },
+        "subject_aliases": {"地球科學", "地科"},
+    },
+    {
+        "school": "華興中學",
+        "teacher": "張建國",
+        "classes": {
+            "國一甲", "國一丁", "國一戊", "國一己", "國一庚",
+            "國三甲", "國三乙", "國三丙", "國三丁",
+            "國三戊", "國三己", "國三庚",
+        },
+        "subject_aliases": {"生物"},
+    },
+    {
+        "school": "華興中學",
+        "teacher": "廖惠萱",
+        "classes": {"國二丁", "國二戊", "國三丙"},
+        "subject_aliases": {"英文", "英語"},
+    },
+    {
+        "school": "衛理女中",
+        "teacher": "謝明清",
+        "classes": {
+            "八信", "八德", "八恩", "八愛", "八慧", "八望", "八義",
+            "高二恩", "高二愛", "高二望",
+        },
+        "subject_aliases": {"地理"},
+    },
+    {
+        "school": "天母國中",
+        "teacher": "黃鈺琁",
+        # 真實資料中共 14 筆；這裡不硬寫全部班名，避免人事調整後
+        # 因一班異動讓整份速度測試完全失效。
+        "min_class_count": 10,
+        "subject_aliases": {"公民"},
+    },
+]
+
+# 真實書籍資料中已確認存在的案例
+REAL_BOOK_CASES = [
+    ("段考王英文5", "南一"),
+    ("新挑戰測驗卷自然5", "漢華"),
+    ("麻吉測驗卷自然5-康", "明霖"),
+    ("雙向溝通測驗卷自然5-康", "金安"),
+]
+
+WRITE_ACTIONS = {
+    "create_order", "update_order", "cancel_order", "set_order_note",
+    "create_other_order", "update_other_order", "create_cram_order",
+}
+
+# ----------------------------------------------------------------------
+# 統計器
+# ----------------------------------------------------------------------
+checks = 0
+fails = []
+warns = []
+action_timings = defaultdict(list)   # 真正 HTTP 傳輸時間；cache hit 記 0
+logical_timings = defaultdict(list)  # 包含 Python 包裝/解析時間，僅供異常診斷
+action_counts = defaultdict(int)
+current_case = ""
+
+# v3：直接量 requests.Session.post 的實際 HTTP 等待時間。
+# v2 只包住整個 google_post()，曾遇到 GAS log 顯示 5 秒、外層卻顯示 164 秒的
+# Windows/程序排程異常。這裡把「網路等待」和「外層包裝時間」拆開，避免速度表失真。
+_real_http_post = mod.HTTP.post
+_http_call_seq = 0
+
+def monitored_http_post(*args, **kwargs):
+    global _http_call_seq
+    payload = kwargs.get("json") or {}
+    action = str(payload.get("action", "") or "")
+    t0 = time.perf_counter()
+    try:
+        return _real_http_post(*args, **kwargs)
+    finally:
+        dt = time.perf_counter() - t0
+        _http_call_seq += 1
+        action_timings[action].append(dt)
+
+mod.HTTP.post = monitored_http_post
+
+def ok(msg):
+    global checks
+    checks += 1
+    print(f"[ OK ] {msg}")
+
+def fail(msg, detail=""):
+    global checks
+    checks += 1
+    full = msg if not detail else f"{msg} — {detail}"
+    fails.append(full)
+    print(f"[FAIL] {msg}")
+    if detail:
+        print(f"       {detail}")
+
+def warn(msg):
+    warns.append(msg)
+    print(f"[WARN] {msg}")
+
+def check(cond, msg, detail=""):
+    if cond:
+        ok(msg)
+    else:
+        fail(msg, detail)
+
+def normalize_class(s):
+    return re.sub(r"\s+|班$", "", str(s or "").strip())
+
+def class_names_from_match(item):
+    out = set()
+    for c in item.get("classes", []) or []:
+        out.add(normalize_class(c.get("class_name", "")))
+    return {x for x in out if x}
+
+def flatten_subjects(item):
+    values = set()
+    for s in item.get("subjects", []) or []:
+        values.add(str(s or "").strip())
+    for c in item.get("classes", []) or []:
+        for s in c.get("subjects", []) or []:
+            values.add(str(s or "").strip())
+    return {x for x in values if x}
+
+# ----------------------------------------------------------------------
+# 攔截寫入 + 記錄 Google action 速度
+# ----------------------------------------------------------------------
+_real_google_post = mod.google_post
+
+def monitored_google_post(payload, timeout=10, retries=1, ignore_budget=False):
+    action = str((payload or {}).get("action", "") or "")
+    if action in WRITE_ACTIONS:
+        raise RuntimeError(
+            f"安全攔截：真實資料測試禁止寫入 action={action}"
+        )
+    before_http = len(action_timings.get(action, []))
+    t0 = time.perf_counter()
+    try:
+        return _real_google_post(
+            payload,
+            timeout=timeout,
+            retries=retries,
+            ignore_budget=ignore_budget,
+        )
+    finally:
+        dt = time.perf_counter() - t0
+        action_counts[action] += 1
+        logical_timings[action].append(dt)
+        # 如果沒有真的送 HTTP，代表命中 Python 本地 cache；速度表記 0 秒。
+        if len(action_timings.get(action, [])) == before_http:
+            action_timings[action].append(0.0)
+
+mod.google_post = monitored_google_post
+
+# ----------------------------------------------------------------------
+# 小工具：直接 action 測試
+# ----------------------------------------------------------------------
+def live_post(payload, label):
+    global current_case
+    current_case = label
+    action = str((payload or {}).get("action", "") or "")
+    before = len(action_timings.get(action, []))
+    try:
+        result = monitored_google_post(payload, timeout=12, retries=1, ignore_budget=True)
+    except Exception as e:
+        fail(label, f"{type(e).__name__}: {e}")
+        result = None
+    new_times = action_timings.get(action, [])[before:]
+    # 一個 logical call 可能因重試送出多個 HTTP；實際等待時間取總和。
+    dt = sum(new_times) if new_times else 0.0
+    return result, dt
+
+def speed_label(seconds, kind="query"):
+    if kind == "local":
+        if seconds < 0.5: return "FAST"
+        if seconds < 1.0: return "OK"
+        return "SLOW"
+    if kind == "multi":
+        if seconds < 3.0: return "FAST"
+        if seconds < 4.5: return "OK"
+        if seconds < 6.0: return "SLOW"
+        return "VERY SLOW"
+    # 一般 Google 查詢
+    if seconds < 2.0: return "FAST"
+    if seconds < 3.0: return "OK"
+    if seconds < 6.0: return "SLOW"
+    return "VERY SLOW"
+
+def print_speed(label, seconds, kind="query"):
+    print(f"       ⏱ {seconds:.3f}s  [{speed_label(seconds, kind)}]  {label}")
+
+# ----------------------------------------------------------------------
+# 0. 預熱 phase：只暖索引，不列入正確性 FAIL
+# ----------------------------------------------------------------------
+print("\n【0. GAS / 索引預熱】")
+
+PREWARM_CASES = [
+    ({"action": "ping"}, "ping"),
+    ({"action": "lookup_teacher_matches", "teacher": "陳映汝", "school": "華興中學"}, "老師索引"),
+    ({"action": "lookup_fuzzy_candidates", "kind": "book", "query": "段考王英文5", "publisher": "南一"}, "書籍索引"),
+    ({"action": "lookup_versions", "school": "華興中學", "grade": "九年級", "subject": "自然", "academic_period": ""}, "版本索引"),
+    ({"action": "lookup_multi_book_candidates", "subject": "自然", "volume": "5", "category": "卷類", "applicable_version": "康軒", "publisher": "", "limit": 30}, "多書索引"),
+]
+
+for payload, label in PREWARM_CASES:
+    r, dt = live_post(payload, "預熱 " + label)
+    state = "成功" if (isinstance(r, dict) and r.get("success")) else "未成功"
+    print(f"       {label}: {dt:.3f}s / {state}")
+    if not (isinstance(r, dict) and r.get("success")):
+        warn(f"預熱 {label} 未成功；正式測試仍會繼續，避免把冷啟動直接當功能錯誤")
+
+# ----------------------------------------------------------------------
+# 0.5 v78 stale fallback：成功資料寫入 SQLite 後，模擬 Google 斷線，
+# 應直接取最近一次成功結果，不讓使用者只因 Apps Script 抖動就看到查無資料。
+# ----------------------------------------------------------------------
+print("\n【0.5. v78 Google 失敗／老師空結果自動備援】")
+if hasattr(mod, "_load_google_stale_cache") and hasattr(mod, "_store_google_stale_cache"):
+    fallback_payload = {
+        "action": "lookup_fuzzy_candidates",
+        "kind": "book",
+        "query": "段考王英文5",
+        "publisher": "南一",
+    }
+    # 先用正常 Google 確保這個 key 有最近成功資料。若預熱已命中本地 cache，
+    # 仍可由 v77 的 persistent stale store 讀取。
+    seed = mod.google_post(fallback_payload, timeout=12, retries=1, ignore_budget=True)
+    if isinstance(seed, dict) and seed.get("success"):
+        mod._google_read_cache.clear()
+        saved_post = mod.HTTP.post
+        def _forced_google_down(*args, **kwargs):
+            raise RuntimeError("v78 fallback test: simulated Google outage")
+        mod.HTTP.post = _forced_google_down
+        try:
+            fb = mod.google_post(fallback_payload, timeout=0.2, retries=1, ignore_budget=True)
+        finally:
+            mod.HTTP.post = saved_post
+        check(
+            isinstance(fb, dict) and fb.get("success") and fb.get("_stale_fallback") is True,
+            "Google 失敗時可使用最近一次成功資料備援",
+            detail=f"回傳={fb}" if not (isinstance(fb, dict) and fb.get("_stale_fallback") is True) else ""
+        )
+    else:
+        warn("v78 stale fallback 種子查詢未成功，本輪無法做斷線備援模擬；不直接判功能 FAIL")
+else:
+    fail("APP 應提供 v78 persistent stale fallback")
+
+# v78 專屬：HTTP 200 / success:true 但老師 matches=[] 時，
+# 若同一查詢已有最近一次成功資料，必須回退舊資料，而不是把空陣列當成真的查無老師。
+if hasattr(mod, "_store_google_stale_cache"):
+    teacher_payload = {
+        "action": "lookup_teacher_matches",
+        "teacher": "廖惠萱",
+        "school": "華興中學",
+        "grade": "",
+        "subject": "",
+    }
+    teacher_key = mod._cache_key(teacher_payload)
+    teacher_seed = {
+        "success": True,
+        "matches": [{
+            "school": "華興中學",
+            "teacher": "廖惠萱",
+            "subjects": ["英文"],
+            "classes": [{"class_name": "國二丁", "students": 40, "subjects": ["英文"]}],
+        }],
+    }
+    mod._store_google_stale_cache("lookup_teacher_matches", teacher_key, teacher_seed)
+    mod._google_read_cache.clear()
+
+    class _FakeEmptyTeacherResponse:
+        status_code = 200
+        def json(self):
+            return {"success": True, "matches": []}
+
+    saved_post = mod.HTTP.post
+    mod.HTTP.post = lambda *args, **kwargs: _FakeEmptyTeacherResponse()
+    try:
+        empty_fb = mod.google_post(teacher_payload, timeout=0.2, retries=1, ignore_budget=True)
+    finally:
+        mod.HTTP.post = saved_post
+
+    check(
+        isinstance(empty_fb, dict)
+        and empty_fb.get("_stale_fallback") is True
+        and bool(empty_fb.get("matches")),
+        "老師成功回空陣列時會使用最近一次成功資料備援",
+        detail=f"回傳={empty_fb}" if not (isinstance(empty_fb, dict) and empty_fb.get("matches")) else ""
+    )
+
+# 預熱與 fallback 測試時間不混入正式速度平均，正式表只看使用體感。
+action_timings.clear()
+logical_timings.clear()
+action_counts.clear()
+
+# v76/v77 本地保險絲：先確認三個社會科目一定會被轉成「社會」。
+if hasattr(mod, "_version_lookup_subject"):
+    check(mod._version_lookup_subject("歷史") == "社會", "歷史版本查詢統一轉社會")
+    check(mod._version_lookup_subject("地理") == "社會", "地理版本查詢統一轉社會")
+    check(mod._version_lookup_subject("公民") == "社會", "公民版本查詢統一轉社會")
+else:
+    fail("APP 應提供 _version_lookup_subject 統一版本科目入口")
+
+# ----------------------------------------------------------------------
+# 1. 基礎連線
+# ----------------------------------------------------------------------
+print("\n【1. Google Apps Script 連線】")
+
+r, dt = live_post({"action": "ping"}, "GAS ping")
+if r and r.get("success"):
+    ok("GAS ping 成功")
+    print(f"       GAS version: {r.get('version','')}")
+else:
+    # ping 只反映 Apps Script 冷啟動/Google 邊緣節點狀態，不代表正式功能壞掉。
+    # v3 改成警告，不再讓單次 ping timeout 把整份正確性測試判 FAIL。
+    warn(f"GAS ping 未成功（可能是冷啟動）：回傳={r}")
+print_speed("ping", dt)
+
+# ----------------------------------------------------------------------
+# 2. 真實老師資料
+# ----------------------------------------------------------------------
+print("\n【2. 真實老師資料】")
+
+for case in REAL_TEACHERS:
+    payload = {
+        "action": "lookup_teacher_matches",
+        "teacher": case["teacher"],
+        "school": case["school"],
+    }
+    r, dt = live_post(payload, f"查老師 {case['school']} / {case['teacher']}")
+    print_speed(f"{case['teacher']}老師", dt)
+
+    matches = (r or {}).get("matches", []) if isinstance(r, dict) else []
+    if not matches and isinstance(r, dict):
+        # 相容部分舊 GAS 回傳欄位
+        matches = r.get("teachers", []) or r.get("results", []) or []
+
+    if not (r and r.get("success")):
+        warn(f"{case['teacher']} 正式查詢未成功（預熱後仍可能是 Google 邊緣節點抖動）：回傳={r}")
+        continue
+    ok(f"{case['teacher']} 查詢成功")
+    if not matches:
+        fail(f"{case['teacher']} 有資料", "成功回傳但 matches 為空")
+        continue
+
+    item = next(
+        (
+            x for x in matches
+            if str(x.get("teacher", "")).strip() == case["teacher"]
+            and str(x.get("school", "")).strip() == case["school"]
+        ),
+        matches[0],
+    )
+    check(
+        str(item.get("school", "")).strip() == case["school"],
+        f"{case['teacher']} 學校正確",
+        f"實際={item.get('school')}",
+    )
+
+    got_classes = class_names_from_match(item)
+    if case.get("classes"):
+        expected = {normalize_class(x) for x in case["classes"]}
+        missing = sorted(expected - got_classes)
+        extra = sorted(got_classes - expected)
+        check(
+            not missing,
+            f"{case['teacher']} 真實班級至少包含預期班級",
+            f"缺少={missing}；多出={extra[:8]}",
+        )
+    else:
+        check(
+            len(got_classes) >= int(case.get("min_class_count", 1)),
+            f"{case['teacher']} 班級數合理",
+            f"實際班級數={len(got_classes)}",
+        )
+
+# ----------------------------------------------------------------------
+# 3. 真實書籍查詢
+# ----------------------------------------------------------------------
+print("\n【3. 真實書籍資料】")
+
+for book, publisher in REAL_BOOK_CASES:
+    r, dt = live_post(
+        {
+            "action": "lookup_fuzzy_candidates",
+            "kind": "book",
+            "query": book,
+            "publisher": publisher,
+        },
+        f"查書 {publisher} / {book}",
+    )
+    print_speed(book, dt)
+    candidates = (r or {}).get("candidates", []) if isinstance(r, dict) else []
+    hit = any(
+        str(x.get("value", "")).strip() == book
+        and str(x.get("publisher", "")).strip() == publisher
+        for x in candidates
+    )
+    if not (r and r.get("success")):
+        warn(f"{book} 正式查詢未成功（Google 冷啟動/節點抖動）：回傳={r}")
+        continue
+    ok(f"{book} 查詢成功")
+    check(hit, f"{book}｜{publisher} 能在真實書籍資料命中",
+          f"前幾筆={candidates[:5]}")
+
+# ----------------------------------------------------------------------
+# 4. 真實版本查詢
+# 不硬寫出版版本值，因學校版本資料會更新；
+# 這裡確認「目前資料庫能查到」並把結果列出。
+# ----------------------------------------------------------------------
+print("\n【4. 真實教科書版本】")
+
+VERSION_CASES = [
+    ("華興中學", "九年級", "自然"),
+    ("華興中學", "九年級", "社會"),
+    ("衛理女中", "八年級", "社會"),
+    ("天母國中", "八年級", "社會"),
+]
+
+version_results = {}
+
+for school, grade, subject in VERSION_CASES:
+    r, dt = live_post(
+        {
+            "action": "lookup_versions",
+            "school": school,
+            "grade": grade,
+            "subject": subject,
+            "academic_period": "",
+        },
+        f"版本 {school}/{grade}/{subject}",
+    )
+    print_speed(f"{school} {grade} {subject}", dt)
+    versions = (r or {}).get("versions", []) if isinstance(r, dict) else []
+    if not (r and r.get("success")):
+        warn(f"{school}{grade}{subject}版本查詢未成功（Google 冷啟動/節點抖動）：回傳={r}")
+        continue
+    ok(f"{school}{grade}{subject}版本查詢成功")
+    if versions:
+        ok(f"{school}{grade}{subject}有版本資料")
+        print("       目前版本：" + "、".join(
+            sorted({str(v.get("version", "") or "") for v in versions if v.get("version")})
+        ))
+        version_results[(school, grade, subject)] = versions
+    else:
+        warn(f"{school}{grade}{subject}目前查無版本資料（不直接判程式 FAIL）")
+
+# ----------------------------------------------------------------------
+# 5. 真實結構化多書搜尋
+# 以華興九年級自然目前版本為準，檢查卷類。
+# ----------------------------------------------------------------------
+print("\n【5. 真實多書結構化搜尋】")
+
+current_version = ""
+for v in version_results.get(("華興中學", "九年級", "自然"), []):
+    candidate = str(v.get("version", "") or "").strip()
+    if candidate:
+        current_version = candidate
+        break
+
+if not current_version:
+    warn("華興九年級自然查不到版本，跳過該版本的多書精準驗證。")
+else:
+    r, dt = live_post(
+        {
+            "action": "lookup_multi_book_candidates",
+            # v2：完全比照正式 app 的 payload，避免測試工具自己送錯欄位，
+            # 造成「GAS 看起來回了 30 本無關書」的假失敗。
+            "subject": "自然",
+            "volume": "5",
+            "category": "卷類",
+            "applicable_version": current_version,
+            "publisher": "",
+            "limit": 30,
+        },
+        f"多書 自然5 / {current_version}",
+    )
+    print_speed(f"自然5卷類 {current_version}", dt, "multi")
+    candidates = (r or {}).get("candidates", []) if isinstance(r, dict) else []
+    check(bool(r and r.get("success")), "多書結構化搜尋成功", f"回傳={r}")
+    check(bool(candidates), "多書結構化搜尋至少有候選", f"回傳={r}")
+
+    print(f"       找到 {len(candidates)} 種：")
+    for i, x in enumerate(candidates[:20], 1):
+        print(
+            f"       {i:>2}. [{x.get('publisher','')}] "
+            f"{x.get('value','')} "
+            f"(適用:{x.get('applicable_version','') or x.get('required_version','')})"
+        )
+
+    # 康軒版本時，依今天實際確認的資料至少應看到這 3 種。
+    if current_version == "康軒":
+        expected = {
+            ("漢華", "新挑戰測驗卷自然5"),
+            ("明霖", "麻吉測驗卷自然5-康"),
+            ("金安", "雙向溝通測驗卷自然5-康"),
+        }
+        got = {
+            (str(x.get("publisher", "")).strip(), str(x.get("value", "")).strip())
+            for x in candidates
+        }
+        missing = sorted(expected - got)
+        check(
+            not missing,
+            "華興九年級自然康軒版 3 種已確認卷類都能找到",
+            f"缺少={missing}",
+        )
+
+# ----------------------------------------------------------------------
+# 6. APP 真實對話解析（唯讀 / 確認前停止）
+# ----------------------------------------------------------------------
+print("\n【6. APP 真實對話流程＋實際耗時】")
+
+def reset_user(uid):
+    try:
+        if hasattr(mod, "clear_all_user_states"):
+            mod.clear_all_user_states(uid)
+        elif hasattr(mod, "clear_task_states_for_new_mode"):
+            mod.clear_task_states_for_new_mode(uid)
+    except Exception:
+        pass
+
+def send(uid, text):
+    http_before = {k: len(v) for k, v in action_timings.items()}
+    t0 = time.perf_counter()
+    try:
+        reply = mod._route_message(uid, text)
+    except Exception as e:
+        outer = time.perf_counter() - t0
+        return f"EXCEPTION: {type(e).__name__}: {e}", outer
+    outer = time.perf_counter() - t0
+    network = 0.0
+    for action, arr in action_timings.items():
+        start = http_before.get(action, 0)
+        network += sum(arr[start:])
+    # 若外層時間比實際 HTTP 多出超過 10 秒且總時間超過 30 秒，視為測試主機
+    # 排程/休眠造成的計時異常。功能體感主要以實際 HTTP + 正常本地處理為準。
+    if outer > 30.0 and outer - network > 10.0:
+        print(f"     [計時異常] 外層 {outer:.3f}s，但實際 HTTP {network:.3f}s；速度統計採 HTTP 時間")
+        return str(reply or ""), network
+    return str(reply or ""), outer
+
+CONVERSATIONS = [
+    (
+        "查老師－陳映汝",
+        ["查老師", "陳映汝"],
+        ["陳映汝", "華興"],
+    ),
+    (
+        "多書－自然5測驗卷7種",
+        ["多書訂購", "陳映汝", "不限", "自然5測驗卷", "7"],
+        ["自然5"],
+    ),
+    (
+        "多書－歷史5需查社會版本",
+        ["多書訂購", "高毓坤", "不限", "歷史5測驗卷", "4"],
+        ["歷史5"],
+    ),
+    (
+        "其他訂單－天母教務處自由聯絡人",
+        ["其他訂單", "天母教務處要補一本國一數學講義"],
+        ["天母", "教務處"],
+    ),
+]
+
+# 如果某一步因 Google timeout 停住，v1 仍會把後面的「不限／書名／7」
+# 繼續餵進去，導致它們全部被當老師姓名，產生一串「連鎖假失敗」。
+# v2 在真正卡住時立即停止該案例，只記第一個根因。
+def _conversation_blocked(reply):
+    text = str(reply or "")
+    return any(x in text for x in [
+        "查詢逾時", "暫時無法連線", "請重新輸入姓名",
+        "請直接再輸入一次老師姓名", "目前找不到符合的老師",
+    ])
+
+for idx, (label, messages, must_contain) in enumerate(CONVERSATIONS, 1):
+    uid = f"REAL_SPEED_{idx}_{int(time.time()*1000)}"
+    reset_user(uid)
+    total = 0.0
+    print(f"\n  ▶ {label}")
+    last_reply = ""
+    blocked = False
+    before_counts = dict(action_counts)
+
+    for step_index, msg in enumerate(messages):
+        reply, dt = send(uid, msg)
+        total += dt
+        last_reply = reply
+        print(f"     你：{msg}")
+        print(f"     ⏱ {dt:.3f}s")
+        preview = reply.splitlines()
+        for line in preview[:5]:
+            print(f"     機器人：{line}")
+        if len(preview) > 5:
+            print("     機器人：...")
+
+        # 第一個功能入口（例如「多書訂購」）只是提示，不算阻塞。
+        # 後續步驟若明確因老師查詢 timeout/找不到而停住，就不要再送下一句。
+        if step_index > 0 and _conversation_blocked(reply):
+            blocked = True
+            print("     ↳ 此案例在真正失敗點停止，避免後續訊息造成連鎖假失敗。")
+            break
+
+    print_speed(label + " 總耗時", total, "multi" if "多書" in label else "query")
+
+    if blocked:
+        fail(
+            f"{label} 流程被上游查詢阻塞",
+            f"最後回覆={last_reply[:600]}"
+        )
+    else:
+        check(
+            all(x in last_reply for x in must_contain),
+            f"{label} 最後回覆包含預期資訊",
+            f"預期={must_contain}；實際={last_reply[:600]}",
+        )
+
+    if "EXCEPTION:" in last_reply:
+        fail(f"{label} 不應丟例外", last_reply)
+
+    # v73 目標：三個主要學校要本地辨識。「天母教務處...」不能為了
+    # 辨識天母再打 list_schools。
+    if label == "其他訂單－天母教務處自由聯絡人":
+        delta = action_counts.get("list_schools", 0) - before_counts.get("list_schools", 0)
+        check(delta == 0, "天母其他訂單不應呼叫 list_schools", f"實際呼叫 {delta} 次")
+
+# ----------------------------------------------------------------------
+# 6.5 同條件暖快取抽測
+# ----------------------------------------------------------------------
+print("\n【6.5. 同條件暖快取抽測】")
+
+WARM_CASES = [
+    ({"action": "lookup_teacher_matches", "teacher": "陳映汝", "school": "華興中學"}, "老師 陳映汝"),
+    ({"action": "lookup_versions", "school": "華興中學", "grade": "九年級", "subject": "自然", "academic_period": ""}, "版本 華興九年級自然"),
+    ({"action": "lookup_multi_book_candidates", "subject": "自然", "volume": "5", "category": "卷類", "applicable_version": current_version or "康軒", "publisher": "", "limit": 30}, "多書 自然5"),
+]
+
+for payload, label in WARM_CASES:
+    r1, t1 = live_post(payload, label + " warm-1")
+    r2, t2 = live_post(payload, label + " warm-2")
+    print(f"       {label}: 第1次 {t1:.3f}s / 第2次 {t2:.3f}s")
+    check(bool(r2 and r2.get("success")), f"{label} 暖快取第二次查詢成功", f"回傳={r2}")
+    if t2 > 3.0:
+        warn(f"{label} 暖快取第二次仍超過 3 秒：{t2:.3f}s")
+
+# ----------------------------------------------------------------------
+# 7. 速度總表
+# ----------------------------------------------------------------------
+print("\n【7. Google action 速度總表】")
+print(f"{'action':34s} {'次數':>4s} {'最快':>8s} {'平均':>8s} {'最慢':>8s} {'判定':>10s}")
+print("-" * 80)
+
+for action in sorted(action_timings):
+    arr = action_timings[action]
+    if not arr:
+        continue
+    fastest = min(arr)
+    avg = statistics.mean(arr)
+    slowest = max(arr)
+    rating = speed_label(avg, "multi" if action == "lookup_multi_book_candidates" else "query")
+    print(
+        f"{action:34s} {len(arr):4d} "
+        f"{fastest:8.3f} {avg:8.3f} {slowest:8.3f} {rating:>10s}"
+    )
+
+# 額外提示 logical wrapper 是否出現與 HTTP 明顯不一致的極端值；不列入功能 FAIL。
+for action, arr in logical_timings.items():
+    if not arr:
+        continue
+    logical_max = max(arr)
+    http_max = max(action_timings.get(action, [0.0]) or [0.0])
+    if logical_max > 30 and logical_max - http_max > 10:
+        warn(f"{action} 曾出現外層計時異常：logical {logical_max:.3f}s / HTTP {http_max:.3f}s")
+
+# ----------------------------------------------------------------------
+# 總結
+# ----------------------------------------------------------------------
+print("\n" + "=" * 72)
+print(f"共 {checks} 個正確性檢查，失敗 {len(fails)} 個，警告 {len(warns)} 個")
+
+if warns:
+    print("\n警告：")
+    for x in warns:
+        print(f"  - {x}")
+
+if fails:
+    print("\n失敗詳情：")
+    for x in fails:
+        print(f"  - {x}")
+    print("\n❌ 真實資料庫測試未完全通過")
+    sys.exit(1)
+
+print("\n✅ 真實資料庫正確性測試通過")
+print("※ 速度屬於當下 Apps Script / 網路實測，偶爾冷啟動會造成單次偏慢。")
+print("※ 本測試沒有建立、修改、取消任何正式訂單。")
