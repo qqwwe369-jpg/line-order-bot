@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-23-v66-version-aware-multibook"
+APP_VERSION = "2026-09-23-v67-structured-multibook-grade-safe"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -193,6 +193,7 @@ _GOOGLE_CACHE_TTLS = {
     "lookup_versions": 300,
     "lookup_book": 300,
     "lookup_fuzzy_candidates": 180,
+    "lookup_multi_book_candidates": 300,
 }
 
 def _cache_key(payload):
@@ -5098,6 +5099,8 @@ def _new_multi_book_draft():
         # 確認過才會進到 awaiting_classes 問班級分配。
         "awaiting_review": False,
         "awaiting_classes": False,
+        # 跨年級老師而書名沒有冊次時，不猜年級；要求使用者補 1～6 冊。
+        "awaiting_volume_selection": False,
         "confirming": False,
     }
 
@@ -5419,34 +5422,110 @@ def _select_diverse_multi_book_candidates(candidates, expected):
     return chosen
 
 
+
+def _multi_book_teacher_has_grade(draft, grade):
+    return any(
+        _class_matches_grade(c.get("class_name", ""), grade)
+        for c in (draft.get("teacher_classes") or [])
+    )
+
+
+def _multi_book_teacher_junior_grades(draft):
+    grades = []
+    for grade in ["七年級", "八年級", "九年級"]:
+        if _multi_book_teacher_has_grade(draft, grade):
+            grades.append(grade)
+    return grades
+
+
+def _multi_book_eligible_classes(draft):
+    """只回傳這次書名冊次所屬年級的班級；避免跨年級老師把別年級班級混進分配。"""
+    grade = str(draft.get("target_grade", "") or "").strip()
+    classes = list(draft.get("teacher_classes") or [])
+    if not grade:
+        profile = _multi_book_query_profile(draft.get("keyword", ""))
+        grade = profile.get("grade", "")
+    if not grade:
+        return classes
+    return [c for c in classes if _class_matches_grade(c.get("class_name", ""), grade)]
+
+
+def _lookup_multi_book_candidates_structured(query, publisher="", required_version="", limit=30):
+    """v67：一次把結構化條件送給 GAS，避免同一筆多書搜尋連打 3 次 fuzzy。"""
+    profile = _multi_book_query_profile(query)
+    if not (profile.get("subject") and profile.get("volume")):
+        return None
+
+    result = google_post({
+        "action": "lookup_multi_book_candidates",
+        "subject": profile.get("subject", ""),
+        "volume": profile.get("volume", ""),
+        "category": "卷類" if profile.get("exam_like") else "",
+        "applicable_version": str(required_version or ""),
+        "publisher": str(publisher or ""),
+        "limit": int(max(1, min(int(limit or 30), 50))),
+    }, timeout=6.0, retries=1)
+
+    # 舊 GAS 尚未部署新 action 時回 None，讓呼叫端退回舊 fuzzy 搜尋，
+    # 避免部署順序不同時整個功能直接壞掉。
+    if not result or not result.get("success"):
+        return None
+    return result.get("candidates", []) or []
+
+
 def _collect_multi_book_matches(query, publisher, target_count=0, required_version=""):
     """
-    多書搜尋：科目／冊次／卷類／適用版本都用硬條件；真正出版社可以不同。
-    同書名但不同出版社算不同品項，不能再只用書名去重。
+    v67 多書搜尋：優先使用 GAS 結構化查詢，一次依「科目＋冊次＋卷類＋
+    適用版本＋真正出版社」取得完整候選。若 GAS 尚未更新才退回舊 fuzzy。
+    同書名不同出版社以 (書名, 出版社) 為不同品項。
     """
     seen = set()
     result = []
-    for variant in _multi_book_query_variants(query):
-        raw = lookup_book_candidates_enhanced(variant, publisher=publisher, max_results=20)
+
+    structured = _lookup_multi_book_candidates_structured(
+        query,
+        publisher=publisher,
+        required_version=required_version,
+        limit=max(30, int(target_count or 0) * 3),
+    )
+
+    if structured is not None:
+        raw_groups = [structured]
+    else:
+        # 相容舊 GAS 的保底路徑；更新 GAS 後正常情況不會走到這裡。
+        raw_groups = []
+        for variant in _multi_book_query_variants(query):
+            raw_groups.append(
+                lookup_book_candidates_enhanced(variant, publisher=publisher, max_results=20)
+            )
+
+    for raw in raw_groups:
         for c in raw:
             value = str(c.get("value", "") or "").strip()
             pub = str(c.get("publisher", "") or publisher or "").strip()
-            score = float(c.get("score", 0) or 0)
+            score = float(c.get("score", 1.0 if structured is not None else 0) or 0)
             key = (value, pub)
-            if (not value or key in seen or score < MULTI_BOOK_MATCH_SCORE_THRESHOLD
-                    or not _multi_book_subject_volume_ok(query, value)):
+            if not value or key in seen or not _multi_book_subject_volume_ok(query, value):
                 continue
-            applicable_version = _infer_candidate_applicable_version(value, pub)
+            if structured is None and score < MULTI_BOOK_MATCH_SCORE_THRESHOLD:
+                continue
+
+            applicable_version = _normalize_textbook_version(
+                c.get("applicable_version", "") or _infer_candidate_applicable_version(value, pub)
+            )
             if required_version and applicable_version != required_version:
                 continue
+
             seen.add(key)
             result.append({
                 "value": value,
                 "publisher": pub,
                 "score": score,
                 "applicable_version": applicable_version,
+                "category": str(c.get("category", "") or ""),
             })
-    return sorted(result, key=lambda x: x["score"], reverse=True)[:20]
+
+    return sorted(result, key=lambda x: x["score"], reverse=True)[:50]
 
 def _find_multi_book_replacement(draft, excluded_values):
     """
@@ -5473,6 +5552,35 @@ def _find_multi_book_replacement(draft, excluded_values):
     return None
 
 
+
+def validate_multi_book_volume_selection(user_id, raw_text, draft):
+    clean = re.sub(r"[第冊上下學期學期，,。.!！?？\s]+", "", str(raw_text or ""))
+    aliases = {
+        "一": "1", "二": "2", "三": "3", "四": "4", "五": "5", "六": "6",
+        "1": "1", "2": "2", "3": "3", "4": "4", "5": "5", "6": "6",
+    }
+    volume = aliases.get(clean, "")
+    if not volume:
+        return (
+            "這位老師跨年級，而且目前書名沒有冊次，我不能替你猜。\n\n"
+            "請直接回覆冊次 1～6，例如「5」。\n"
+            "1/2＝七年級、3/4＝八年級、5/6＝九年級。"
+        )
+
+    grade = {"1":"七年級", "2":"七年級", "3":"八年級", "4":"八年級", "5":"九年級", "6":"九年級"}[volume]
+    if not _multi_book_teacher_has_grade(draft, grade):
+        available = "、".join(_multi_book_teacher_junior_grades(draft)) or "目前查不到國中年級班級"
+        return f"⚠️ {draft.get('teacher','')} 沒有 {grade} 班級。\n目前可用年級：{available}\n請重新輸入冊次。"
+
+    profile = _multi_book_query_profile(draft.get("keyword", ""))
+    subject = profile.get("subject", "")
+    # 把冊次補回關鍵字，後續所有年級／版本／候選搜尋都走同一套規則。
+    draft["keyword"] = f"{subject}{volume}測驗卷" if profile.get("exam_like") else f"{subject}{volume}"
+    draft["awaiting_volume_selection"] = False
+    multi_book_order_context[user_id] = draft
+    return _run_multi_book_search(user_id, draft)
+
+
 def validate_multi_book_count_input(user_id, raw_text, draft):
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
     m = re.fullmatch(r"([0-9]{1,3}|[一二三四五六七八九十]{1,3})種?", clean)
@@ -5488,7 +5596,7 @@ def validate_multi_book_count_input(user_id, raw_text, draft):
     # 一個班配一本書，要挑的種數不能超過老師實際的班級數，不然湊滿書
     # 種之後問班級分配時一定卡死（例如老師只有 7 班，卻要挑 10 種），
     # 使用者只能取消重來。這裡先擋下，總比讓使用者繞一大圈才發現。
-    teacher_class_count = len(draft.get("teacher_classes") or [])
+    teacher_class_count = len(_multi_book_eligible_classes(draft))
     if teacher_class_count and count > teacher_class_count:
         return (
             f"⚠️ {draft.get('teacher','')} 目前只有 {teacher_class_count} 個班，"
@@ -5505,6 +5613,28 @@ def _run_multi_book_search(user_id, draft):
     publisher = draft.get("publisher") or ""
     expected = draft.get("expected_count", 0)
     profile = _multi_book_query_profile(query)
+
+    # v67：年級優先由書名冊次決定；決定後再確認這位老師真的有該年級。
+    # 不能因為老師同時教兩個年級，就隨便拿第一個班級的年級去查版本。
+    if profile.get("grade"):
+        if not _multi_book_teacher_has_grade(draft, profile["grade"]):
+            available = "、".join(_multi_book_teacher_junior_grades(draft)) or "目前查不到國中年級班級"
+            return (
+                f"⚠️ 書名冊次判斷為 {profile['grade']}，但 {draft.get('teacher','')} "
+                f"目前沒有這個年級的班級。\n\n老師目前可用年級：{available}\n"
+                "請重新輸入正確的書名關鍵字。"
+            )
+    elif profile.get("exam_like") and profile.get("subject"):
+        grades = _multi_book_teacher_junior_grades(draft)
+        if len(grades) > 1:
+            draft["awaiting_volume_selection"] = True
+            multi_book_order_context[user_id] = draft
+            return (
+                f"{draft.get('teacher','')} 同時有 {'、'.join(grades)} 的班級，"
+                "而目前書名沒有冊次，我不能替你猜年級。\n\n"
+                "請直接回覆冊次 1～6，例如「5」。\n"
+                "1/2＝七年級、3/4＝八年級、5/6＝九年級。"
+            )
 
     required_version = ""
     if profile.get("exam_like") and profile.get("grade") and profile.get("subject"):
@@ -5596,7 +5726,7 @@ def make_multi_book_review_reply(draft):
 def make_multi_book_classes_prompt(draft):
     candidates = draft.get("candidates", [])
     class_list = "、".join(
-        c["class_name"] for c in sort_class_items(draft.get("teacher_classes", []))
+        c["class_name"] for c in sort_class_items(_multi_book_eligible_classes(draft))
     )
     lines = ["📚 最終書單：", ""]
     lines.extend(_format_multi_book_candidate_lines(candidates))
@@ -5627,7 +5757,7 @@ def handle_multi_book_search_mismatch(user_id, clean, draft):
     # 新的書名關鍵字去查，把好不容易找到的候選清單洗掉。
     if clean in MULTI_BOOK_ACCEPT_FOUND_WORDS or _is_confirm_word(clean):
         candidates = draft.get("candidates", [])
-        teacher_class_count = len(draft.get("teacher_classes") or [])
+        teacher_class_count = len(_multi_book_eligible_classes(draft))
         if teacher_class_count and len(candidates) > teacher_class_count:
             return (
                 f"⚠️ 這裡找到 {len(candidates)} 種，但 {draft.get('teacher','')} "
@@ -5729,12 +5859,13 @@ def validate_multi_book_classes_input(user_id, raw_text, draft):
     if not parts:
         return "請依序輸入班級名稱，用空格或逗號分隔。"
 
-    known_names = {c["class_name"] for c in draft.get("teacher_classes", [])}
+    eligible_classes = _multi_book_eligible_classes(draft)
+    known_names = {c["class_name"] for c in eligible_classes}
     unknown = [p for p in parts if p not in known_names]
 
     if unknown:
         available = "、".join(
-            c["class_name"] for c in sort_class_items(draft.get("teacher_classes", []))
+            c["class_name"] for c in sort_class_items(eligible_classes)
         )
         return (
             f"⚠️ 這幾個班級對不上 {draft.get('teacher', '')} 的資料：{'、'.join(unknown)}\n\n"
@@ -5752,7 +5883,7 @@ def validate_multi_book_classes_input(user_id, raw_text, draft):
             "請重新輸入班級名稱（用空格或逗號分隔）。"
         )
 
-    class_lookup = {c["class_name"]: c for c in draft.get("teacher_classes", [])}
+    class_lookup = {c["class_name"]: c for c in eligible_classes}
     assignments = []
     for class_name, book_item in zip(parts, draft["candidates"]):
         info = class_lookup[class_name]
@@ -5877,6 +6008,9 @@ def handle_multi_book_order_flow(user_id, text):
 
     if draft.get("confirming"):
         return handle_multi_book_confirm_stage(user_id, clean, draft)
+
+    if draft.get("awaiting_volume_selection"):
+        return validate_multi_book_volume_selection(user_id, clean, draft)
 
     if draft.get("awaiting_classes"):
         return validate_multi_book_classes_input(user_id, clean, draft)
