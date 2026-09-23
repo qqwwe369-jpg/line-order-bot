@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-24-v78-teacher-empty-fallback"
+APP_VERSION = "2026-09-24-v79-final-stability"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -269,6 +269,72 @@ def _load_google_stale_cache(action, key):
     except Exception as e:
         logger.warning(f"Google stale cache read failed: action={action} error={e}")
         return None
+
+def _teacher_name_fallback_key(teacher, school=""):
+    """v79：建立不受完整 payload 影響的老師姓名級備援 key。"""
+    name = str(teacher or "").strip()
+    name = re.sub(r"[，,。.!！?？\\s]+", "", name)
+    name = re.sub(r"老師$", "", name)
+    school = str(school or "").strip()
+    if not name:
+        return ""
+    return "teacher-name::" + name + ("::" + school if school else "")
+
+
+def _store_teacher_name_fallback(payload, data):
+    """把成功老師結果另外依「老師姓名」保存，避免 exact payload 首次回空時無資料可救。"""
+    if not isinstance(data, dict) or data.get("success") is False:
+        return
+    matches = data.get("matches") or []
+    if not matches:
+        return
+
+    # 依每一位實際命中的老師分開保存；同名跨校則另外存 school-specific key。
+    grouped = {}
+    for item in matches:
+        if not isinstance(item, dict):
+            continue
+        tname = str(item.get("teacher", "") or "").strip()
+        school = str(item.get("school", "") or "").strip()
+        norm = _teacher_name_fallback_key(tname)
+        if not norm:
+            continue
+        grouped.setdefault(norm, []).append(copy.deepcopy(item))
+        if school:
+            grouped.setdefault(_teacher_name_fallback_key(tname, school), []).append(copy.deepcopy(item))
+
+    for synthetic_key, items in grouped.items():
+        _store_google_stale_cache(
+            "lookup_teacher_matches",
+            synthetic_key,
+            {"success": True, "matches": items},
+        )
+
+
+def _load_teacher_name_fallback(payload):
+    """先用老師姓名+學校，再退到純老師姓名讀取最近成功資料。"""
+    teacher = str((payload or {}).get("teacher", "") or "").strip()
+    school = str((payload or {}).get("school", "") or "").strip()
+    if not teacher:
+        return None
+
+    keys = []
+    if school:
+        keys.append(_teacher_name_fallback_key(teacher, school))
+    keys.append(_teacher_name_fallback_key(teacher))
+    for synthetic_key in keys:
+        if not synthetic_key:
+            continue
+        stale = _load_google_stale_cache("lookup_teacher_matches", synthetic_key)
+        if isinstance(stale, dict) and (stale.get("matches") or []):
+            logger.warning(
+                "Google teacher name-level fallback HIT: teacher=%s school=%s",
+                teacher,
+                school,
+            )
+            return stale
+    return None
+
 
 def _clear_google_stale_cache():
     try:
@@ -5663,12 +5729,13 @@ def _collect_multi_book_matches(query, publisher, target_count=0, required_versi
     if structured is not None:
         raw_groups = [structured]
     else:
-        # 相容舊 GAS 的保底路徑；更新 GAS 後正常情況不會走到這裡。
-        raw_groups = []
-        for variant in _multi_book_query_variants(query):
-            raw_groups.append(
-                lookup_book_candidates_enhanced(variant, publisher=publisher, max_results=20)
-            )
+        # v79：結構化多書搜尋失敗／逾時後，只允許「一次」舊 fuzzy 保底。
+        # 舊版會跑最多 3 個 query variant，而 enhanced 每個 variant 又可能
+        # 再打 core query，最壞會疊到 4~6 次 Google，實測曾把單一流程拖到
+        # 46 秒。現在只打原始關鍵字一次；若這一次也失敗，就直接回查無，
+        # 不再為了湊候選把 LINE worker 卡住。
+        one_fallback = lookup_fuzzy_candidates("book", query, publisher=publisher) or []
+        raw_groups = [one_fallback]
 
     for raw in raw_groups:
         for c in raw:
@@ -11117,7 +11184,12 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
                 and not (data.get("matches") or [])
                 and str(payload.get("teacher", "") or "").strip()
             ):
+                # 先找完全相同 payload；若這個 exact key 從未成功過，再用
+                # v79 的「老師姓名級」備援。這可處理第一次 exact query 就
+                # 被 GAS 假空結果擊中的情況。
                 stale = _load_google_stale_cache(action, key) if cache_ttl > 0 else None
+                if not (isinstance(stale, dict) and (stale.get("matches") or [])):
+                    stale = _load_teacher_name_fallback(payload)
                 if isinstance(stale, dict) and (stale.get("matches") or []):
                     logger.warning(
                         "Google teacher empty-result fallback HIT: teacher=%s school=%s",
@@ -11148,6 +11220,8 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
                         "expires_at": time.time() + cache_ttl
                     }
                     _store_google_stale_cache(action, key, data)
+                    if action == "lookup_teacher_matches" and (data.get("matches") or []):
+                        _store_teacher_name_fallback(payload, data)
 
             if action in {
                 "create_order", "update_order", "cancel_order", "set_order_note",
@@ -11166,6 +11240,8 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
                 continue
 
             stale = _load_google_stale_cache(action, key) if cache_ttl > 0 else None
+            if stale is None and action == "lookup_teacher_matches":
+                stale = _load_teacher_name_fallback(payload)
             if stale is not None:
                 return stale
             return None
@@ -12280,7 +12356,7 @@ if __name__ == "__main__":
 """
 =============================================================
 大漢訂書小幫手 — 真實資料庫 + 速度測試
-版本：2026-09-24 real-db-speed-v5
+版本：2026-09-24 real-db-speed-v7
 =============================================================
 
 用途
@@ -12301,7 +12377,7 @@ if __name__ == "__main__":
 - 不啟用 OpenAI API，避免測試產生成本或被 AI fallback 干擾。
 
 執行方式：
-    python test_dahan_real_db_speed_v6.py app_v78_老師空結果備援版.py
+    python test_dahan_real_db_speed_v7.py app_v79_最後穩定版.py
 
 如果本機沒有 GOOGLE_SCRIPT_URL，執行後會請你貼上 Apps Script Web App URL。
 =============================================================
@@ -12358,7 +12434,7 @@ spec.loader.exec_module(mod)
 
 print(f"測試對象：{APP_PATH}")
 print(f"程式版本：{getattr(mod, 'APP_VERSION', 'unknown')}")
-print("測試模式：真實 Google 資料庫（唯讀）＋速度分析 v5（含 v77 stale fallback 驗證）")
+print("測試模式：真實 Google 資料庫（唯讀）＋速度分析 v7（含 v79 姓名級備援／多書單次 fallback 驗證）")
 print("=" * 72)
 
 # ----------------------------------------------------------------------
@@ -12587,7 +12663,7 @@ for payload, label in PREWARM_CASES:
 # 0.5 v78 stale fallback：成功資料寫入 SQLite 後，模擬 Google 斷線，
 # 應直接取最近一次成功結果，不讓使用者只因 Apps Script 抖動就看到查無資料。
 # ----------------------------------------------------------------------
-print("\n【0.5. v78 Google 失敗／老師空結果自動備援】")
+print("\n【0.5. v79 Google 失敗／姓名級老師空結果自動備援】")
 if hasattr(mod, "_load_google_stale_cache") and hasattr(mod, "_store_google_stale_cache"):
     fallback_payload = {
         "action": "lookup_fuzzy_candidates",
@@ -12602,7 +12678,7 @@ if hasattr(mod, "_load_google_stale_cache") and hasattr(mod, "_store_google_stal
         mod._google_read_cache.clear()
         saved_post = mod.HTTP.post
         def _forced_google_down(*args, **kwargs):
-            raise RuntimeError("v78 fallback test: simulated Google outage")
+            raise RuntimeError("v79 fallback test: simulated Google outage")
         mod.HTTP.post = _forced_google_down
         try:
             fb = mod.google_post(fallback_payload, timeout=0.2, retries=1, ignore_budget=True)
@@ -12660,6 +12736,71 @@ if hasattr(mod, "_store_google_stale_cache"):
         "老師成功回空陣列時會使用最近一次成功資料備援",
         detail=f"回傳={empty_fb}" if not (isinstance(empty_fb, dict) and empty_fb.get("matches")) else ""
     )
+
+    # v79 專屬：exact payload 從未成功過，但同一老師姓名之前在別的 payload
+    # 成功查過，仍要能用姓名級備援救回來。這就是 v78 謝明清真實案例的缺口。
+    if hasattr(mod, "_store_teacher_name_fallback") and hasattr(mod, "_load_teacher_name_fallback"):
+        seed_payload = {
+            "action": "lookup_teacher_matches",
+            "teacher": "謝明清",
+            "school": "",
+            "grade": "",
+            "subject": "",
+        }
+        seed_data = {
+            "success": True,
+            "matches": [{
+                "school": "衛理女中",
+                "teacher": "謝明清",
+                "subjects": ["地理"],
+                "classes": [{"class_name": "八信", "students": 40, "subjects": ["地理"]}],
+            }],
+        }
+        mod._store_teacher_name_fallback(seed_payload, seed_data)
+        never_seen_exact_payload = {
+            "action": "lookup_teacher_matches",
+            "teacher": "謝明清老師",
+            "school": "衛理女中",
+            "grade": "八年級",
+            "subject": "地理",
+        }
+        mod._google_read_cache.clear()
+        saved_post2 = mod.HTTP.post
+        mod.HTTP.post = lambda *args, **kwargs: _FakeEmptyTeacherResponse()
+        try:
+            name_fb = mod.google_post(never_seen_exact_payload, timeout=0.2, retries=1, ignore_budget=True)
+        finally:
+            mod.HTTP.post = saved_post2
+        check(
+            isinstance(name_fb, dict) and bool(name_fb.get("matches")),
+            "老師 exact key 首次回空時可用姓名級備援",
+            detail=f"回傳={name_fb}" if not (isinstance(name_fb, dict) and name_fb.get("matches")) else ""
+        )
+    else:
+        fail("APP 應提供 v79 老師姓名級備援")
+
+# v79 專屬：結構化多書搜尋失敗後最多只允許 1 次 fuzzy fallback。
+if hasattr(mod, "_collect_multi_book_matches"):
+    saved_structured = mod._lookup_multi_book_candidates_structured
+    saved_fuzzy = mod.lookup_fuzzy_candidates
+    fuzzy_calls = []
+    mod._lookup_multi_book_candidates_structured = lambda *a, **k: None
+    def _count_one_fuzzy(kind, query, publisher="", school=""):
+        fuzzy_calls.append((kind, query, publisher, school))
+        return []
+    mod.lookup_fuzzy_candidates = _count_one_fuzzy
+    try:
+        mod._collect_multi_book_matches("歷史5測驗卷", "", target_count=4, required_version="康軒")
+    finally:
+        mod._lookup_multi_book_candidates_structured = saved_structured
+        mod.lookup_fuzzy_candidates = saved_fuzzy
+    check(
+        len(fuzzy_calls) <= 1,
+        "多書結構化失敗後最多只打一次 fuzzy fallback",
+        detail=f"實際 fuzzy 次數={len(fuzzy_calls)} calls={fuzzy_calls}"
+    )
+else:
+    fail("APP 應提供多書候選收集函式")
 
 # 預熱與 fallback 測試時間不混入正式速度平均，正式表只看使用體感。
 action_timings.clear()
@@ -12990,6 +13131,13 @@ for idx, (label, messages, must_contain) in enumerate(CONVERSATIONS, 1):
 
     if "EXCEPTION:" in last_reply:
         fail(f"{label} 不應丟例外", last_reply)
+
+    if label == "多書－歷史5需查社會版本":
+        check(
+            total <= 12.0,
+            "多書－歷史5總耗時不應再因連續 fuzzy fallback 超過 12 秒",
+            f"實際 {total:.3f}s"
+        )
 
     # v73 目標：三個主要學校要本地辨識。「天母教務處...」不能為了
     # 辨識天母再打 list_schools。
