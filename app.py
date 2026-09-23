@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-23-v74-coldstart-local-school"
+APP_VERSION = "2026-09-23-v75-stability-final"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -11049,13 +11049,17 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
 
 def lookup_teacher_matches_status(teacher, school="", grade="", subject=""):
     """回傳 (matches, query_ok)。query_ok=False 代表 Google/網路失敗，不是「真的查無老師」。"""
+    # v75：老師查詢偶爾會遇到 Apps Script/Google 邊緣節點瞬間變慢。
+    # 舊版一次等 5 秒，逾時就整個流程卡住；現在改成「較短逾時 + 最多一次快速重試」。
+    # 正常命中通常 1~2 秒，不受影響；偶發冷啟動時第一次失敗，第二次常可直接命中
+    # GAS / Script Properties 的暖快取。最壞等待仍控制在約 7 秒，而不是後續再疊 fuzzy。
     result = google_post({
         "action": "lookup_teacher_matches",
         "teacher": str(teacher or "").strip(),
         "school": str(school or "").strip(),
         "grade": str(grade or "").strip(),
         "subject": str(subject or "").strip()
-    }, timeout=5, retries=1)
+    }, timeout=3.5, retries=2)
 
     if not result or not result.get("success"):
         return [], False
