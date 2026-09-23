@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-23-v65-speed-multibook-search"
+APP_VERSION = "2026-09-23-v66-version-aware-multibook"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -5231,7 +5231,7 @@ def validate_multi_book_keyword_input(user_id, raw_text, draft):
 
 
 def _multi_book_query_variants(query):
-    """多書湊單專用的少量搜尋變體；最多 3 組，避免為了湊書反而打爆 Google。"""
+    """多書湊單專用搜尋變體；保持少量，避免為了湊書打爆 Google。"""
     clean = str(query or "").strip()
     variants = [clean] if clean else []
     norm = normalize_book_match_text(clean)
@@ -5245,9 +5245,9 @@ def _multi_book_query_variants(query):
         variants.append(clean.replace("測驗卷", "考卷"))
     elif "考卷" in clean:
         variants.append(clean.replace("考卷", "測驗卷"))
-    elif "卷" in clean and subject:
-        variants.append(f"{subject}{volume}測驗卷" if volume else f"{subject}測驗卷")
 
+    # 最後才放寬成科目＋冊次；後續仍會用「卷類」與適用版本硬篩選，
+    # 所以不會再把新講義、段考王之類混進「測驗卷」結果。
     if subject and volume:
         variants.append(f"{subject}{volume}")
 
@@ -5259,30 +5259,170 @@ def _multi_book_query_variants(query):
     return out[:3]
 
 
-def _multi_book_subject_volume_ok(query, candidate):
-    """有明確科目/冊次時避免用放寬搜尋湊進錯科或錯冊。"""
+def _multi_book_query_profile(query):
     q = normalize_book_match_text(query)
-    c = normalize_book_match_text(candidate)
     subjects = ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]
-    q_subject = next((x for x in subjects if x in q), "")
-    if q_subject:
-        aliases = {"英文", "英語"} if q_subject in {"英文", "英語"} else {q_subject}
+    subject = next((x for x in subjects if x in q), "")
+    if subject == "英語":
+        subject = "英文"
+    m = re.search(r"(?:國文|英文|英語|數學|自然|理化|生物|地科|社會|歷史|地理|公民)[^1-6]*([1-6])", q)
+    volume = m.group(1) if m else ""
+    exam_like = any(x in q for x in ["測驗卷", "考卷", "卷類", "試卷"])
+    grade = {"1":"七年級", "2":"七年級", "3":"八年級", "4":"八年級", "5":"九年級", "6":"九年級"}.get(volume, "")
+    return {"subject": subject, "volume": volume, "exam_like": exam_like, "grade": grade}
+
+
+def _normalize_textbook_version(value):
+    s = re.sub(r"[\s版]+", "", str(value or ""))
+    if s.startswith("南"):
+        return "南一"
+    if s.startswith("康"):
+        return "康軒"
+    if s.startswith("翰"):
+        return "翰林"
+    return str(value or "").strip()
+
+
+def _infer_candidate_applicable_version(book, publisher):
+    """依目前書籍資料規則推導考卷的適用教科書版本。"""
+    name = normalize_book_match_text(book)
+    pub = str(publisher or "").strip()
+
+    # 明霖／金安等跨版本卷：書名尾碼南／康／翰才是適用版本。
+    m = re.search(r"(?:[-－_ ]?)(南|康|翰)$", str(book or "").strip())
+    if m:
+        return {"南":"南一", "康":"康軒", "翰":"翰林"}[m.group(1)]
+
+    # 使用者確認：漢華「新挑戰測驗卷」全系列都是康軒版。
+    if pub == "漢華" and "新挑戰測驗卷" in name:
+        return "康軒"
+
+    # 南一／康軒／翰林自己出版且沒有另標版本的 A/B/C/D 卷，
+    # 視為適用該出版社自己的教科書版本。
+    if pub in {"南一", "康軒", "翰林"} and re.search(r"(?:^|[^A-Za-z])[ABCDＡＢＣＤ]卷", name, re.I):
+        return pub
+
+    # 出版社自己的「測驗卷／考卷」若沒有另外的版本尾碼，也視為自家版本。
+    if pub in {"南一", "康軒", "翰林"} and any(x in name for x in ["測驗卷", "考卷", "平時卷", "複習卷", "段考卷"]):
+        return pub
+
+    return ""
+
+
+def _multi_book_is_exam_candidate(book):
+    name = normalize_book_match_text(book)
+    if re.search(r"(?:^|[^A-Za-z])[ABCDＡＢＣＤ]卷", name, re.I):
+        return True
+    return any(x in name for x in ["測驗卷", "考卷", "平時卷", "複習卷", "段考卷", "試卷"])
+
+
+def _multi_book_subject_volume_ok(query, candidate):
+    """科目、冊次是硬條件；使用者說測驗卷時，候選也必須真的是卷類。"""
+    profile = _multi_book_query_profile(query)
+    c = normalize_book_match_text(candidate)
+    subject = profile["subject"]
+    volume = profile["volume"]
+
+    if subject:
+        aliases = {"英文", "英語"} if subject == "英文" else {subject}
         if not any(x in c for x in aliases):
             return False
 
-    m = re.search(r"(?:國文|英文|英語|數學|自然|理化|生物|地科|社會|歷史|地理|公民)[^1-6]*([1-6])", q)
-    if m and q_subject:
-        volume = m.group(1)
-        subject_pat = "(?:英文|英語)" if q_subject in {"英文", "英語"} else re.escape(q_subject)
+    if volume and subject:
+        subject_pat = "(?:英文|英語)" if subject == "英文" else re.escape(subject)
         if not re.search(subject_pat + r"[^1-6]*" + re.escape(volume) + r"(?!\d)", c):
             return False
+
+    if profile["exam_like"] and not _multi_book_is_exam_candidate(candidate):
+        return False
     return True
 
 
-def _collect_multi_book_matches(query, publisher, target_count=0):
+def _multi_book_school_target_version(draft, query):
+    """依書名冊次推年級，再查該校該年級科目的教科書版本。"""
+    profile = _multi_book_query_profile(query)
+    school = str(draft.get("school", "") or "").strip()
+    grade = profile.get("grade", "")
+    subject = profile.get("subject", "")
+    if not (school and grade and subject):
+        return ""
+
+    subject_aliases = [subject]
+    if subject == "自然":
+        subject_aliases += ["理化", "生物"]
+    elif subject in {"理化", "生物", "地科"}:
+        subject_aliases += ["自然"]
+
+    for sub in subject_aliases:
+        result = lookup_school_versions(school, grade, sub, "")
+        if not result:
+            continue
+        versions = result.get("versions", []) or []
+        for item in versions:
+            version = _normalize_textbook_version(item.get("version", ""))
+            if version:
+                draft["target_grade"] = grade
+                draft["target_subject"] = subject
+                draft["target_version"] = version
+                return version
+
+    # 最後一次查同年級全部科目，避免資料庫科目命名略有差異。
+    result = lookup_school_versions(school, grade, "", "")
+    if result:
+        for item in result.get("versions", []) or []:
+            item_subject = str(item.get("subject", "") or "")
+            if subject == "自然":
+                subject_ok = any(x in item_subject for x in ["自然", "理化", "生物", "地科"])
+            elif subject == "英文":
+                subject_ok = any(x in item_subject for x in ["英文", "英語"])
+            else:
+                subject_ok = subject in item_subject
+            if subject_ok:
+                version = _normalize_textbook_version(item.get("version", ""))
+                if version:
+                    draft["target_grade"] = grade
+                    draft["target_subject"] = subject
+                    draft["target_version"] = version
+                    return version
+    return ""
+
+
+def _multi_book_series_key(book):
+    """用來讓選出的 N 種儘量分散系列，而不是全部同一系列。"""
+    s = normalize_book_match_text(book)
+    s = re.sub(r"(?:國文|英文|英語|數學|自然|理化|生物|地科|社會|歷史|地理|公民)[^1-6]*[1-6]", "", s)
+    s = re.sub(r"(?:[-－_ ]?)(南|康|翰)$", "", s)
+    return s or normalize_book_match_text(book)
+
+
+def _select_diverse_multi_book_candidates(candidates, expected):
+    """在合格候選裡優先不同出版社、不同系列，再看模糊分數。"""
+    pool = list(candidates)
+    chosen = []
+    used_publishers = set()
+    used_series = set()
+    while pool and len(chosen) < expected:
+        def rank(c):
+            pub = c.get("publisher", "")
+            series = _multi_book_series_key(c.get("value", ""))
+            return (
+                1 if pub and pub not in used_publishers else 0,
+                1 if series and series not in used_series else 0,
+                float(c.get("score", 0) or 0),
+            )
+        best = max(pool, key=rank)
+        pool.remove(best)
+        chosen.append(best)
+        if best.get("publisher"):
+            used_publishers.add(best["publisher"])
+        used_series.add(_multi_book_series_key(best.get("value", "")))
+    return chosen
+
+
+def _collect_multi_book_matches(query, publisher, target_count=0, required_version=""):
     """
-    多書搜尋最多收 20 筆候選。先用原關鍵字；不夠目標數量時才用最多兩個
-    放寬變體補找，並用科目/冊次守門，兼顧「湊得滿」與速度。
+    多書搜尋：科目／冊次／卷類／適用版本都用硬條件；真正出版社可以不同。
+    同書名但不同出版社算不同品項，不能再只用書名去重。
     """
     seen = set()
     result = []
@@ -5290,20 +5430,23 @@ def _collect_multi_book_matches(query, publisher, target_count=0):
         raw = lookup_book_candidates_enhanced(variant, publisher=publisher, max_results=20)
         for c in raw:
             value = str(c.get("value", "") or "").strip()
+            pub = str(c.get("publisher", "") or publisher or "").strip()
             score = float(c.get("score", 0) or 0)
-            if (not value or value in seen or score < MULTI_BOOK_MATCH_SCORE_THRESHOLD
+            key = (value, pub)
+            if (not value or key in seen or score < MULTI_BOOK_MATCH_SCORE_THRESHOLD
                     or not _multi_book_subject_volume_ok(query, value)):
                 continue
-            seen.add(value)
+            applicable_version = _infer_candidate_applicable_version(value, pub)
+            if required_version and applicable_version != required_version:
+                continue
+            seen.add(key)
             result.append({
                 "value": value,
-                "publisher": str(c.get("publisher", "") or publisher or ""),
+                "publisher": pub,
                 "score": score,
+                "applicable_version": applicable_version,
             })
-        if target_count and len(result) >= target_count:
-            break
     return sorted(result, key=lambda x: x["score"], reverse=True)[:20]
-
 
 def _find_multi_book_replacement(draft, excluded_values):
     """
@@ -5322,8 +5465,10 @@ def _find_multi_book_replacement(draft, excluded_values):
         if pub in checked_pools:
             continue
         checked_pools.add(pub)
-        for c in _collect_multi_book_matches(query, pub):
-            if c["value"] not in excluded_values:
+        required_version = draft.get("target_version", "")
+        for c in _collect_multi_book_matches(query, pub, required_version=required_version):
+            key = f"{c.get('publisher','')}|{c['value']}"
+            if key not in excluded_values:
                 return c
     return None
 
@@ -5359,39 +5504,53 @@ def _run_multi_book_search(user_id, draft):
     query = draft.get("keyword", "")
     publisher = draft.get("publisher") or ""
     expected = draft.get("expected_count", 0)
+    profile = _multi_book_query_profile(query)
 
-    matched = _collect_multi_book_matches(query, publisher, target_count=expected)
+    required_version = ""
+    if profile.get("exam_like") and profile.get("grade") and profile.get("subject"):
+        required_version = _multi_book_school_target_version(draft, query)
+        if not required_version:
+            return (
+                f"⚠️ 我查不到 {draft.get('school','')} {profile.get('grade','')}"
+                f"{profile.get('subject','')} 的教科書版本，所以先不亂幫你湊考卷。\n\n"
+                "請先確認 Google「學校版本資料」有這個年級／科目的版本資料。"
+            )
 
-    # 指定出版社湊不滿時，自動放寬成不限出版社繼續湊，直到湊滿、或
-    # 資料庫裡真的沒有更多符合的書為止。判斷出版社永遠是看資料庫的
-    # 「出版社」欄位，書名裡就算寫著「OO版」也不影響——那只是這份
-    # 考卷搭配哪個課本版本的說明文字，不是它真正的出版社。
+    matched = _collect_multi_book_matches(
+        query, publisher, target_count=expected, required_version=required_version
+    )
+
+    # 若使用者有限定「真正出版社」但該出版社湊不滿，才放寬成跨出版社；
+    # 適用版本仍然是硬條件，絕不跟著放寬。
     if publisher and len(matched) < expected:
-        seen_values = {c["value"] for c in matched}
-        for c in _collect_multi_book_matches(query, "", target_count=expected):
-            if len(matched) >= expected:
-                break
-            if c["value"] in seen_values:
+        seen_keys = {(c["value"], c.get("publisher", "")) for c in matched}
+        for c in _collect_multi_book_matches(
+            query, "", target_count=expected, required_version=required_version
+        ):
+            key = (c["value"], c.get("publisher", ""))
+            if key in seen_keys:
                 continue
             matched.append(c)
-            seen_values.add(c["value"])
+            seen_keys.add(key)
 
-    matched = matched[:MULTI_BOOK_MAX_CANDIDATES]
-    draft["candidates"] = matched
-    draft["excluded_values"] = sorted({c["value"] for c in matched})
+    # 找到超過 N 種不是錯誤：從完整合格池中挑最適合、且儘量分散出版社／系列的 N 種。
+    all_match_count = len(matched)
+    if len(matched) >= expected:
+        matched = _select_diverse_multi_book_candidates(matched, expected)
+
+    draft["all_match_count"] = all_match_count
+    draft["candidates"] = matched[:MULTI_BOOK_MAX_CANDIDATES]
+    draft["excluded_values"] = sorted({f"{c.get('publisher','')}|{c['value']}" for c in matched})
     multi_book_order_context[user_id] = draft
 
     if not matched:
         draft["expected_count"] = 0
-        # 一定要把 keyword 清掉：handle_multi_book_order_flow() 是用
-        # 「draft 有沒有 keyword」判斷下一句該當書名關鍵字還是數量，
-        # 沒清掉的話使用者重新輸入的關鍵字會被誤判成「要挑幾種」的
-        # 數量輸入，卡在同一個查無資料的舊關鍵字出不來。
         draft["keyword"] = ""
         multi_book_order_context[user_id] = draft
+        version_text = f"、適用版本：{required_version}" if required_version else ""
         return (
-            "⚠️ 依照目前條件完全查不到符合的書（已經含跨出版社查詢）。\n\n"
-            f"關鍵字：{query}\n\n"
+            "⚠️ 依照目前條件完全查不到符合的書。\n\n"
+            f"關鍵字：{query}{version_text}\n\n"
             "請重新輸入書名關鍵字。"
         )
 
@@ -5405,7 +5564,6 @@ def _run_multi_book_search(user_id, draft):
     multi_book_order_context[user_id] = draft
     return make_multi_book_shortfall_reply(draft)
 
-
 def _format_multi_book_candidate_lines(candidates):
     return [
         f"{i}. [{c.get('publisher', '')}] {c.get('value', '')}"
@@ -5415,15 +5573,25 @@ def _format_multi_book_candidate_lines(candidates):
 
 def make_multi_book_review_reply(draft):
     candidates = draft.get("candidates", [])
-    lines = ["🔎 找到符合的書（已含跨出版社湊數量）：", ""]
+    target_version = draft.get("target_version", "")
+    grade = draft.get("target_grade", "")
+    subject = draft.get("target_subject", "")
+    all_count = int(draft.get("all_match_count", 0) or 0)
+    lines = ["🔎 已找到符合條件的書：", ""]
+    if target_version:
+        lines.append(f"📘 {draft.get('school','')}｜{grade}{subject}｜教科書版本：{target_version}")
+        lines.append("✅ 只保留相同適用版本的考卷")
+        lines.append("")
     lines.extend(_format_multi_book_candidate_lines(candidates))
     lines.append("")
-    lines.append(f"共 {len(candidates)} 種，符合你要的數量。")
+    lines.append(f"已挑出 {len(candidates)} 種，符合你要的數量。")
+    if all_count > len(candidates):
+        lines.append(f"資料庫另有 {all_count - len(candidates)} 種符合條件，可用「換N」替換。")
     lines.append("")
-    lines.append("如果有哪一項不要，回覆「N不要」或「換N」（例如「4不要」）我會幫你換掉那一項。")
+    lines.append("我會優先分散出版社／系列，避免不同班拿到太接近的考卷。")
+    lines.append("如果有哪一項不要，回覆「N不要」或「換N」（例如「4不要」）。")
     lines.append("都沒問題的話，請回覆「確認」，我再請你分配班級。")
     return "\n".join(lines)
-
 
 def make_multi_book_classes_prompt(draft):
     candidates = draft.get("candidates", [])
