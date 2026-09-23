@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-23-v69-social-version-free-contact"
+APP_VERSION = "2026-09-23-v72-speed-specialist"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -1156,6 +1156,16 @@ def _v56_natural_rewrite(user_id, text):
 
     # 訂書確認階段：班級增刪、數量修改的常見說法
     if user_id in pending_orders or user_id in order_flow_context:
+        # v71：同一句若有兩組以上「班級＋數量修改」，不能在這層先
+        # 正規化成第一組，否則後面的 handle_pending_order_edit() 永遠
+        # 看不到第二組，會造成「801改30 803改40」只改到 801。
+        # 這種批次修改保留原句，交給後面的原子批次驗證處理。
+        batch_qty_hits = re.findall(
+            r"(?<!\d)([789]\d{2})(?!\d).{0,8}?(?:要|改成|改為|改|變成|調成|數量)\s*(?:為|成)?\s*(\d{1,3})\s*(?:本|人)?",
+            t
+        )
+        if len(batch_qty_hits) >= 2:
+            return t
         m = re.search(r"([789]\d{2}).{0,5}(?:不要了|拿掉|刪掉|刪除|取消掉|不用了)", t)
         if m:
             return f"{m.group(1)}取消"
@@ -1526,6 +1536,56 @@ def _v57_other_order_rewrite(user_id, text):
 
 
 
+_FAST_KNOWN_SCHOOLS = (
+    ("天母國中", ("天母國中", "天母")),
+    ("華興中學", ("華興中學", "華興")),
+    ("衛理女中", ("衛理女中", "衛理")),
+)
+
+
+def _fast_school_from_text(text):
+    """先用目前最常用三校做純本地辨識；完全不打 Google。"""
+    t = str(text or "")
+    for full, aliases in _FAST_KNOWN_SCHOOLS:
+        if any(alias and alias in t for alias in aliases):
+            return full
+    return ""
+
+
+def _text_may_contain_dynamic_school(text):
+    """
+    只有句子看起來真的有「學校名稱」時才值得去抓動態學校清單。
+    避免「查老師」「陳映汝」「7」這種訊息每次都先 list_schools。
+    """
+    t = str(text or "")
+    return bool(re.search(r"(?:國中|中學|女中|高中|國小|學校)", t))
+
+
+def _extract_school_for_rewrite(text):
+    school = _fast_school_from_text(text)
+    if school:
+        return school
+    if not _text_may_contain_dynamic_school(text):
+        return ""
+    for full in sorted(get_school_catalog(), key=len, reverse=True):
+        full = str(full or "").strip()
+        if not full:
+            continue
+        short = re.sub(r"(?:國民中學|國民小學|高級中學|國中|國小|高中|中學|女中)$", "", full)
+        if full in str(text or "") or (short and short in str(text or "")):
+            return full
+    return ""
+
+
+def _should_scan_cram_catalog(text):
+    t = str(text or "")
+    # 只有真的像補習班訂書需求時才查補習班名單；一般查老師/書名完全跳過。
+    return bool(
+        "補習班" in t
+        or any(k in t for k in ("叫幾本書", "叫書", "補班訂書", "補班", "補習班下單"))
+    )
+
+
 def _v62_general_new_user_rewrite(user_id, text):
     """
     v62：不依賴特定舊學校/老師名稱的通用口語正規化。
@@ -1535,16 +1595,10 @@ def _v62_general_new_user_rewrite(user_id, text):
     if not t:
         return t
 
-    # 動態抓目前資料庫的學校與簡稱，不再只寫死天母/華興/衛理。
-    school = ""
-    for full in sorted(get_school_catalog(), key=len, reverse=True):
-        full = str(full or "").strip()
-        if not full:
-            continue
-        short = re.sub(r"(?:國民中學|國民小學|高級中學|國中|國小|高中|中學|女中)$", "", full)
-        if full in t or (short and short in t):
-            school = full
-            break
+    # v72：先走純本地常用學校辨識；只有句子真的像含學校名稱時，
+    # 才需要呼叫 list_schools。避免每一則「查老師／姓名／數字」都先
+    # 打 Google，這是實測中 8~15 秒額外延遲的主要來源之一。
+    school = _extract_school_for_rewrite(t)
 
     # 進行中的訂單：自然改班。
     if user_id in pending_orders or user_id in order_flow_context:
@@ -1622,10 +1676,11 @@ def _v62_general_new_user_rewrite(user_id, text):
             return f"{school}學生人數"
 
     # 補習班自然入口：直接用補習班名，不要求句子裡一定寫「補習班」三個字。
-    for cram in get_cram_school_catalog():
-        cram = str(cram or "").strip()
-        if cram and cram in t and any(k in t for k in ("叫幾本書", "叫書", "訂幾本書", "訂書", "下單", "要書")):
-            return "補習班訂書"
+    if _should_scan_cram_catalog(t):
+        for cram in get_cram_school_catalog():
+            cram = str(cram or "").strip()
+            if cram and cram in t and any(k in t for k in ("叫幾本書", "叫書", "訂幾本書", "訂書", "下單", "要書")):
+                return "補習班訂書"
 
     # 其他訂單：
     # A. 老師 +「有學生把...弄丟了，要補一本」
@@ -3228,7 +3283,13 @@ def handle_guided_teacher_lookup(user_id,text):
         if smart_reply is not None:
             return smart_reply
         return "👨‍🏫 老師查詢\n\n我還在查老師模式。\n請直接輸入 2～4 個中文字的老師姓名。"
-    matches=lookup_teacher_matches(name+"老師",school="")
+    matches, teacher_query_ok = lookup_teacher_matches_status(name+"老師",school="")
+    if not teacher_query_ok:
+        return (
+            "⚠️ 老師資料庫目前查詢逾時或暫時無法連線。\n\n"
+            "我沒有再追加模糊搜尋，避免讓你多等十幾秒。\n"
+            "請直接再輸入一次老師姓名即可。"
+        )
     if len(matches)==1: return finish_teacher_lookup(user_id,matches[0])
     if len(matches)>1:
         schools=unique_list([m.get("school","") for m in matches if m.get("school")])
@@ -4614,7 +4675,7 @@ def get_cram_school_catalog(force_refresh=False):
     ):
         return list(cram_school_catalog_cache.get("schools", []))
 
-    result = google_post({"action": "list_cram_schools"}, timeout=10, retries=1)
+    result = google_post({"action": "list_cram_schools"}, timeout=5, retries=1)
 
     schools = []
     call_succeeded = bool(result and result.get("success"))
@@ -5141,7 +5202,13 @@ def validate_multi_book_teacher_input(user_id, raw_text, draft):
     if not clean:
         return "請告訴我是哪一位老師？"
 
-    exact_matches = lookup_teacher_matches(clean)
+    exact_matches, teacher_query_ok = lookup_teacher_matches_status(clean)
+    if not teacher_query_ok:
+        return (
+            "⚠️ 老師資料庫目前查詢逾時或暫時無法連線。\n\n"
+            "為了避免連續模糊搜尋讓等待時間更久，我先停在這一步。\n"
+            "請直接再輸入一次老師姓名。"
+        )
 
     if len(exact_matches) == 1:
         return _apply_multi_book_teacher(user_id, draft, exact_matches[0])
@@ -6910,6 +6977,32 @@ def handle_pending_order_edit(user_id, text):
             refresh_order_total(order)
             return "✅ 已新增：" + cname + "\n\n" + make_order_confirmation(order)
 
+    # v70：多班數量修改必須先整批驗證，再一次套用。
+    # 這段一定要放在舊的「單班改數量」分支之前，否則像
+    # 「801改成30 803改成40」會被前面的單班規則只吃掉 801，
+    # 造成 803 不在訂單裡時仍然半套用 801。
+    multi_qty_matches = list(re.finditer(
+        rf"(?<!\d)({class_pattern})(?!\d)\s*(?:數量|變|幫我調|其實是|改成|改為|改)\s*(\d{{1,3}})\s*(?:本|人)?",
+        text
+    ))
+    if len(multi_qty_matches) >= 2:
+        planned_multi_qty = []
+        for mm in multi_qty_matches:
+            cname = mm.group(1)
+            qty = int(mm.group(2))
+            target = find_order_class(order, cname)
+            if not target:
+                return f"⚠️ 目前訂單裡沒有 {cname}。整批修改未套用。"
+            if qty < 0:
+                return "⚠️ 數量不能小於 0。整批修改未套用。"
+            planned_multi_qty.append((target, cname, qty))
+
+        for target, cname, qty in planned_multi_qty:
+            target["students"] = qty
+        refresh_order_total(order)
+        changed = "、".join(f"{cname}→{qty}本" for _, cname, qty in planned_multi_qty)
+        return "✅ 已調整：" + changed + "\n\n" + make_order_confirmation(order)
+
     # 例：701五十本／701數量50／701變50本／701幫我調50／701其實是50／701不是30是50
     zh_num = {"十":10,"二十":20,"三十":30,"四十":40,"五十":50,"六十":60,"七十":70,"八十":80,"九十":90}
     qty_text = text
@@ -8529,14 +8622,13 @@ def get_school_catalog(force_refresh=False):
 
     if (
         not force_refresh
-        and school_catalog_cache.get("schools")
         and now < float(school_catalog_cache.get("expires_at", 0) or 0)
     ):
-        return list(school_catalog_cache["schools"])
+        return list(school_catalog_cache.get("schools", []))
 
     result = google_post(
         {"action": "list_schools"},
-        timeout=10,
+        timeout=5,
         retries=1
     )
 
@@ -8550,12 +8642,17 @@ def get_school_catalog(force_refresh=False):
             ]
         )
 
-    if schools:
+    if result and result.get("success"):
         school_catalog_cache["schools"] = schools
-        school_catalog_cache["expires_at"] = now + 600
+        school_catalog_cache["expires_at"] = now + 1800
         return list(schools)
 
-    return list(school_catalog_cache.get("schools", []))
+    # Google 暫時逾時時不要下一則訊息又立刻重打 list_schools；
+    # 先用三個主要學校做短暫負向快取，30 秒後才允許再刷新。
+    fallback = list(school_catalog_cache.get("schools", [])) or [x[0] for x in _FAST_KNOWN_SCHOOLS]
+    school_catalog_cache["schools"] = fallback
+    school_catalog_cache["expires_at"] = now + 30
+    return list(fallback)
 
 
 def extract_grade_text(text):
@@ -10914,7 +11011,8 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
     return None
 
 
-def lookup_teacher_matches(teacher, school="", grade="", subject=""):
+def lookup_teacher_matches_status(teacher, school="", grade="", subject=""):
+    """回傳 (matches, query_ok)。query_ok=False 代表 Google/網路失敗，不是「真的查無老師」。"""
     result = google_post({
         "action": "lookup_teacher_matches",
         "teacher": str(teacher or "").strip(),
@@ -10924,7 +11022,7 @@ def lookup_teacher_matches(teacher, school="", grade="", subject=""):
     }, timeout=5, retries=1)
 
     if not result or not result.get("success"):
-        return []
+        return [], False
 
     matches = []
     for item in result.get("matches", []):
@@ -10935,7 +11033,11 @@ def lookup_teacher_matches(teacher, school="", grade="", subject=""):
             "subjects": unique_list(item.get("subjects", [])),
             "classes": classes
         })
+    return matches, True
 
+
+def lookup_teacher_matches(teacher, school="", grade="", subject=""):
+    matches, _ok = lookup_teacher_matches_status(teacher, school=school, grade=grade, subject=subject)
     return matches
 
 
