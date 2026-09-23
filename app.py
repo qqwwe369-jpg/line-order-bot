@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-23-v67-structured-multibook-grade-safe"
+APP_VERSION = "2026-09-23-v69-social-version-free-contact"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -2064,16 +2064,19 @@ def _route_message(user_id, user_text):
             guided_mode.pop(user_id, None)
             return get_main_menu_reply()
 
+        if text in ["取消", "不要了", "這筆不要"] and user_id in pending_other_orders:
+            pending_other_orders.pop(user_id, None)
+            guided_mode.pop(user_id, None)
+            return "❌ 已取消這筆「其他訂單」，Google 沒有寫入。"
+
+        if user_id in pending_other_orders and not str(pending_other_orders[user_id].get("school", "") or "").strip():
+            return handle_pending_other_order_school_input(user_id, text)
+
         if _is_confirm_word(text) and user_id in pending_other_orders:
             reply = confirm_other_order(user_id)
             if not reply.startswith("❌") and not reply.startswith("⚠️"):
                 guided_mode.pop(user_id, None)
             return reply
-
-        if text in ["取消", "不要了", "這筆不要"] and user_id in pending_other_orders:
-            pending_other_orders.pop(user_id, None)
-            guided_mode.pop(user_id, None)
-            return "❌ 已取消這筆「其他訂單」，Google 沒有寫入。"
 
         if user_id not in pending_other_orders:
             escape_reply = _guided_mode_escape_reply(user_id, text, current_mode)
@@ -2406,6 +2409,8 @@ def _route_message(user_id, user_text):
     if parsed_other:
         _clear_stale_history_pending(user_id)
         pending_other_orders[user_id] = parsed_other
+        if not str(parsed_other.get("school", "") or "").strip():
+            guided_mode[user_id] = "other_order"
         return make_other_order_confirmation(parsed_other)
 
     # 19. 訂書流程 —— 優先於一般 AI
@@ -5099,6 +5104,9 @@ def _new_multi_book_draft():
         # 確認過才會進到 awaiting_classes 問班級分配。
         "awaiting_review": False,
         "awaiting_classes": False,
+        # v68：只有「合格卷種類湊不滿指定數量」時才啟用輪替備援。
+        "fallback_rotation": False,
+        "rotation_target_count": 0,
         # 跨年級老師而書名沒有冊次時，不猜年級；要求使用者補 1～6 冊。
         "awaiting_volume_selection": False,
         "confirming": False,
@@ -5350,7 +5358,11 @@ def _multi_book_school_target_version(draft, query):
     if not (school and grade and subject):
         return ""
 
-    subject_aliases = [subject]
+    # 教科書版本表的「歷史／地理／公民」通常統一登記在「社會」。
+    # 書籍搜尋仍保留原科目（歷史就是找歷史書），只有版本查詢改用社會。
+    version_subject = "社會" if subject in {"歷史", "地理", "公民"} else subject
+
+    subject_aliases = [version_subject]
     if subject == "自然":
         subject_aliases += ["理化", "生物"]
     elif subject in {"理化", "生物", "地科"}:
@@ -5378,6 +5390,8 @@ def _multi_book_school_target_version(draft, query):
                 subject_ok = any(x in item_subject for x in ["自然", "理化", "生物", "地科"])
             elif subject == "英文":
                 subject_ok = any(x in item_subject for x in ["英文", "英語"])
+            elif subject in {"歷史", "地理", "公民"}:
+                subject_ok = "社會" in item_subject or subject in item_subject
             else:
                 subject_ok = subject in item_subject
             if subject_ok:
@@ -5685,11 +5699,26 @@ def _run_multi_book_search(user_id, draft):
         )
 
     if len(matched) == expected:
+        draft["fallback_rotation"] = False
+        draft["rotation_target_count"] = 0
         draft["awaiting_decision"] = False
         draft["awaiting_review"] = True
         multi_book_order_context[user_id] = draft
         return make_multi_book_review_reply(draft)
 
+    # v68：只有在「湊不滿」且至少有 2 種合格卷時才啟用輪替備援。
+    # 正常找得到足夠種類時絕對不會走這裡。
+    if 2 <= len(matched) < expected:
+        draft["fallback_rotation"] = True
+        draft["rotation_target_count"] = expected
+        draft["awaiting_decision"] = False
+        draft["awaiting_review"] = True
+        multi_book_order_context[user_id] = draft
+        return make_multi_book_review_reply(draft)
+
+    # 只有 1 種時保留原本提示，不自動輪替。
+    draft["fallback_rotation"] = False
+    draft["rotation_target_count"] = 0
     draft["awaiting_decision"] = True
     multi_book_order_context[user_id] = draft
     return make_multi_book_shortfall_reply(draft)
@@ -5714,13 +5743,22 @@ def make_multi_book_review_reply(draft):
         lines.append("")
     lines.extend(_format_multi_book_candidate_lines(candidates))
     lines.append("")
-    lines.append(f"已挑出 {len(candidates)} 種，符合你要的數量。")
-    if all_count > len(candidates):
-        lines.append(f"資料庫另有 {all_count - len(candidates)} 種符合條件，可用「換N」替換。")
+    if draft.get("fallback_rotation"):
+        target = int(draft.get("rotation_target_count", 0) or 0)
+        lines.append(
+            f"⚠️ 你原本要 {target} 種，但資料庫目前只有 {len(candidates)} 種真正符合條件的考卷。"
+        )
+        lines.append(
+            f"我會只用這 {len(candidates)} 種，平均輪替分配到 {target} 個班，並盡量避免相鄰班拿同一份。"
+        )
+    else:
+        lines.append(f"已挑出 {len(candidates)} 種，符合你要的數量。")
+        if all_count > len(candidates):
+            lines.append(f"資料庫另有 {all_count - len(candidates)} 種符合條件，可用「換N」替換。")
+        lines.append("我會優先分散出版社／系列，避免不同班拿到太接近的考卷。")
     lines.append("")
-    lines.append("我會優先分散出版社／系列，避免不同班拿到太接近的考卷。")
-    lines.append("如果有哪一項不要，回覆「N不要」或「換N」（例如「4不要」）。")
-    lines.append("都沒問題的話，請回覆「確認」，我再請你分配班級。")
+    lines.append("如果有哪一項不要，回覆「N不要」或「換N」（例如「2不要」）。")
+    lines.append("都沒問題的話，請回覆「確認」。")
     return "\n".join(lines)
 
 def make_multi_book_classes_prompt(draft):
@@ -5728,13 +5766,19 @@ def make_multi_book_classes_prompt(draft):
     class_list = "、".join(
         c["class_name"] for c in sort_class_items(_multi_book_eligible_classes(draft))
     )
+    target_count = (
+        int(draft.get("rotation_target_count", 0) or 0)
+        if draft.get("fallback_rotation")
+        else len(candidates)
+    )
     lines = ["📚 最終書單：", ""]
     lines.extend(_format_multi_book_candidate_lines(candidates))
     lines.append("")
-    lines.append(
-        f"請依照上面清單的順序，依序告訴我要給哪 {len(candidates)} 個班"
-        "（用空格或逗號分隔）。"
-    )
+    if draft.get("fallback_rotation"):
+        lines.append(
+            f"目前只有 {len(candidates)} 種合格考卷，我會輪替分配到你要的 {target_count} 個班。"
+        )
+    lines.append(f"請告訴我要使用哪 {target_count} 個班（用空格或逗號分隔）。")
     lines.append(f"{draft.get('teacher', '')} 目前班級：{class_list}")
     return "\n".join(lines)
 
@@ -5809,6 +5853,18 @@ def handle_multi_book_review_stage(user_id, clean, draft):
 
     if _is_confirm_word(clean) or clean in {"可以", "沒問題", "都可以", "都沒問題", "可以了", "這樣就好"}:
         draft["awaiting_review"] = False
+        target_count = (
+            int(draft.get("rotation_target_count", 0) or 0)
+            if draft.get("fallback_rotation")
+            else len(draft.get("candidates", []))
+        )
+        eligible = sort_class_items(_multi_book_eligible_classes(draft))
+        # 若這個年級剛好就是 target_count 個班，直接全部採用並自動輪替；
+        # 只有班級比需求更多時才請使用者選班。
+        if target_count and len(eligible) == target_count:
+            class_text = " ".join(c["class_name"] for c in eligible)
+            multi_book_order_context[user_id] = draft
+            return validate_multi_book_classes_input(user_id, class_text, draft)
         draft["awaiting_classes"] = True
         multi_book_order_context[user_id] = draft
         return make_multi_book_classes_prompt(draft)
@@ -5876,8 +5932,17 @@ def validate_multi_book_classes_input(user_id, raw_text, draft):
     if len(unique_list(parts)) != len(parts):
         return "⚠️ 班級名稱重複了，請確認每個班只出現一次後重新輸入。"
 
-    expected = len(draft.get("candidates", []))
+    expected = (
+        int(draft.get("rotation_target_count", 0) or 0)
+        if draft.get("fallback_rotation")
+        else len(draft.get("candidates", []))
+    )
     if len(parts) != expected:
+        if draft.get("fallback_rotation"):
+            return (
+                f"⚠️ 這次要分配 {expected} 個班，但你輸入了 {len(parts)} 個班級。\n\n"
+                "請重新輸入班級名稱（用空格或逗號分隔）。"
+            )
         return (
             f"⚠️ 目前有 {expected} 種書，但你輸入了 {len(parts)} 個班級，兩者數量要一樣。\n\n"
             "請重新輸入班級名稱（用空格或逗號分隔）。"
@@ -5885,7 +5950,9 @@ def validate_multi_book_classes_input(user_id, raw_text, draft):
 
     class_lookup = {c["class_name"]: c for c in eligible_classes}
     assignments = []
-    for class_name, book_item in zip(parts, draft["candidates"]):
+    books = list(draft.get("candidates", []))
+    for idx, class_name in enumerate(parts):
+        book_item = books[idx % len(books)] if draft.get("fallback_rotation") else books[idx]
         info = class_lookup[class_name]
         assignments.append({
             "class_name": class_name,
@@ -5921,7 +5988,13 @@ def make_multi_book_order_confirmation(draft):
         )
         total += item["students"]
     lines.append("")
-    lines.append(f"共 {len(draft.get('assignments', []))} 種書，總數量：{total}本")
+    unique_books = len({(x.get("publisher", ""), x.get("book", "")) for x in draft.get("assignments", [])})
+    if draft.get("fallback_rotation"):
+        lines.append(
+            f"共 {len(draft.get('assignments', []))} 個班，使用 {unique_books} 種不同考卷輪替，總數量：{total}本"
+        )
+    else:
+        lines.append(f"共 {unique_books} 種書，總數量：{total}本")
     lines.append("")
     lines.append("確認無誤請回覆「確認」。")
     lines.append("要取消這筆多書訂單請回覆「取消」。")
@@ -8669,21 +8742,70 @@ def parse_other_order(user_id, text):
     if not (explicit_other or is_supply or is_sample or is_replacement):
         return None
 
-    resolved = _resolve_other_order_teacher(user_id, teacher_raw, school_hint)
-    if not resolved:
-        return None
+    # v69：其他訂單的「老師」欄改視為自由文字的聯絡對象／單位。
+    # 有明確學校時，以使用者輸入的學校為準，不再要求這個名稱一定要
+    # 存在老師資料庫（例如：天母教務處、華興註冊組、不知道姓名的老師）。
+    if school_hint:
+        resolved = {"school": school_hint, "teacher": teacher_raw}
+    else:
+        # 沒有學校時才把老師資料庫當成加分功能：能唯一補出學校就補；
+        # 補不到也不丟掉整筆需求，保留聯絡對象並追問學校。
+        resolved = _resolve_other_order_teacher(user_id, teacher_raw, school_hint)
+        if not resolved:
+            resolved = {"school": "", "teacher": teacher_raw}
 
     return {
-        "school": resolved["school"],
-        "teacher": resolved["teacher"],
+        "school": resolved.get("school", ""),
+        "teacher": resolved.get("teacher", teacher_raw),
         "item": item,
+        "needs_school": not bool(resolved.get("school", "")),
     }
 
+def _resolve_other_order_school_input(raw_text):
+    clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
+    if not clean:
+        return ""
+    aliases = _other_order_school_aliases()
+    if clean in aliases:
+        return aliases[clean]
+    # 允許「天母國中」「華興」這類包含關係。
+    for alias in sorted(aliases, key=len, reverse=True):
+        if alias and (clean == alias or clean in alias or alias in clean):
+            return aliases[alias]
+    fuzzy = resolve_fuzzy_name("school", clean)
+    if fuzzy.get("status") == "auto":
+        return str(fuzzy.get("value", "") or "").strip()
+    return ""
+
+
+def handle_pending_other_order_school_input(user_id, text):
+    order = pending_other_orders.get(user_id)
+    if not order or str(order.get("school", "") or "").strip():
+        return None
+    school = _resolve_other_order_school_input(text)
+    if not school:
+        return (
+            "我還缺這筆其他訂單的學校。\n\n"
+            "請直接輸入學校名稱，例如「天母」、「華興中學」、「衛理女中」。"
+        )
+    order["school"] = school
+    order["needs_school"] = False
+    pending_other_orders[user_id] = order
+    return make_other_order_confirmation(order)
+
+
 def make_other_order_confirmation(order):
+    if not str(order.get("school", "") or "").strip():
+        return (
+            "📦 其他訂單\n\n"
+            f"聯絡對象：{order.get('teacher','')}\n"
+            f"品項：{order.get('item','')}\n\n"
+            "我還缺學校。請直接輸入學校名稱，例如「天母」或「華興中學」。"
+        )
     return (
         "📦 其他訂單｜請確認\n\n"
         f"🏫 學校：{order['school']}\n"
-        f"👨‍🏫 老師：{order['teacher']}\n"
+        f"👤 聯絡對象：{order['teacher']}\n"
         f"🧾 品項：{order['item']}\n\n"
         "確認新增 → 回覆「確認」\n"
         "不要這筆 → 回覆「取消」"
