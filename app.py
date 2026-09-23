@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-23-v75-stability-final"
+APP_VERSION = "2026-09-23-v76-version-subject-unified"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -5427,7 +5427,7 @@ def _multi_book_school_target_version(draft, query):
 
     # 教科書版本表的「歷史／地理／公民」通常統一登記在「社會」。
     # 書籍搜尋仍保留原科目（歷史就是找歷史書），只有版本查詢改用社會。
-    version_subject = "社會" if subject in {"歷史", "地理", "公民"} else subject
+    version_subject = _version_lookup_subject(subject)
 
     subject_aliases = [version_subject]
     if subject == "自然":
@@ -11384,6 +11384,22 @@ def lookup_school_classes(school, grade="", class_name=""):
     }
 
 
+def _version_lookup_subject(subject):
+    """
+    學校版本資料的統一科目入口。
+
+    書籍本身仍保留「歷史／地理／公民」原科目；只有查教科書版本時，
+    這三科一律查 Google「學校版本資料」中的「社會」。
+    放在最底層 lookup_school_versions() 前再正規化一次，避免任何上層流程漏轉。
+    """
+    s = str(subject or "").strip()
+    if s in {"歷史", "地理", "公民"}:
+        return "社會"
+    if s == "英語":
+        return "英文"
+    return s
+
+
 def lookup_school_versions_all_junior_grades(school, subject="", academic_period=""):
     combined = []
     periods = []
@@ -11413,6 +11429,10 @@ def lookup_school_versions(
     subject="",
     academic_period=""
 ):
+    # v76：所有版本查詢最後都經過這裡，統一保證歷史／地理／公民查「社會」。
+    # 這層是保險絲：即使上層某個流程忘了轉換，也不會把「歷史」直接送到 GAS。
+    subject = _version_lookup_subject(subject)
+
     def do_lookup(school_name):
         return google_post({
             "action": "lookup_versions",
