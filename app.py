@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-23-v73-indexed-speed"
+APP_VERSION = "2026-09-23-v74-coldstart-local-school"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -8696,8 +8696,23 @@ def get_context_school(user_id):
 # =========================================================
 # 其他訂單
 # =========================================================
-def _other_order_school_aliases():
-    aliases = {}
+def _other_order_school_aliases(include_dynamic=False):
+    """
+    v74：其他訂單的常用三校別名完全本地化。
+
+    舊版每次 parse_other_order() 一進來就先 get_school_catalog()，所以即使
+    使用者已經明確打「天母教務處要補一本書」，仍會白打 list_schools。
+    這裡預設只回傳本地三校；只有真的需要解析其他動態學校名稱時，
+    呼叫端才顯式傳 include_dynamic=True。
+    """
+    aliases = {
+        "天母":"天母國中","天母國中":"天母國中",
+        "華興":"華興中學","華興中學":"華興中學",
+        "衛理":"衛理女中","衛理女中":"衛理女中"
+    }
+    if not include_dynamic:
+        return aliases
+
     for school in get_school_catalog():
         school = str(school or "").strip()
         if not school:
@@ -8706,12 +8721,6 @@ def _other_order_school_aliases():
         short = re.sub(r"(?:國民中學|國民小學|高級中學|國中|國小|高中|中學|女中)$", "", school)
         if short:
             aliases[short] = school
-    for key, value in {
-        "天母":"天母國中","天母國中":"天母國中",
-        "華興":"華興中學","華興中學":"華興中學",
-        "衛理":"衛理女中","衛理女中":"衛理女中"
-    }.items():
-        aliases.setdefault(key,value)
     return aliases
 
 
@@ -8782,13 +8791,24 @@ def parse_other_order(user_id, text):
         explicit_other = True
         clean = clean[len("其他單"):]
 
-    aliases = _other_order_school_aliases()
+    # v74：先只用本地三校，不為「天母／華興／衛理」呼叫 list_schools。
+    aliases = _other_order_school_aliases(include_dynamic=False)
     school_hint = ""
     for alias in sorted(aliases, key=len, reverse=True):
         if clean.startswith(alias):
             school_hint = aliases[alias]
             clean = clean[len(alias):]
             break
+
+    # 只有尚未命中本地三校，而且文字本身真的帶有學校型態字樣時，
+    # 才取得動態學校清單。這保留未來其他學校的彈性，但不拖慢常用三校。
+    if not school_hint and _text_may_contain_dynamic_school(clean):
+        aliases = _other_order_school_aliases(include_dynamic=True)
+        for alias in sorted(aliases, key=len, reverse=True):
+            if clean.startswith(alias):
+                school_hint = aliases[alias]
+                clean = clean[len(alias):]
+                break
 
     clean = re.sub(r"^(?:幫我|幫|麻煩|請幫我|請幫)", "", clean)
 
@@ -8874,9 +8894,13 @@ def _resolve_other_order_school_input(raw_text):
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
     if not clean:
         return ""
-    aliases = _other_order_school_aliases()
+    aliases = _other_order_school_aliases(include_dynamic=False)
     if clean in aliases:
         return aliases[clean]
+    if _text_may_contain_dynamic_school(clean):
+        aliases = _other_order_school_aliases(include_dynamic=True)
+        if clean in aliases:
+            return aliases[clean]
     # 允許「天母國中」「華興」這類包含關係。
     for alias in sorted(aliases, key=len, reverse=True):
         if alias and (clean == alias or clean in alias or alias in clean):
