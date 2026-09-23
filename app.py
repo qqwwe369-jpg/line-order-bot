@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-23-v76-version-subject-unified"
+APP_VERSION = "2026-09-24-v77-google-stale-fallback"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -195,6 +195,91 @@ _GOOGLE_CACHE_TTLS = {
     "lookup_fuzzy_candidates": 180,
     "lookup_multi_book_candidates": 300,
 }
+
+# v77：Google Apps Script 偶爾會出現 10~15 秒逾時。
+# 參照資料（老師／版本／書籍／學校清單）並不是每分鐘都會變動，
+# 因此把「最近一次成功結果」另外存到 SQLite，當 Google 真的逾時時
+# 才拿來做唯讀備援。正常情況永遠優先使用即時 Google 回覆。
+#
+# 這不是寫入備援：建立／修改／取消訂單仍必須真的寫進 Google；
+# 只有下列唯讀 action 允許 stale fallback。
+_GOOGLE_STALE_MAX_AGES = {
+    "list_schools": 24 * 3600,
+    "list_cram_schools": 24 * 3600,
+    "lookup_teacher_matches": 24 * 3600,
+    "lookup_teacher": 24 * 3600,
+    "lookup_school_classes": 12 * 3600,
+    "lookup_versions": 24 * 3600,
+    "lookup_book": 12 * 3600,
+    "lookup_fuzzy_candidates": 6 * 3600,
+    "lookup_multi_book_candidates": 6 * 3600,
+}
+
+def _store_google_stale_cache(action, key, data):
+    if not key or action not in _GOOGLE_STALE_MAX_AGES or not isinstance(data, dict):
+        return
+    if data.get("success") is False:
+        return
+    if action == "lookup_fuzzy_candidates" and not data.get("candidates"):
+        return
+    try:
+        payload_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+        conn = _state_db()
+        try:
+            conn.execute(
+                "INSERT INTO google_stale_cache (cache_key, action, data_json, updated_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(cache_key) DO UPDATE SET "
+                "action=excluded.action, data_json=excluded.data_json, updated_at=excluded.updated_at",
+                (key, action, payload_json, time.time())
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"Google stale cache store failed: action={action} error={e}")
+
+def _load_google_stale_cache(action, key):
+    max_age = int(_GOOGLE_STALE_MAX_AGES.get(action, 0) or 0)
+    if not key or max_age <= 0:
+        return None
+    try:
+        conn = _state_db()
+        try:
+            row = conn.execute(
+                "SELECT data_json, updated_at FROM google_stale_cache WHERE cache_key=? AND action=?",
+                (key, action)
+            ).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            return None
+        data_json, updated_at = row
+        age = time.time() - float(updated_at or 0)
+        if age < 0 or age > max_age:
+            return None
+        data = json.loads(data_json)
+        if not isinstance(data, dict):
+            return None
+        data = copy.deepcopy(data)
+        data["_stale_fallback"] = True
+        data["_stale_age_seconds"] = round(age, 1)
+        logger.warning(f"Google stale fallback HIT: action={action} age={age:.1f}s")
+        return data
+    except Exception as e:
+        logger.warning(f"Google stale cache read failed: action={action} error={e}")
+        return None
+
+def _clear_google_stale_cache():
+    try:
+        conn = _state_db()
+        try:
+            conn.execute("DELETE FROM google_stale_cache")
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception as e:
+        logger.warning(f"Google stale cache clear failed: {e}")
 
 def _cache_key(payload):
     try:
@@ -566,6 +651,10 @@ def _ensure_state_db_schema():
             )
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS cache_epoch (id INTEGER PRIMARY KEY, epoch INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS google_stale_cache ("
+                "cache_key TEXT PRIMARY KEY, action TEXT, data_json TEXT, updated_at REAL)"
             )
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS user_processing_lock ("
@@ -1868,6 +1957,7 @@ def _route_message(user_id, user_text):
 
     if text in {"清除快取", "清快取", "重新整理資料", "重新整理快取"}:
         clear_google_read_cache()
+        _clear_google_stale_cache()
         _bump_shared_cache_epoch()
         google_post({"action": "clear_cache"}, timeout=5, retries=1)
         get_school_catalog(force_refresh=True)
@@ -10972,6 +11062,9 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
     # 花了一些預算，後面幾筆就完全沒送出卻被算成「失敗」。
     if not ignore_budget and _request_budget_exceeded():
         logger.warning(f"Google call skipped (request time/call budget exceeded): action={action}")
+        stale = _load_google_stale_cache(action, key) if cache_ttl > 0 else None
+        if stale is not None:
+            return stale
         return None
 
     attempts = max(1, int(retries or 1))
@@ -10985,6 +11078,9 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
         # 避免前面幾次已經花了很久，還繼續傻等下一次重試。
         if attempt > 0 and not ignore_budget and _request_budget_exceeded():
             logger.warning(f"Google call retry skipped (request time/call budget exceeded): action={action}")
+            stale = _load_google_stale_cache(action, key) if cache_ttl > 0 else None
+            if stale is not None:
+                return stale
             return None
         _register_google_call()
         try:
@@ -11004,6 +11100,9 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
                 if attempt < attempts - 1:
                     time.sleep(0.15 * (attempt + 1))
                     continue
+                stale = _load_google_stale_cache(action, key) if cache_ttl > 0 else None
+                if stale is not None:
+                    return stale
                 return None
 
             data = response.json()
@@ -11025,6 +11124,7 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
                         "data": copy.deepcopy(data),
                         "expires_at": time.time() + cache_ttl
                     }
+                    _store_google_stale_cache(action, key, data)
 
             if action in {
                 "create_order", "update_order", "cancel_order", "set_order_note",
@@ -11042,6 +11142,9 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
                 time.sleep(0.15 * (attempt + 1))
                 continue
 
+            stale = _load_google_stale_cache(action, key) if cache_ttl > 0 else None
+            if stale is not None:
+                return stale
             return None
 
     return None
