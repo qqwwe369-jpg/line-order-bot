@@ -1125,7 +1125,17 @@ def _v56_natural_rewrite(user_id, text):
         return "查" + m.group(1)
 
     # 訂書確認階段：班級增刪、數量修改的常見說法
-    if user_id in pending_orders or user_id in order_flow_context:
+    # 這幾條規則都只抓「第一個」符合的班級號碼，句子裡如果其實提到
+    # 兩個以上的班級（例如「801改成30 803改成40」），會把後面的班級
+    # 直接吃掉、整句被改寫成只剩第一個班級的版本，使用者對第二個班級
+    # 的修改意圖就這樣憑空消失，訂單只會套用第一項。只在句子裡「剛好
+    # 只有一個」班級號碼時才適用這幾條快速改寫，超過一個就維持原樣，
+    # 交給後面 _v59 的多班保護，以及 handle_pending_order_edit() 自己
+    # 用 finditer 做的多筆比對去正確處理。
+    if (
+        (user_id in pending_orders or user_id in order_flow_context)
+        and len(re.findall(r"[789]\d{2}", t)) == 1
+    ):
         m = re.search(r"([789]\d{2}).{0,5}(?:不要了|拿掉|刪掉|刪除|取消掉|不用了)", t)
         if m:
             return f"{m.group(1)}取消"
@@ -2834,13 +2844,20 @@ def clear_task_states_for_new_mode(user_id):
 def _clear_stale_history_pending(user_id):
     """
     建立一筆新的待確認訂單（學校訂單或其他訂單）時要呼叫：如果使用者
-    先前打過「取消訂單005」或對某張歷史訂單提出修改、但還沒有回覆
-    「確認」，這兩個待辦如果沒清掉，接下來對新訂單的「確認」會因為
-    dispatcher 的判斷順序，被誤導去執行舊的、使用者可能早就不記得的
-    歷史訂單取消／修改，而不是確認這筆新訂單。
+    身上還留著任何「舊的、跟這筆新訂單無關的確認詞目標」，都要在這裡
+    一併清掉，不然接下來對新訂單的「確認」會被 dispatcher 誤導去處理
+    這些舊的殘留，而不是確認這筆新訂單：
+      - pending_history_cancels／pending_history_updates：先前打過
+        「取消訂單005」或對某張歷史訂單提出修改、但還沒回覆確認。
+      - pending_receipt_offers：上一張訂單確認後「要不要生成訂購單
+        PDF」的提問還沒回答（40 秒內有效）。這個提問排在 dispatcher
+        判斷「確認」要交給誰處理的最前面，沒清掉的話，對新訂單說
+        「確認」會被導去對上一張訂單生成 PDF，這筆新訂單反而完全沒
+        被確認、沒有寫入 Google，使用者卻以為自己已經確認過了。
     """
     pending_history_cancels.pop(user_id, None)
     pending_history_updates.pop(user_id, None)
+    pending_receipt_offers.pop(user_id, None)
 
 def normalize_teacher_name_input(text):
     clean=re.sub(r"[，,。.!！?？\s]+","",str(text or ""))
