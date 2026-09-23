@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-23-v72-speed-specialist"
+APP_VERSION = "2026-09-23-v73-indexed-speed"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -8554,6 +8554,18 @@ def handle_school_version_query(query):
 def extract_school_name(text):
     clean = re.sub(r"[，,。.!！?？：:\s]+", "", str(text or ""))
     if not clean:
+        return ""
+
+    # v73：三個主要學校先做純本地辨識。這一層一定要放在
+    # get_school_catalog() 之前，否則像「天母教務處要補一本書」這種
+    # 已經明確寫出天母的句子，仍會先打一次 list_schools，白白多等數秒。
+    fast_school = _fast_school_from_text(clean)
+    if fast_school:
+        return fast_school
+
+    # 沒有任何「學校型態」字樣時，也不要為了猜學校就打 Google。
+    # 真正需要動態學校清單的情況才往下走。
+    if not _text_may_contain_dynamic_school(clean):
         return ""
 
     schools = get_school_catalog()
