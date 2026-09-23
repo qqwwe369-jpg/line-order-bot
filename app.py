@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-22-v63-new-user-blindtest-finish"
+APP_VERSION = "2026-09-23-v65-speed-multibook-search"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -525,6 +525,9 @@ _SESSION_DICTS = {
     "ai_agent_history": ai_agent_history,
 }
 
+# v65 2026-09-23：速度/多書搜尋修正：快取相容舊 GAS、SQLite schema 每 worker 初始化一次、
+# 跨 worker 鎖縮短等待、多書候選放寬至 20 並支援考卷/測驗卷變體、查老師後純書名可直接訂書。
+
 # =========================================================
 # 跨 worker 對話狀態持久化：SQLite
 # =========================================================
@@ -533,27 +536,53 @@ _SESSION_STALE_SECONDS = 3 * 24 * 3600
 _PROCESSED_MESSAGE_TTL_SECONDS = 24 * 3600
 
 
+_STATE_DB_INITIALIZED = False
+_STATE_DB_INIT_LOCK = threading.Lock()
+
+
+def _ensure_state_db_schema():
+    """每個 worker process 只初始化一次 SQLite schema，避免每則訊息重複 DDL。"""
+    global _STATE_DB_INITIALIZED
+    if _STATE_DB_INITIALIZED:
+        return
+    with _STATE_DB_INIT_LOCK:
+        if _STATE_DB_INITIALIZED:
+            return
+        conn = sqlite3.connect(_STATE_DB_PATH, timeout=5)
+        try:
+            try:
+                conn.execute("PRAGMA journal_mode=WAL")
+            except Exception:
+                pass
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS user_session ("
+                "user_id TEXT PRIMARY KEY, session_json TEXT, updated_at REAL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS processed_message ("
+                "message_id TEXT PRIMARY KEY, processed_at REAL)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS cache_epoch (id INTEGER PRIMARY KEY, epoch INTEGER)"
+            )
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS user_processing_lock ("
+                "user_id TEXT PRIMARY KEY, started_at REAL)"
+            )
+            conn.commit()
+            _STATE_DB_INITIALIZED = True
+        finally:
+            conn.close()
+
+
 def _state_db():
+    _ensure_state_db_schema()
     conn = sqlite3.connect(_STATE_DB_PATH, timeout=5)
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
     except Exception:
         pass
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS user_session ("
-        "user_id TEXT PRIMARY KEY, session_json TEXT, updated_at REAL)"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS processed_message ("
-        "message_id TEXT PRIMARY KEY, processed_at REAL)"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS cache_epoch (id INTEGER PRIMARY KEY, epoch INTEGER)"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS user_processing_lock ("
-        "user_id TEXT PRIMARY KEY, started_at REAL)"
-    )
     return conn
 
 
@@ -572,8 +601,8 @@ def _state_db():
 # 處理同一個人的同一個狀態。
 # =========================================================
 _CROSS_WORKER_LOCK_STALE_SECONDS = 30
-_CROSS_WORKER_LOCK_WAIT_SECONDS = 20
-_CROSS_WORKER_LOCK_POLL_INTERVAL = 0.3
+_CROSS_WORKER_LOCK_WAIT_SECONDS = 6
+_CROSS_WORKER_LOCK_POLL_INTERVAL = 0.15
 
 
 def _acquire_cross_worker_lock(user_id):
@@ -1125,17 +1154,7 @@ def _v56_natural_rewrite(user_id, text):
         return "查" + m.group(1)
 
     # 訂書確認階段：班級增刪、數量修改的常見說法
-    # 這幾條規則都只抓「第一個」符合的班級號碼，句子裡如果其實提到
-    # 兩個以上的班級（例如「801改成30 803改成40」），會把後面的班級
-    # 直接吃掉、整句被改寫成只剩第一個班級的版本，使用者對第二個班級
-    # 的修改意圖就這樣憑空消失，訂單只會套用第一項。只在句子裡「剛好
-    # 只有一個」班級號碼時才適用這幾條快速改寫，超過一個就維持原樣，
-    # 交給後面 _v59 的多班保護，以及 handle_pending_order_edit() 自己
-    # 用 finditer 做的多筆比對去正確處理。
-    if (
-        (user_id in pending_orders or user_id in order_flow_context)
-        and len(re.findall(r"[789]\d{2}", t)) == 1
-    ):
+    if user_id in pending_orders or user_id in order_flow_context:
         m = re.search(r"([789]\d{2}).{0,5}(?:不要了|拿掉|刪掉|刪除|取消掉|不用了)", t)
         if m:
             return f"{m.group(1)}取消"
@@ -2844,20 +2863,13 @@ def clear_task_states_for_new_mode(user_id):
 def _clear_stale_history_pending(user_id):
     """
     建立一筆新的待確認訂單（學校訂單或其他訂單）時要呼叫：如果使用者
-    身上還留著任何「舊的、跟這筆新訂單無關的確認詞目標」，都要在這裡
-    一併清掉，不然接下來對新訂單的「確認」會被 dispatcher 誤導去處理
-    這些舊的殘留，而不是確認這筆新訂單：
-      - pending_history_cancels／pending_history_updates：先前打過
-        「取消訂單005」或對某張歷史訂單提出修改、但還沒回覆確認。
-      - pending_receipt_offers：上一張訂單確認後「要不要生成訂購單
-        PDF」的提問還沒回答（40 秒內有效）。這個提問排在 dispatcher
-        判斷「確認」要交給誰處理的最前面，沒清掉的話，對新訂單說
-        「確認」會被導去對上一張訂單生成 PDF，這筆新訂單反而完全沒
-        被確認、沒有寫入 Google，使用者卻以為自己已經確認過了。
+    先前打過「取消訂單005」或對某張歷史訂單提出修改、但還沒有回覆
+    「確認」，這兩個待辦如果沒清掉，接下來對新訂單的「確認」會因為
+    dispatcher 的判斷順序，被誤導去執行舊的、使用者可能早就不記得的
+    歷史訂單取消／修改，而不是確認這筆新訂單。
     """
     pending_history_cancels.pop(user_id, None)
     pending_history_updates.pop(user_id, None)
-    pending_receipt_offers.pop(user_id, None)
 
 def normalize_teacher_name_input(text):
     clean=re.sub(r"[，,。.!！?？\s]+","",str(text or ""))
@@ -5052,7 +5064,7 @@ _SESSION_DICTS["multi_book_order_context"] = multi_book_order_context
 # 書籍模糊比對分數門檻：只有達到這個分數的候選才會被視為「符合條件」
 # 一起收下，不是只取分數最高的一筆。門檻比照其他地方的「還算可信」
 # 標準（0.5 上下），故意不設太高，避免漏掉書名寫法差異較大的候選。
-MULTI_BOOK_MATCH_SCORE_THRESHOLD = 0.5
+MULTI_BOOK_MATCH_SCORE_THRESHOLD = 0.42
 # 一次最多處理幾種書／幾個班，純粹防呆，避免異常輸入。
 MULTI_BOOK_MAX_CANDIDATES = 15
 
@@ -5218,27 +5230,79 @@ def validate_multi_book_keyword_input(user_id, raw_text, draft):
     return f"關鍵字：{clean}\n\n這次要挑幾種不同的書？請直接輸入數字，例如「7」。"
 
 
-def _collect_multi_book_matches(query, publisher):
+def _multi_book_query_variants(query):
+    """多書湊單專用的少量搜尋變體；最多 3 組，避免為了湊書反而打爆 Google。"""
+    clean = str(query or "").strip()
+    variants = [clean] if clean else []
+    norm = normalize_book_match_text(clean)
+
+    subjects = ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]
+    subject = next((x for x in subjects if x in norm), "")
+    m = re.search(r"(?:國文|英文|英語|數學|自然|理化|生物|地科|社會|歷史|地理|公民)[^1-6]*([1-6])", norm)
+    volume = m.group(1) if m else ""
+
+    if "測驗卷" in clean:
+        variants.append(clean.replace("測驗卷", "考卷"))
+    elif "考卷" in clean:
+        variants.append(clean.replace("考卷", "測驗卷"))
+    elif "卷" in clean and subject:
+        variants.append(f"{subject}{volume}測驗卷" if volume else f"{subject}測驗卷")
+
+    if subject and volume:
+        variants.append(f"{subject}{volume}")
+
+    out = []
+    for v in variants:
+        v = str(v or "").strip()
+        if v and v not in out:
+            out.append(v)
+    return out[:3]
+
+
+def _multi_book_subject_volume_ok(query, candidate):
+    """有明確科目/冊次時避免用放寬搜尋湊進錯科或錯冊。"""
+    q = normalize_book_match_text(query)
+    c = normalize_book_match_text(candidate)
+    subjects = ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]
+    q_subject = next((x for x in subjects if x in q), "")
+    if q_subject:
+        aliases = {"英文", "英語"} if q_subject in {"英文", "英語"} else {q_subject}
+        if not any(x in c for x in aliases):
+            return False
+
+    m = re.search(r"(?:國文|英文|英語|數學|自然|理化|生物|地科|社會|歷史|地理|公民)[^1-6]*([1-6])", q)
+    if m and q_subject:
+        volume = m.group(1)
+        subject_pat = "(?:英文|英語)" if q_subject in {"英文", "英語"} else re.escape(q_subject)
+        if not re.search(subject_pat + r"[^1-6]*" + re.escape(volume) + r"(?!\d)", c):
+            return False
+    return True
+
+
+def _collect_multi_book_matches(query, publisher, target_count=0):
     """
-    查一次書籍模糊比對，回傳所有分數達門檻、且書名不重複的候選
-    （依分數高到低排序）。底層 lookup_book_candidates_enhanced()
-    本身最多只會回 10 筆，這裡不另外放寬，算是既有機制的限制。
+    多書搜尋最多收 20 筆候選。先用原關鍵字；不夠目標數量時才用最多兩個
+    放寬變體補找，並用科目/冊次守門，兼顧「湊得滿」與速度。
     """
-    raw = lookup_book_candidates_enhanced(query, publisher=publisher)
     seen = set()
     result = []
-    for c in raw:
-        value = str(c.get("value", "") or "").strip()
-        score = float(c.get("score", 0) or 0)
-        if not value or value in seen or score < MULTI_BOOK_MATCH_SCORE_THRESHOLD:
-            continue
-        seen.add(value)
-        result.append({
-            "value": value,
-            "publisher": str(c.get("publisher", "") or publisher or ""),
-            "score": score,
-        })
-    return sorted(result, key=lambda x: x["score"], reverse=True)
+    for variant in _multi_book_query_variants(query):
+        raw = lookup_book_candidates_enhanced(variant, publisher=publisher, max_results=20)
+        for c in raw:
+            value = str(c.get("value", "") or "").strip()
+            score = float(c.get("score", 0) or 0)
+            if (not value or value in seen or score < MULTI_BOOK_MATCH_SCORE_THRESHOLD
+                    or not _multi_book_subject_volume_ok(query, value)):
+                continue
+            seen.add(value)
+            result.append({
+                "value": value,
+                "publisher": str(c.get("publisher", "") or publisher or ""),
+                "score": score,
+            })
+        if target_count and len(result) >= target_count:
+            break
+    return sorted(result, key=lambda x: x["score"], reverse=True)[:20]
 
 
 def _find_multi_book_replacement(draft, excluded_values):
@@ -5296,7 +5360,7 @@ def _run_multi_book_search(user_id, draft):
     publisher = draft.get("publisher") or ""
     expected = draft.get("expected_count", 0)
 
-    matched = _collect_multi_book_matches(query, publisher)
+    matched = _collect_multi_book_matches(query, publisher, target_count=expected)
 
     # 指定出版社湊不滿時，自動放寬成不限出版社繼續湊，直到湊滿、或
     # 資料庫裡真的沒有更多符合的書為止。判斷出版社永遠是看資料庫的
@@ -5304,7 +5368,7 @@ def _run_multi_book_search(user_id, draft):
     # 考卷搭配哪個課本版本的說明文字，不是它真正的出版社。
     if publisher and len(matched) < expected:
         seen_values = {c["value"] for c in matched}
-        for c in _collect_multi_book_matches(query, ""):
+        for c in _collect_multi_book_matches(query, "", target_count=expected):
             if len(matched) >= expected:
                 break
             if c["value"] in seen_values:
@@ -5792,10 +5856,17 @@ def _looks_like_order_for_known_teacher_no_class(text, context):
         return False
 
     book_words = [
-        "講義", "評量", "教材", "複習", "測驗", "題本",
-        "自修", "課本", "習作", "學習單", "套書",
+        "講義", "評量", "教材", "複習", "測驗", "題本", "考卷", "卷",
+        "自修", "課本", "習作", "學習單", "套書", "段考王", "大滿貫",
+        "學習講義", "學習自修",
     ]
-    return any(w in clean for w in book_words)
+    if any(w in clean for w in book_words):
+        return True
+
+    # 查完老師後，使用者常直接丟「段考王英文5」這種純書名。即使名稱
+    # 沒有「講義／評量」等字，只要同時帶科目與冊次，也視為書名接續訂書。
+    subjects = ["國文", "英文", "英語", "數學", "自然", "理化", "生物", "地科", "社會", "歷史", "地理", "公民"]
+    return any(subj in clean for subj in subjects) and bool(re.search(r"[1-6]", clean))
 
 
 def looks_like_contextual_class_book(text, context):
@@ -8187,6 +8258,15 @@ def _resolve_other_order_teacher(user_id, teacher_text, school_hint=""):
             "teacher":str(item.get("teacher","") or teacher_name).strip()
         }
 
+    # 其他訂單也支援老師姓名一字錯誤／同音字。這裡只需要學校與老師名稱，
+    # 可直接使用 fuzzy candidate，不再為了拿班級資料多打一趟 Google。
+    fuzzy = resolve_fuzzy_name("teacher", teacher_name, school=school_hint)
+    if fuzzy.get("status") == "auto":
+        return {
+            "school": str(fuzzy.get("school", "") or school_hint).strip(),
+            "teacher": str(fuzzy.get("value", "") or teacher_name).strip(),
+        }
+
     if school_hint:
         classes=get_teacher_classes(school_hint,teacher_name)
         if classes:
@@ -9980,7 +10060,7 @@ def book_keyword_score(query, candidate):
     return min(score, 1.0)
 
 
-def lookup_book_candidates_enhanced(query, publisher=""):
+def lookup_book_candidates_enhanced(query, publisher="", max_results=10):
     query = str(query or "").strip()
     if not query:
         return []
@@ -10020,7 +10100,8 @@ def lookup_book_candidates_enhanced(query, publisher=""):
         key = (value, pub)
         if key not in merged or score > merged[key]["score"]:
             merged[key] = {"value": value, "publisher": pub, "school": "", "score": score}
-    return sorted(merged.values(), key=lambda x: x["score"], reverse=True)[:10]
+    max_results = max(1, min(int(max_results or 10), 20))
+    return sorted(merged.values(), key=lambda x: x["score"], reverse=True)[:max_results]
 
 def resolve_fuzzy_name(kind, query, school=""):
     candidates = (
@@ -10376,7 +10457,10 @@ def google_post(payload, timeout=10, retries=1, ignore_budget=False):
                 # 資料庫忙線）。這種失敗回應以前也會被當成正常結果快取
                 # 起來，同一個查詢接下來幾分鐘到半小時內（視 TTL）會
                 # 一直回失敗結果，即使 Google 那邊早就恢復正常。
-                should_cache = data.get("success") is True and not (
+                # 只有「明確 success:false」才視為失敗不快取。
+                # 有些舊 GAS action 回的是正常資料但沒有 success 欄位；若硬性要求
+                # `is True`，這些讀取就會每次都重新打 Google，造成 1~3 秒累積延遲。
+                should_cache = data.get("success") is not False and not (
                     action == "lookup_fuzzy_candidates" and not data.get("candidates")
                 )
                 if should_cache:
