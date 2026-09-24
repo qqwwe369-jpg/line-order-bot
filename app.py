@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-25-v81-cram-bulk-order"
+APP_VERSION = "2026-09-25-v82-bulk-ai-fix"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -12652,11 +12652,113 @@ def _v81_bulk_system_prompt():
 10. 訊息裡有寫補習班名稱才填 cram_school，沒有就留空。"""
 
 
+# v82：整段訂單的 AI 呼叫另外寫，原因（實際上線第一次就失敗）：
+#   gpt-5-mini 是「會先思考」的模型，max_completion_tokens 包含思考用掉的字數。
+#   43 項的清單本身就要 3000 字左右，再加上思考，4000 一定不夠 → 回覆被截斷 → JSON 壞掉。
+#   所以：思考開到最少（reasoning_effort）、上限拉高、截斷時救回已經寫完的項目，
+#   失敗時把原因告訴使用者、也寫進 log。
+_V82_BULK_MAX_TOKENS = int(os.environ.get("BULK_AI_MAX_TOKENS", "16000"))
+_V82_BULK_TIMEOUT = float(os.environ.get("BULK_AI_TIMEOUT_SECONDS", "45"))
+_v82_last_bulk_failure = {}
+
+
+def _v82_salvage_json(content):
+    """回覆被截斷時，把已經完整寫完的項目救回來。"""
+    text = str(content or "")
+    start = text.find("{")
+    if start < 0:
+        return None
+    text = text[start:]
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    items_at = text.find('"items"')
+    if items_at < 0:
+        return None
+    # 從最後一個「},」或「}」往回試，補上 ]} 讓它變成合法 JSON
+    cut = len(text)
+    for _ in range(200):
+        cut = text.rfind("}", 0, cut)
+        if cut <= items_at:
+            return None
+        candidate = text[:cut + 1] + "]}"
+        try:
+            data = json.loads(candidate)
+            if isinstance(data, dict) and data.get("items"):
+                data.setdefault("notes", [])
+                data["_truncated"] = True
+                return data
+        except Exception:
+            pass
+    return None
+
+
+def _v82_bulk_ai_call(messages):
+    """回傳 (data, 失敗原因)。原因：no_key / timeout / http_xxx / too_long / bad_json / error"""
+    if not OPENAI_API_KEY:
+        return None, "no_key"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    efforts = ["minimal", "low", None] if OPENAI_MODEL.lower().startswith(("gpt-5", "o")) else [None]
+    deadline = time.time() + _V82_BULK_TIMEOUT
+    last_reason = "error"
+    for effort in efforts:
+        remaining = deadline - time.time()
+        if remaining < 5:
+            return None, last_reason if last_reason != "error" else "timeout"
+        payload = {
+            "model": OPENAI_MODEL,
+            "messages": messages,
+            "response_format": {"type": "json_object"},
+            "max_completion_tokens": _V82_BULK_MAX_TOKENS,
+        }
+        if effort:
+            payload["reasoning_effort"] = effort
+        started = time.time()
+        try:
+            response = HTTP.post("https://api.openai.com/v1/chat/completions",
+                                 headers=headers, json=payload, timeout=remaining)
+        except Exception as error:
+            name = type(error).__name__
+            logger.warning("bulk AI error effort=%s %s: %s", effort, name, error)
+            return None, "timeout" if "Timeout" in name else "error"
+        elapsed = time.time() - started
+        if response.status_code == 400 and effort and "reasoning" in (response.text or "").lower():
+            logger.warning("bulk AI: model rejected reasoning_effort=%s, retrying", effort)
+            last_reason = "http_400"
+            continue
+        if response.status_code != 200:
+            logger.warning("bulk AI failed status=%s body=%s", response.status_code, (response.text or "")[:300])
+            return None, f"http_{response.status_code}"
+        try:
+            body = response.json()
+            choice = (body.get("choices") or [{}])[0]
+            content = (choice.get("message") or {}).get("content") or ""
+            finish = choice.get("finish_reason") or ""
+            usage = body.get("usage") or {}
+        except Exception as error:
+            logger.warning("bulk AI bad body: %s", error)
+            return None, "bad_json"
+        logger.info("bulk AI done effort=%s elapsed=%.1fs finish=%s usage=%s chars=%s",
+                    effort, elapsed, finish, usage, len(content))
+        try:
+            return json.loads(content), ""
+        except Exception:
+            data = _v82_salvage_json(content)
+            if data:
+                logger.warning("bulk AI output truncated, salvaged %s items", len(data.get("items", [])))
+                return data, ""
+            return None, "too_long" if finish == "length" else "bad_json"
+    return None, last_reason
+
+
 def _v81_extract_bulk(raw_text):
-    return _openai_json([
+    data, reason = _v82_bulk_ai_call([
         {"role": "system", "content": _v81_bulk_system_prompt()},
         {"role": "user", "content": str(raw_text or "")[:6000]},
-    ], max_output_tokens=4000, timeout=max(AI_TIMEOUT_SECONDS, 40))
+    ])
+    _v82_last_bulk_failure["reason"] = reason
+    return data
 
 
 def _v81_load_books():
@@ -12909,8 +13011,18 @@ def _v81_start_bulk(user_id, raw_text):
         return "📋 這看起來是一整段訂單，但整理整段訂單需要 AI 功能（OPENAI_API_KEY 還沒設定）。"
     data = _v81_extract_bulk(raw_text)
     if not isinstance(data, dict) or not data.get("items"):
+        reason = _v82_last_bulk_failure.get("reason") or ("empty" if isinstance(data, dict) else "error")
+        why = {
+            "timeout": "AI 整理太久（超過 {:.0f} 秒）沒有回來".format(_V82_BULK_TIMEOUT),
+            "too_long": "AI 的回覆太長被截斷",
+            "bad_json": "AI 回覆的格式不對",
+            "empty": "AI 沒有從這段訊息找到要買的東西",
+            "http_401": "OpenAI 金鑰無效（401）",
+            "http_429": "OpenAI 額度用完或太多人同時用（429）",
+        }.get(reason, "AI 呼叫失敗（{}）".format(reason))
         return (
-            "⚠️ 這段訂單我這次沒有整理成功。\n\n"
+            "⚠️ 這段訂單我這次沒有整理成功。\n"
+            f"原因：{why}\n\n"
             "可以再傳一次；如果還是不行，請分成幾段傳，或改用「補習班訂書」一本一本登記。"
         )
     books = _v81_load_books()
