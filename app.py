@@ -148,11 +148,11 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-24-v79-final-stability"
+APP_VERSION = "2026-09-25-v81-cram-bulk-order"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
-MAX_USER_TEXT_LENGTH = 1000
+MAX_USER_TEXT_LENGTH = 5000   # v81：整段訂單可能很長；LINE 單則上限就是 5000 字
 
 # =========================================================
 # 簡易防濫用：同一個使用者短時間內訊息數上限
@@ -2000,6 +2000,7 @@ def _route_message(user_id, user_text):
     # （「好」「可以」）都可能被誤判成確認這筆已放棄的訂單，寫進 Google。
     if not guided_mode.get(user_id) and text in {"主選單", "回主選單", "離開"}:
         clear_task_states_for_new_mode(user_id)
+        pending_bulk_orders.pop(user_id, None)
         return get_main_menu_reply()
 
     # 0.1 純本地固定指令：絕對不能碰 Google / AI
@@ -2031,6 +2032,11 @@ def _route_message(user_id, user_text):
 
     if text in {"統計", "今日統計", "今天統計", "訂單統計", "今日訂單統計"}:
         return get_today_order_stats_reply()
+
+    # v81：補習班整段訂單（有待確認清單時先處理「3改25／5刪掉／6選2／確認」）
+    bulk_reply = _v81_route_bulk(user_id, user_text)
+    if bulk_reply is not None:
+        return bulk_reply
 
     # 0.15 訂購單生成提問：新訂單確認或歷史訂單查詢後才會出現。
     if user_id in pending_receipt_offers:
@@ -2627,7 +2633,10 @@ def _route_message(user_id, user_text):
     # 19. 訂書流程 —— 優先於一般 AI
     order_reply = handle_order_flow(user_id, text)
     if order_reply is not None:
-        return order_reply
+        # v81（#17）：規則層接手了卻失敗（找不到老師／書），先讓 AI 讀一次整句；
+        # AI 讀懂、而且資料庫對得上才採用，否則照舊回原本的錯誤訊息。
+        rescued = _v81_ai_rescue_failed_order(user_id, text, order_reply)
+        return rescued if rescued is not None else order_reply
 
     # 19.5 智慧理解最後容錯：
     # 原本所有固定功能、guided_mode、資料庫規則都已經先跑完。
@@ -8912,16 +8921,85 @@ def _resolve_other_order_teacher(user_id, teacher_text, school_hint=""):
     # 可直接使用 fuzzy candidate，不再為了拿班級資料多打一趟 Google。
     fuzzy = resolve_fuzzy_name("teacher", teacher_name, school=school_hint)
     if fuzzy.get("status") == "auto":
-        return {
-            "school": str(fuzzy.get("school", "") or school_hint).strip(),
-            "teacher": str(fuzzy.get("value", "") or teacher_name).strip(),
-        }
+        suggested = str(fuzzy.get("value", "") or teacher_name).strip()
+        suggested_school = str(fuzzy.get("school", "") or school_hint).strip()
+        sug_norm = normalize_person_name(suggested)
+        # 只是多打／少打字（「林怡君藥」→「林怡君」）是同一個人，直接採用；
+        # 有字不一樣（「王大明」→「王小明」）才可能是另一個人，要先問。
+        if sug_norm == teacher_name or (sug_norm and (sug_norm in teacher_name or teacher_name in sug_norm)):
+            return {"school": suggested_school, "teacher": suggested}
+        # v81：只差一個字的「另一位老師」不能默默換掉（王大明→王小明）。
+        # 照使用者打的名字登記，先問學校，並提示資料庫有一位很像的。
+        return {"school": "", "teacher": teacher_name,
+                "suggest_teacher": suggested, "suggest_school": suggested_school}
 
     if school_hint:
         classes=get_teacher_classes(school_hint,teacher_name)
         if classes:
             return {"school":school_hint,"teacher":teacher_name}
     return None
+
+
+_V80_OTHER_ORDER_SUPPLY_WORDS = (
+    "書面紙","影印紙","A4紙","a4紙","海報紙","色紙","彩色筆","白板筆",
+    "原子筆","鉛筆","橡皮擦","資料夾","粉筆","尺","剪刀","膠水","膠帶","便利貼"
+)
+_V80_OTHER_ORDER_SAMPLE_WORDS = ("樣書","全樣書","教師用書","教師本","參考樣書","試閱")
+_V80_OTHER_ORDER_REPLACEMENT_WORDS = (
+    "補一本","補一冊","補一套","補書","要補","需要補","少一本","少一冊",
+    "缺一本","缺一冊","遺失","不見了","不見","弄丟","掉了","丟了",
+    "再拿一本","再要一本","學生要一本","同學要一本"
+)
+# 學校裡的單位：看到這些字，前面那一段一定是學校名稱。
+_V80_SCHOOL_OFFICE_WORDS = (
+    "教務處","學務處","總務處","輔導室","輔導處","人事室","會計室","圖書館",
+    "註冊組","設備組","教學組","訓育組","衛生組","體育組","資訊組","實研組",
+    "導師室","辦公室","校長室","教官室","健康中心","出版組"
+)
+_V80_SCHOOL_TYPE_SUFFIX = r"(?:國民中學|國民小學|高級中學|完全中學|實驗中學|國中|國小|高中|高職|中學|女中|實中|學校)"
+
+
+def _v80_looks_like_other_order(text):
+    t = str(text or "")
+    return any(w in t for w in (
+        _V80_OTHER_ORDER_SUPPLY_WORDS + _V80_OTHER_ORDER_SAMPLE_WORDS + _V80_OTHER_ORDER_REPLACEMENT_WORDS
+    ))
+
+
+def _v80_split_other_order_school(clean):
+    """
+    v80：其他訂單的學校辨識，回傳 (學校, 去掉學校後的文字)。
+    依序：
+      1. 本地三校（天母／華興／衛理）——不打 Google
+      2. Google 學校清單（含簡稱，例如「泰北」→「泰北高中」；清單 30 分鐘快取）
+      3. 寫了學校型態（XX高中、XX國中…）——不在清單也照打的名字登記
+      4. 後面接學校單位（XX教務處、XX註冊組…）——前面那段就是學校
+    都不符合時回傳 ("", 原文)，交給後面用老師資料庫反查學校。
+    """
+    aliases = _other_order_school_aliases(include_dynamic=False)
+    for alias in sorted(aliases, key=len, reverse=True):
+        if clean.startswith(alias):
+            return aliases[alias], clean[len(alias):]
+
+    aliases = _other_order_school_aliases(include_dynamic=True)
+    for alias in sorted(aliases, key=len, reverse=True):
+        if len(alias) >= 2 and clean.startswith(alias):
+            return aliases[alias], clean[len(alias):]
+
+    # 校名裡不會出現「老師」或動詞；有的話代表切錯了（例如「林老師要中學生用的色紙」）。
+    def _plausible_school(name):
+        return not re.search(r"老師|要|買|訂|補|給|拿|送|需|缺|看|的", name)
+
+    m = re.match(rf"^([\u4e00-\u9fff]{{1,8}}?{_V80_SCHOOL_TYPE_SUFFIX})(.+)$", clean)
+    if m and _plausible_school(m.group(1)):
+        return m.group(1), m.group(2)
+
+    for office in _V80_SCHOOL_OFFICE_WORDS:
+        m = re.match(rf"^([\u4e00-\u9fff]{{2,8}}?)(?:的)?({office}.+)$", clean)
+        if m and _plausible_school(m.group(1)):
+            return m.group(1), m.group(2)
+
+    return "", clean
 
 
 def parse_other_order(user_id, text):
@@ -8948,24 +9026,16 @@ def parse_other_order(user_id, text):
         explicit_other = True
         clean = clean[len("其他單"):]
 
-    # v74：先只用本地三校，不為「天母／華興／衛理」呼叫 list_schools。
-    aliases = _other_order_school_aliases(include_dynamic=False)
-    school_hint = ""
-    for alias in sorted(aliases, key=len, reverse=True):
-        if clean.startswith(alias):
-            school_hint = aliases[alias]
-            clean = clean[len(alias):]
-            break
+    # v80：這句根本不像其他訂單（沒有用品／樣書／補書字眼，也不是明確
+    # 「其他訂單」）時提早離開。結果跟舊版一樣是 None，但可以避免為了
+    # 辨識學校而去抓學校清單，一般訊息的速度不受影響。
+    if not explicit_other and not _v80_looks_like_other_order(clean):
+        return None
 
-    # 只有尚未命中本地三校，而且文字本身真的帶有學校型態字樣時，
-    # 才取得動態學校清單。這保留未來其他學校的彈性，但不拖慢常用三校。
-    if not school_hint and _text_may_contain_dynamic_school(clean):
-        aliases = _other_order_school_aliases(include_dynamic=True)
-        for alias in sorted(aliases, key=len, reverse=True):
-            if clean.startswith(alias):
-                school_hint = aliases[alias]
-                clean = clean[len(alias):]
-                break
+    # v74：先只用本地三校，不為「天母／華興／衛理」呼叫 list_schools。
+    school_hint, clean = _v80_split_other_order_school(clean)
+    if school_hint:
+        clean = re.sub(r"^的", "", clean)      # 「泰北的註冊組」
 
     clean = re.sub(r"^(?:幫我|幫|麻煩|請幫我|請幫)", "", clean)
 
@@ -9011,8 +9081,8 @@ def parse_other_order(user_id, text):
     is_sample = any(w in item or w in full_for_intent for w in sample_words)
     is_replacement = any(w in full_for_intent for w in replacement_words)
 
-    # 補書時，動詞「補」已被切掉；把品項整理成使用者真正要登記的文字。
-    item = re.sub(r"^(?:一本|一冊|一套)", "", item) if is_replacement else item
+    # v80：品項照使用者打的保留，不再把開頭的「一本／一冊／一套」刪掉——
+    # 「補一套3800套書」刪掉「一套」後只剩「3800套書」，數量就不見了。
     item = item.strip()
     if not item:
         return None
@@ -9040,12 +9110,16 @@ def parse_other_order(user_id, text):
         if not resolved:
             resolved = {"school": "", "teacher": teacher_raw}
 
-    return {
+    parsed = {
         "school": resolved.get("school", ""),
         "teacher": resolved.get("teacher", teacher_raw),
         "item": item,
         "needs_school": not bool(resolved.get("school", "")),
     }
+    if resolved.get("suggest_teacher"):
+        parsed["suggest_teacher"] = resolved["suggest_teacher"]
+        parsed["suggest_school"] = resolved.get("suggest_school", "")
+    return parsed
 
 def _resolve_other_order_school_input(raw_text):
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
@@ -9062,9 +9136,25 @@ def _resolve_other_order_school_input(raw_text):
     for alias in sorted(aliases, key=len, reverse=True):
         if alias and (clean == alias or clean in alias or alias in clean):
             return aliases[alias]
+    # v80：Google 學校清單的簡稱（「泰北」→「泰北高中」）不管有沒有
+    # 「國中／高中」字樣都要查；清單有 30 分鐘快取。
+    aliases = _other_order_school_aliases(include_dynamic=True)
+    if clean in aliases:
+        return aliases[clean]
+    for alias in sorted(aliases, key=len, reverse=True):
+        if len(alias) >= 2 and (clean in alias or alias in clean):
+            return aliases[alias]
     fuzzy = resolve_fuzzy_name("school", clean)
     if fuzzy.get("status") == "auto":
         return str(fuzzy.get("value", "") or "").strip()
+    # v80：清單裡沒有的學校，照使用者打的名字登記（確認畫面會顯示出來
+    # 讓使用者檢查）。確認／取消這類字、數字、太長的句子不能當成校名。
+    if (
+        re.fullmatch(r"[\u4e00-\u9fffA-Za-z]{2,12}", clean)
+        and not _is_confirm_word(clean)
+        and clean not in {"取消", "不要", "不要了", "這筆不要", "重來", "主選單", "回主選單", "離開"}
+    ):
+        return clean
     return ""
 
 
@@ -9072,6 +9162,13 @@ def handle_pending_other_order_school_input(user_id, text):
     order = pending_other_orders.get(user_id)
     if not order or str(order.get("school", "") or "").strip():
         return None
+    clean_yes = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+    if order.get("suggest_teacher") and clean_yes in {"是", "對", "是他", "就是他", "對就是他", "沒錯", "是的"}:
+        order["teacher"] = order.pop("suggest_teacher")
+        order["school"] = order.pop("suggest_school", "")
+        order["needs_school"] = not bool(order["school"])
+        pending_other_orders[user_id] = order
+        return make_other_order_confirmation(order)
     school = _resolve_other_order_school_input(text)
     if not school:
         return (
@@ -9091,6 +9188,11 @@ def make_other_order_confirmation(order):
             f"聯絡對象：{order.get('teacher','')}\n"
             f"品項：{order.get('item','')}\n\n"
             "我還缺學校。請直接輸入學校名稱，例如「天母」或「華興中學」。"
+            + (
+                f"\n\n💡 資料庫有一位很像的老師：{order.get('suggest_school','')} {order.get('suggest_teacher','')}。"
+                "\n是同一位的話回「是」，就改成他；不是的話直接打學校名稱。"
+                if order.get("suggest_teacher") else ""
+            )
         )
     return (
         "📦 其他訂單｜請確認\n\n"
@@ -9776,7 +9878,9 @@ def _photo_school_batch_confirmation(batch):
         lines.extend(["", f"📝 共同備註：{batch['note']}"])
     if batch.get("dropped"):
         lines.extend(["", f"⚠️ 以下書名資料庫查無資料，需要你自己另外處理：{'、'.join(batch['dropped'])}"])
-    lines.extend(["", "以上資料正確請回覆「確認」。", "需要取消請回覆「取消」。"])
+    lines.extend(["", "以上資料正確請回覆「確認」。",
+                  "需要修改可直接說：701改30、702不要、加703。",
+                  "需要取消請回覆「取消」。"])
     return "\n".join(lines)
 
 
@@ -10014,8 +10118,159 @@ def handle_pending_photo_order(user_id, text):
     if _is_confirm_word(clean):
         return confirm_photo_order(user_id)
 
+    # v80：口語（AI 助手）／拍照訂單的確認畫面也能改班級數量、刪班、加班。
+    if batch.get("kind") == "school":
+        spaced = re.sub(r"[\s，,。.!！?？]+", " ", str(text or "")).strip()
+        edit_reply = _v80_edit_photo_school_batch(user_id, batch, spaced)
+        if edit_reply is not None:
+            return edit_reply
+
     return (_photo_school_batch_confirmation(batch) if batch.get("kind") == "school"
             else _photo_cram_batch_confirmation(batch))
+
+
+_V80_REMOVE_WORDS = r"(?:不要了|不要|取消|刪掉|刪除|拿掉|移除|去掉|不用)"
+_V80_CLASS_TOKEN = r"(?:[789]\d{2}|(?:國[一二三]|高[一二三]|[七八九]年級?)[甲乙丙丁戊己庚辛壬癸信望愛慧忠孝仁])"
+
+
+def _v80_split_classes(text):
+    return re.findall(_V80_CLASS_TOKEN, text)
+
+
+def _v80_photo_teacher_classes(batch):
+    """加班時需要這位老師每班的人數：先用建立時存下來的，沒有再查老師資料庫。"""
+    cached = batch.get("teacher_classes")
+    if cached:
+        return cached
+    teacher = str(batch.get("teacher", "") or "").strip()
+    school = str(batch.get("school", "") or "").strip()
+    if not teacher or teacher == "未填寫":
+        return []
+    for item in lookup_teacher_matches(teacher, school=school) or []:
+        if not school or str(item.get("school", "")).strip() == school:
+            classes = copy_classes(item.get("classes", []))
+            batch["teacher_classes"] = classes
+            return classes
+    return []
+
+
+def _v80_edit_photo_school_batch(user_id, batch, clean):
+    """
+    支援的講法（可以一句寫好幾個，全部檢查沒問題才一起套用）：
+      701改30、701改成30本、701要30本、701跟703都改25
+      701少2本、701多3本
+      702不要、702取消、刪702、拿掉702、701跟702不要
+      加703、再加703、703也要、新增703
+    同一筆有好幾本書時，會套用到「有這個班」的每一本；前面加「第2本」
+    就只改那一本（例如「第2本701改30」）。回傳 None 代表這句不是修改指令。
+    """
+    items = batch.get("items", [])
+    if not items:
+        return None
+
+    target_indexes = list(range(len(items)))
+    m = re.match(r"^第?(\d{1,2})(?:本|項)\s*(.*)$", clean)
+    if m:
+        n = int(m.group(1))
+        if not (1 <= n <= len(items)):
+            return f"⚠️ 目前只有 1～{len(items)} 本，請輸入正確的編號。"
+        target_indexes = [n - 1]
+        clean = m.group(2)
+
+    ops = []   # (動作, 班級, 數字)
+    rest = clean
+    patterns = [
+        ("set", rf"((?:{_V80_CLASS_TOKEN}(?:跟|和|、|,|及|\s)*)+)(?:都|全部)?\s*(?:改成|改為|改|變成|要|訂)\s*(\d{{1,3}})(?!\d)(?:本|份|冊)?"),
+        ("delta", rf"((?:{_V80_CLASS_TOKEN}(?:跟|和|、|,|及|\s)*)+)(?:都)?\s*(少|減|減少|多|加|增加)\s*(\d{{1,3}})(?!\d)(?:本|份|冊)"),
+        ("remove", rf"(?:刪|刪掉|拿掉|移除|去掉|取消)((?:{_V80_CLASS_TOKEN}(?:跟|和|、|,|及|\s)*)+)"),
+        ("remove", rf"((?:{_V80_CLASS_TOKEN}(?:跟|和|、|,|及|\s)*)+)(?:都|也)?{_V80_REMOVE_WORDS}"),
+        ("add", rf"(?:再加|加上|加|新增|補上|補|再補)((?:{_V80_CLASS_TOKEN}(?:跟|和|、|,|及|\s)*)+)(?:班)?"),
+        ("add", rf"((?:{_V80_CLASS_TOKEN}(?:跟|和|、|,|及|\s)*)+)(?:班)?(?:也要|也訂|也一起)"),
+    ]
+    found_any = True
+    while found_any and rest:
+        found_any = False
+        for kind, pat in patterns:
+            mm = re.search(pat, rest)
+            if not mm:
+                continue
+            classes = _v80_split_classes(mm.group(1))
+            if kind == "set":
+                ops += [("set", c, int(mm.group(2))) for c in classes]
+            elif kind == "delta":
+                sign = -1 if mm.group(2) in {"少", "減", "減少"} else 1
+                ops += [("delta", c, sign * int(mm.group(3))) for c in classes]
+            else:
+                ops += [(kind, c, 0) for c in classes]
+            rest = rest[:mm.start()] + " " + rest[mm.end():]
+            found_any = True
+            break
+    if not ops:
+        return None
+    if re.search(r"[\u4e00-\u9fff0-9]", re.sub(r"[\s跟和、,及也再然後還有]", "", rest)):
+        # 句子裡還有看不懂的部分，不要只改一半。
+        return (
+            "⚠️ 這句修改我沒有完全看懂，所以什麼都還沒改。\n\n"
+            "可以這樣說：701改30、702不要、加703、701少2本"
+        )
+
+    # 先在複本上全部套用、全部檢查，沒問題才寫回。
+    new_items = copy.deepcopy(items)
+    teacher_classes = None
+    done = []
+    for kind, cname, num in ops:
+        if kind == "add":
+            if teacher_classes is None:
+                teacher_classes = {c["class_name"]: int(c.get("students", 0) or 0)
+                                   for c in _v80_photo_teacher_classes(batch)}
+            if cname not in teacher_classes:
+                known = "、".join(teacher_classes) or "查不到"
+                return f"⚠️ {batch.get('teacher','')} 沒有 {cname} 這個班（目前班級：{known}）。整批修改未套用。"
+            added = False
+            for i in target_indexes:
+                if any(c["class_name"] == cname for c in new_items[i]["classes"]):
+                    continue
+                new_items[i]["classes"].append({"class_name": cname, "students": teacher_classes[cname]})
+                added = True
+            if not added:
+                return f"⚠️ {cname} 已經在訂單裡了。整批修改未套用。"
+            done.append(f"加 {cname}（{teacher_classes[cname]}本）")
+            continue
+
+        hit = False
+        for i in target_indexes:
+            cls = new_items[i]["classes"]
+            for c in list(cls):
+                if c["class_name"] != cname:
+                    continue
+                hit = True
+                if kind == "remove":
+                    cls.remove(c)
+                else:
+                    value = num if kind == "set" else int(c["students"]) + num
+                    if value <= 0:
+                        return f"⚠️ {cname} 改完會變成 {value} 本，數量要大於 0。要整班不要請說「{cname}不要」。"
+                    c["students"] = value
+        if not hit:
+            return f"⚠️ 目前訂單裡沒有 {cname}。整批修改未套用。"
+        if kind == "remove":
+            done.append(f"刪除 {cname}")
+        elif kind == "set":
+            done.append(f"{cname}→{num}本")
+        else:
+            done.append(f"{cname}{'+' if num > 0 else ''}{num}本")
+
+    for i in target_indexes:
+        if not new_items[i]["classes"]:
+            return (
+                f"⚠️ 「{new_items[i]['book']}」的班級會全部被刪掉。\n\n"
+                "至少要保留一班；整筆都不要的話請回覆「取消」。整批修改未套用。"
+            )
+
+    batch["items"] = new_items
+    pending_photo_orders[user_id] = batch
+    scope = f"第 {target_indexes[0] + 1} 本" if len(target_indexes) == 1 and len(items) > 1 else ""
+    return f"✅ 已修改{scope}：{'、'.join(done)}\n\n" + _photo_school_batch_confirmation(batch)
 
 
 def confirm_photo_order(user_id):
@@ -10054,7 +10309,8 @@ def confirm_photo_order(user_id):
     pending_photo_orders.pop(user_id, None)
     ok = [x for x in results if x[0]]
     fail = [x for x in results if not x[0]]
-    lines = ["✅ 學校拍照訂單已處理", "", f"成功 {len(ok)} 筆／共 {len(results)} 筆"]
+    kind_label = "口語" if batch.get("source_label") == "口語" else "拍照"
+    lines = [f"✅ 學校{kind_label}訂單已處理", "", f"成功 {len(ok)} 筆／共 {len(results)} 筆"]
     for success, number, book in ok:
         lines.append(f"✔️ {book}｜訂單編號 {number}")
     for success, number, book in fail:
@@ -10120,6 +10376,7 @@ def _apply_smart_school_order(user_id, data, source_label="口語"):
         "kind": "school",
         "teacher": teacher_info["teacher"],
         "school": teacher_info["school"],
+        "teacher_classes": copy_classes(teacher_info.get("classes", [])),   # v80：加班時用
         "items": batch_items,
         "note": common_note,
         "source_label": source_label,
@@ -12334,6 +12591,509 @@ def reply_to_line(reply_token, message, quick_reply=None):
                 continue
 
 
+# =========================================================
+# v81：補習班「整段訂單」——轉傳一整段訊息，整理成可修改的清單
+# =========================================================
+# 流程：
+#   1. 偵測：3 行以上都有「數字＋本/份/冊/套」的訊息，就當成整段訂單
+#   2. AI 只負責「讀懂」：拆成一項一項（科目、冊次、出版社、系列、卷別、數量…）
+#   3. 程式負責「對書」：用 Apps Script 的 list_books 一次拿到整份書籍資料
+#      （含 E 欄「別名」），在本地逐項比對，不會一項打一次 Google
+#   4. 給使用者一張有編號的清單：✅ 對到、❓ 要選、❌ 資料庫沒有
+#   5. 可以改數量／刪除／選書／指定補習班，確認後寫進「補習班訂單」
+pending_bulk_orders = {}
+_SESSION_DICTS["pending_bulk_orders"] = pending_bulk_orders
+
+_GOOGLE_CACHE_TTLS["list_books"] = 1800
+_GOOGLE_STALE_MAX_AGES["list_books"] = 7 * 24 * 3600
+
+_V81_QTY_RE = re.compile(r"\d+\s*(?:\+\s*\d+\s*)*(?:本|份|冊|套)|[xX×＊*]\s*\d+")
+_V81_SUBJECTS = ["國文", "英文", "數學", "自然", "生物", "理化", "地科", "歷史", "地理", "公民", "社會"]
+_V81_PAPER_TYPES = {"A卷", "B卷", "C卷", "D卷", "KA", "KB", "門市卷", "測驗卷"}
+# 使用者確認過的講法：康軒「新挑戰」如果不是卷（沒寫 A/B 卷、KA/KB），指的是康軒學習講義
+_V81_SERIES_REWRITE = {("康軒", "新挑戰"): "學習講義", ("康軒", "新挑戰講義"): "學習講義"}
+
+
+def _v81_is_bulk_text(raw_text):
+    lines = [l for l in str(raw_text or "").splitlines() if l.strip()]
+    if len(lines) < 3:
+        return False
+    qty_lines = sum(1 for l in lines if _V81_QTY_RE.search(l))
+    return qty_lines >= 3
+
+
+def _v81_norm(text):
+    t = normalize_text(str(text or "")).upper()
+    t = re.sub(r"[\s，,。.!！?？:：、()（）【】\[\]「」『』\-－_/]+", "", t)
+    return t.replace("英語", "英文").replace("8K", "")
+
+
+def _v81_bulk_system_prompt():
+    return """你是書店的補習班訂單整理員。使用者會貼上一整段補習班老師傳來的訊息，
+你要把它拆成「一項一項要買的東西」，只輸出 JSON，不要自己補不存在的資料。
+
+輸出格式：
+{"cram_school":"","items":[{"section":"國文 第一冊","floor":"5F",
+ "subjects":["國文"],"volume":1,"grade":0,"publisher":"翰林","version":"","series":"超級悍將",
+ "paper":"","quantities":[43],"note":""}],"notes":["整段共通的備註"]}
+
+規則：
+1. 標題行（例如「國文 第三冊 送8F」「社會科 7年級 送5F」）決定後面每一項的 section、subject、volume／grade、floor，直到下一個標題。
+2. volume 是冊次數字：第一冊、（ㄧ）、(1)、（5）都要轉成數字。只寫年級沒寫冊次時，volume 填 0、grade 填 7/8/9。
+3. 一行寫了好幾科（例如「歷史 地理 公民」「歷地公」），subjects 直接列多科 ["歷史","地理","公民"]，不用拆成好幾項。
+   沒寫科目時沿用標題的科目。欄位值空白就給空字串，不要省略欄位名稱以外的東西，也不要多寫說明。
+4. quantities：「43本」→[43]；「20+20份」→[20,20]（保留兩筆，不要加總）；「x45本」→[45]。
+5. publisher 填訊息寫的品牌（翰林、康軒、南一、奇鼎…）；「8k 奇鼎 A卷 翰林」這種，publisher=奇鼎、version=翰林。
+6. paper 只能填：A卷、B卷、C卷、D卷、KA、KB、門市卷、測驗卷，或空白。KA、KB 照寫，不要改成 A卷。
+7. series 填系列名稱原文（超級悍將、新挑戰學習講義、標竿、教學式、學習講義…），8K、8k 不用寫。
+8. 「無法出貨看有什麼版本」「沒有就門市卷」這類替代說明放到該項 note；
+   「北投、石牌…（翰林版）」「幫確定列的版本是否正確」這類跟整段有關的說明放 notes。
+9. 看不懂的行也要列出來，series 填那一行原文，quantities 照寫，不要丟掉。
+10. 訊息裡有寫補習班名稱才填 cram_school，沒有就留空。"""
+
+
+def _v81_extract_bulk(raw_text):
+    return _openai_json([
+        {"role": "system", "content": _v81_bulk_system_prompt()},
+        {"role": "user", "content": str(raw_text or "")[:6000]},
+    ], max_output_tokens=4000, timeout=max(AI_TIMEOUT_SECONDS, 40))
+
+
+def _v81_load_books():
+    result = google_post({"action": "list_books"}, timeout=15, retries=1, ignore_budget=True)
+    if not result or not result.get("success"):
+        return None
+    books = []
+    for b in result.get("books", []) or []:
+        name = str(b.get("name", "") or "").strip()
+        if not name or name == "書名":
+            continue
+        aliases = [a.strip() for a in re.split(r"[、,，/;；]", str(b.get("alias", "") or "")) if a.strip()]
+        books.append({
+            "name": name,
+            "publisher": str(b.get("publisher", "") or "").strip(),
+            "version": str(b.get("version", "") or "").strip(),
+            "category": str(b.get("category", "") or "").strip(),
+            "aliases": aliases,
+            "_n": _v81_norm(name),
+            "_aliases_n": [_v81_norm(a) for a in aliases],
+        })
+    return books
+
+
+def _v81_volume_from_grade(grade):
+    """沒寫冊次時用年級＋學期推：8 月～隔年 1 月是上學期（1、3、5 冊），2～7 月是下學期（2、4、6 冊）。"""
+    try:
+        g = int(grade or 0)
+    except Exception:
+        return 0, ""
+    if g not in (7, 8, 9):
+        return 0, ""
+    month = datetime.now().month
+    upper = month >= 8 or month == 1
+    vol = (g - 7) * 2 + (1 if upper else 2)
+    cn = {7: "七", 8: "八", 9: "九"}[g]
+    return vol, f"{cn}年級→第{vol}冊（{'上' if upper else '下'}學期）"
+
+
+def _v81_subject_volume_ok(book, subject, volume):
+    n = book["_n"]
+    s = _v81_norm(subject)
+    if not s or s not in n:
+        return False
+    if not volume:
+        return True
+    tail = n[n.index(s) + len(s):]
+    return re.search(rf"(^|[^0-9~]){int(volume)}([^0-9~]|$)", tail) is not None
+
+
+def _v81_match(item, books):
+    """回傳 (狀態, 候選清單)。狀態：ok / choose / missing"""
+    subject = item.get("subject", "")
+    volume = item.get("volume", 0)
+    pub = str(item.get("publisher", "") or "").strip()
+    ver = str(item.get("version", "") or "").strip()
+    paper = str(item.get("paper", "") or "").strip().upper().replace("卷", "卷")
+    series = str(item.get("series", "") or "").strip()
+    if paper == "門市卷":
+        return "missing", []
+    series = _V81_SERIES_REWRITE.get((pub, _v81_norm(series)), series) if not paper else series
+
+    series_paper = _v81_norm(series + paper)
+    key_full = _v81_norm(pub + series + paper)
+    hits = []
+    for b in books:
+        if not _v81_subject_volume_ok(b, subject, volume):
+            continue
+        if ver and b["version"] and b["version"] != ver:
+            continue
+        if paper and b["category"] != "卷類":
+            continue
+        alias_hit = any(a and (a in key_full or (series_paper and a == series_paper)) for a in b["_aliases_n"])
+        s = _v81_norm(subject)
+        core = b["_n"][:b["_n"].index(s)] if s in b["_n"] else b["_n"]
+        name_hit = bool(series_paper) and bool(core) and (core in series_paper or series_paper in core) \
+            and min(len(core), len(series_paper)) >= 2
+        if not (alias_hit or name_hit):
+            continue
+        if pub and b["publisher"] != pub and not alias_hit:
+            continue
+        rank = (alias_hit, b["publisher"] == pub, bool(ver) and b["version"] == ver, name_hit)
+        hits.append((rank, b))
+    if not hits:
+        return "missing", []
+    best = max(h[0] for h in hits)
+    top = [b for r, b in hits if r == best]
+    if len(top) == 1:
+        return "ok", top
+    return "choose", sorted(top, key=lambda b: (b["publisher"], b["name"]))[:6]
+
+
+def _v81_build_rows(data, books):
+    rows = []
+    expanded = []
+    for it in (data.get("items") or []):
+        if not isinstance(it, dict):
+            continue
+        subs = it.get("subjects")
+        if isinstance(subs, str):
+            subs = [x for x in re.split(r"[、,，\s/]+", subs) if x]
+        if not subs:
+            subs = [it.get("subject", "")]
+        for sub in subs:
+            expanded.append(dict(it, subject=sub))
+    for it in expanded:
+        subject = str(it.get("subject", "") or "").strip().replace("英語", "英文")
+        try:
+            volume = int(it.get("volume") or 0)
+        except Exception:
+            volume = 0
+        vol_note = ""
+        if not volume:
+            volume, vol_note = _v81_volume_from_grade(it.get("grade"))
+        qtys = []
+        for q in (it.get("quantities") or []):
+            try:
+                q = int(q)
+            except Exception:
+                continue
+            if q > 0:
+                qtys.append(q)
+        if not qtys:
+            qtys = [0]
+        base = {
+            "line": str(it.get("line", "") or "").strip(),
+            "section": str(it.get("section", "") or "").strip(),
+            "floor": str(it.get("floor", "") or "").strip().upper(),
+            "subject": subject, "volume": volume, "vol_note": vol_note,
+            "publisher": str(it.get("publisher", "") or "").strip(),
+            "version": str(it.get("version", "") or "").strip(),
+            "series": str(it.get("series", "") or "").strip(),
+            "paper": str(it.get("paper", "") or "").strip(),
+            "note": str(it.get("note", "") or "").strip(),
+        }
+        status, cands = _v81_match(base, books)
+        for idx, q in enumerate(qtys):
+            row = dict(base, qty=q, status=status, removed=False,
+                       choices=[{"book": b["name"], "publisher": b["publisher"]} for b in cands],
+                       book="", book_publisher="")
+            if len(qtys) > 1:
+                row["note"] = ((row["note"] + "；") if row["note"] else "") + f"第{idx + 1}組"
+            if status == "ok":
+                row["book"] = cands[0]["name"]
+                row["book_publisher"] = cands[0]["publisher"]
+            if q <= 0:
+                row["status"] = "missing"
+                row["note"] = ((row["note"] + "；") if row["note"] else "") + "沒讀到數量"
+            rows.append(row)
+    for i, r in enumerate(rows, 1):
+        r["no"] = i
+    return rows
+
+
+def _v81_describe_raw(r):
+    parts = [r.get("publisher", ""), r.get("series", ""), r.get("paper", ""), r.get("subject", "")]
+    text = " ".join(p for p in parts if p)
+    if r.get("volume"):
+        text += f"({r['volume']})"
+    return text or r.get("line", "") or "（看不懂的一行）"
+
+
+def _v81_confirmation(order):
+    """回傳 LINE 訊息清單（最多 5 則，每則 4,500 字以內，照分段切，不會切在一項中間）。"""
+    rows = [r for r in order["rows"] if not r["removed"]]
+    head = ["👑 LeBron James 幫你把整段訂單整理好了", "", f"📋 補習班訂單整理（共 {len(rows)} 項）"]
+    if order.get("cram_school"):
+        head.append(f"🏫 補習班：{order['cram_school']}")
+    else:
+        head.append("❓ 補習班：訊息裡沒寫，請回覆補習班名稱（名單裡沒有的新補習班，請打「補習班是XXX」）")
+    blocks = []          # 每個分段一塊
+    section, cur = None, None
+    for r in rows:
+        sec = "｜".join(x for x in (r["section"], f"送{r['floor']}" if r["floor"] else "") if x) or "其他"
+        if sec != section:
+            section = sec
+            title = f"【{sec}】"
+            if r.get("vol_note"):
+                title = f"【{sec}】{r['vol_note']}"
+            cur = [title]
+            blocks.append(cur)
+        unit = "份" if (r.get("paper") or "卷" in r.get("book", "")) else "本"
+        group = re.search(r"第(\d+)組", r.get("note", ""))
+        gtxt = f"（第{group.group(1)}組）" if group else ""
+        note = re.sub(r"；?第\d+組", "", r.get("note", "")).strip("；")
+        if r["status"] == "ok":
+            cur.append(f"{r['no']}. ✅ [{r['book_publisher']}] {r['book']}｜{r['qty']}{unit}{gtxt}")
+        elif r["status"] == "choose":
+            cur.append(f"{r['no']}. ❓ {_v81_describe_raw(r)}｜{r['qty']}{unit}{gtxt}　請選：")
+            for j, c in enumerate(r["choices"], 1):
+                cur.append(f"      {j}) [{c['publisher']}] {c['book']}")
+        else:
+            cur.append(f"{r['no']}. ❌ {_v81_describe_raw(r)}｜{r['qty']}{unit}{gtxt}（資料庫沒有，需人工處理）")
+        if note:
+            cur.append(f"      📝 {note}")
+    ok = [r for r in rows if r["status"] == "ok"]
+    ask = [r for r in rows if r["status"] == "choose"]
+    miss = [r for r in rows if r["status"] == "missing"]
+    tail = []
+    if order.get("notes"):
+        tail += ["📌 備註"] + [f"• {n}" for n in order["notes"]] + [""]
+    tail += [f"✅ {len(ok)} 項（共 {sum(r['qty'] for r in ok)} 本／份）　❓ {len(ask)} 項　❌ {len(miss)} 項",
+             "", "修改：「3改25」「5刪掉」「6選2」",
+             "確認後會把 ✅ 的寫進「補習班訂單」；❌ 的不會寫入，要自己另外處理。",
+             "全部正確請回覆「確認」，不要了請回覆「取消」。"]
+
+    limit = 4500
+    messages, buf = [], "\n".join(head)
+    for b in blocks:
+        text = "\n".join(b)
+        if len(buf) + 2 + len(text) > limit:
+            messages.append(buf)
+            buf = text
+        else:
+            buf += "\n\n" + text
+    tail_text = "\n".join(tail)
+    if len(buf) + 2 + len(tail_text) > limit:
+        messages.append(buf)
+        buf = tail_text
+    else:
+        buf += "\n\n" + tail_text
+    messages.append(buf)
+    if len(messages) > 5:     # LINE 一次最多 5 則
+        messages = messages[:4] + ["⚠️ 清單太長，後面的項目沒辦法一次顯示；請把訊息分成兩段傳。\n\n" + tail_text]
+    return messages if len(messages) > 1 else messages[0]
+
+
+def _v81_with_prefix(prefix, conf):
+    """在確認畫面前面加一行「✅ 已修改…」。"""
+    if isinstance(conf, list):
+        return [conf[0].replace("👑 LeBron James 幫你把整段訂單整理好了\n\n", "👑 LeBron James 幫你把整段訂單整理好了\n\n" + prefix + "\n\n", 1)] + conf[1:]
+    return conf.replace("👑 LeBron James 幫你把整段訂單整理好了\n\n", "👑 LeBron James 幫你把整段訂單整理好了\n\n" + prefix + "\n\n", 1)
+
+
+def _v81_resolve_cram_school(text):
+    clean = re.sub(r"^(?:補習班(?:是|為|:|：)?)", "", re.sub(r"[\s，,。.!！?？]+", "", str(text or "")))
+    if not clean or len(clean) > 20:
+        return ""
+    catalog = get_cram_school_catalog()
+    if clean in catalog:
+        return clean
+    for name in catalog:
+        if name.startswith(clean) or clean.startswith(name):
+            return name
+    return clean   # 名單裡沒有：照打的名字（Apps Script 會自動加進補習班名單）
+
+
+def _v81_start_bulk(user_id, raw_text):
+    if not OPENAI_API_KEY:
+        return "📋 這看起來是一整段訂單，但整理整段訂單需要 AI 功能（OPENAI_API_KEY 還沒設定）。"
+    data = _v81_extract_bulk(raw_text)
+    if not isinstance(data, dict) or not data.get("items"):
+        return (
+            "⚠️ 這段訂單我這次沒有整理成功。\n\n"
+            "可以再傳一次；如果還是不行，請分成幾段傳，或改用「補習班訂書」一本一本登記。"
+        )
+    books = _v81_load_books()
+    if books is None:
+        return (
+            "⚠️ 讀不到書籍資料，這段訂單先沒辦法整理。\n\n"
+            "如果 Apps Script 還沒加上 list_books 功能，請先更新 Apps Script。"
+        )
+    rows = _v81_build_rows(data, books)
+    if not rows:
+        return "⚠️ 這段訊息裡我沒有找到要訂的書。"
+    clear_task_states_for_new_mode(user_id)
+    pending_photo_orders.pop(user_id, None)
+    guided_mode.pop(user_id, None)
+    cram = str(data.get("cram_school", "") or "").strip()
+    order = {
+        "cram_school": _v81_resolve_cram_school(cram) if cram else "",
+        "rows": rows,
+        "notes": [str(n).strip() for n in (data.get("notes") or []) if str(n).strip()],
+        "created_at": time.time(),
+    }
+    pending_bulk_orders[user_id] = order
+    return _v81_confirmation(order)
+
+
+def _v81_find_row(order, no):
+    for r in order["rows"]:
+        if r["no"] == no and not r["removed"]:
+            return r
+    return None
+
+
+def _v81_handle_pending(user_id, text):
+    order = pending_bulk_orders.get(user_id)
+    if not order:
+        return None
+    clean = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
+
+    if clean in {"取消", "不要了", "這筆不要", "取消訂單", "全部取消"}:
+        pending_bulk_orders.pop(user_id, None)
+        return "❌ 已取消這份補習班訂單整理，Google 沒有寫入。"
+
+    if _is_confirm_word(clean):
+        return _v81_confirm(user_id, order)
+
+    m = re.fullmatch(r"第?(\d{1,3})(?:項)?(?:改成|改為|改|要)(\d{1,4})(?:本|份|冊|套)?", clean)
+    if m:
+        r = _v81_find_row(order, int(m.group(1)))
+        if not r:
+            return f"⚠️ 清單裡沒有第 {m.group(1)} 項。"
+        if int(m.group(2)) <= 0:
+            return "⚠️ 數量要大於 0；整項不要請說「" + m.group(1) + "刪掉」。"
+        r["qty"] = int(m.group(2))
+        return _v81_with_prefix(f"✅ 第 {r['no']} 項改成 {r['qty']}。", _v81_confirmation(order))
+
+    m = re.fullmatch(r"(?:刪除?|刪掉|拿掉|移除)?第?(\d{1,3})(?:項)?(?:刪掉|刪除|不要了|不要|拿掉|移除|取消)?", clean)
+    if m and clean != m.group(1) and not clean.isdigit():
+        r = _v81_find_row(order, int(m.group(1)))
+        if not r:
+            return f"⚠️ 清單裡沒有第 {m.group(1)} 項。"
+        r["removed"] = True
+        return _v81_with_prefix(f"✅ 已刪除第 {r['no']} 項。", _v81_confirmation(order))
+
+    m = re.fullmatch(r"第?(\d{1,3})(?:項)?選(?:第)?(\d{1,2})", clean)
+    if m:
+        r = _v81_find_row(order, int(m.group(1)))
+        if not r:
+            return f"⚠️ 清單裡沒有第 {m.group(1)} 項。"
+        if r["status"] != "choose":
+            return f"⚠️ 第 {r['no']} 項不用選。"
+        k = int(m.group(2))
+        if not (1 <= k <= len(r["choices"])):
+            return f"⚠️ 第 {r['no']} 項請選 1～{len(r['choices'])}。"
+        c = r["choices"][k - 1]
+        r.update(status="ok", book=c["book"], book_publisher=c["publisher"])
+        return _v81_with_prefix(f"✅ 第 {r['no']} 項選定：[{c['publisher']}] {c['book']}", _v81_confirmation(order))
+
+    m = re.fullmatch(r"補習班(?:是|為|:|：)(.+)", clean)
+    if m:
+        name = _v81_resolve_cram_school(m.group(1))
+        if name:
+            order["cram_school"] = name
+            return _v81_with_prefix(f"✅ 補習班：{name}", _v81_confirmation(order))
+    if not order.get("cram_school") and re.fullmatch(r"[一-鿿A-Za-z]{2,15}", clean):
+        # 還沒指定補習班時，只接受「看起來就是補習班」的回覆，
+        # 避免把「查老師」這類指令當成補習班名稱。
+        catalog = get_cram_school_catalog()
+        in_catalog = any(n == clean or n.startswith(clean) or clean.startswith(n) for n in catalog)
+        looks_like = re.search(r"(補習班|文理|美語|學苑|書院|學院|教育|數理|英語|數學|理化|家教|安親)$", clean)
+        if in_catalog or looks_like:
+            name = _v81_resolve_cram_school(clean)
+            order["cram_school"] = name
+            return _v81_with_prefix(f"✅ 補習班：{name}", _v81_confirmation(order))
+    return None
+
+
+def _v81_confirm(user_id, order):
+    rows = [r for r in order["rows"] if not r["removed"]]
+    if not order.get("cram_school"):
+        return "⚠️ 還不知道是哪一間補習班，請回覆補習班名稱（新的補習班請打「補習班是XXX」）。"
+    ask = [str(r["no"]) for r in rows if r["status"] == "choose"]
+    if ask:
+        return f"⚠️ 第 {'、'.join(ask)} 項還沒選書，請回覆例如「{ask[0]}選1」，不要的話說「{ask[0]}刪掉」。"
+    ok = [r for r in rows if r["status"] == "ok" and r["qty"] > 0]
+    miss = [r for r in rows if r["status"] == "missing"]
+    if not ok:
+        return "⚠️ 清單裡沒有資料庫對得到的書，沒有東西可以寫入。"
+    draft = {"cram_school": order["cram_school"],
+             "items": [{"publisher": r["book_publisher"], "book": r["book"], "quantity": r["qty"]} for r in ok]}
+    success, order_number = write_cram_order_to_google(draft)
+    if not success:
+        return "❌ 補習班訂單寫入失敗，請稍後再試。清單還保留著，可以再回覆「確認」。"
+    pending_bulk_orders.pop(user_id, None)
+    pending_receipt_offers[user_id] = {
+        "kind": "cram", "order_number": order_number, "cram_school": order["cram_school"],
+        "items": draft["items"], "created_at": time.time(),
+    }
+    lines = ["✅ 補習班訂單已確認", "", f"訂單編號：{order_number}", f"補習班：{order['cram_school']}",
+             f"寫入 {len(ok)} 項，共 {sum(r['qty'] for r in ok)} 本／份"]
+    floors = {}
+    for r in ok:
+        floors.setdefault(r["floor"] or "未寫樓層", []).append(r)
+    if len(floors) > 1 or "未寫樓層" not in floors:
+        lines += ["", "📦 送貨樓層"]
+        for fl, lst in floors.items():
+            lines.append(f"• {fl}：{len(lst)} 項 {sum(r['qty'] for r in lst)} 本／份")
+    if miss:
+        lines += ["", "⚠️ 以下沒有寫入，需要人工處理："]
+        lines += [f"• {_v81_describe_raw(r)}｜{r['qty']}" + (f"（{r['note']}）" if r["note"] else "") for r in miss]
+    return ["\n".join(lines),
+            "需要幫你生成一份訂購單 PDF，讓你可以存下來 email 給補習班或出版社嗎？\n"
+            "回覆「要」或「好」即可，40 秒內沒有回覆就會自動取消這個提問。"]
+
+
+def _v81_route_bulk(user_id, raw_text):
+    """_route_message 最前面呼叫：有待確認的整段訂單就先處理指令；新的整段訂單就開始整理。"""
+    if user_id in pending_bulk_orders:
+        reply = _v81_handle_pending(user_id, raw_text)
+        if reply is not None:
+            return reply
+        if not _v81_is_bulk_text(raw_text):
+            # 清單還沒確認時不讓其他功能接手——不然之後別的流程打「確認」，
+            # 會被當成確認這份補習班訂單（跟拍照訂單待確認時的做法一樣）。
+            order = pending_bulk_orders[user_id]
+            n = len([r for r in order["rows"] if not r["removed"]])
+            return (
+                f"📋 你還有一份補習班訂單清單（{n} 項）還沒確認。\n\n"
+                "• 要修改：「3改25」「5刪掉」「6選2」\n"
+                "• 要寫入：回覆「確認」\n"
+                "• 不要了：回覆「取消」\n"
+                "• 先去做別的事：回覆「主選單」（這份清單會被放棄）"
+            )
+    if _v81_is_bulk_text(raw_text):
+        return _v81_start_bulk(user_id, raw_text)
+    return None
+
+
+_V81_ORDER_FAIL_MARKERS = ("找不到符合", "找不到這位老師", "查不到", "無法確認", "請重新輸入正確的老師", "資料庫目前找不到")
+
+
+def _v81_ai_rescue_failed_order(user_id, text, order_reply):
+    """#17：一般訂書規則抓錯（例如老師名變成「習作給侯」）時，讓 AI 讀一次整句。"""
+    if not OPENAI_API_KEY:
+        return None
+    body = "\n".join(order_reply) if isinstance(order_reply, (list, tuple)) else str(order_reply or "")
+    if not any(m in body for m in _V81_ORDER_FAIL_MARKERS):
+        return None
+    compact = re.sub(r"\s+", "", str(text or ""))
+    if len(compact) < 8 or compact in CONFIRM_WORDS or compact in EXIT_WORDS:
+        return None          # 短回答（例如只打老師名字）照舊，不多等一次 AI
+    had_photo = user_id in pending_photo_orders
+    reply = handle_smart_order_fallback(user_id, text)
+    if reply is None or had_photo or user_id not in pending_photo_orders:
+        return None
+    # AI 讀懂了：清掉剛剛規則層留下的半套訂書狀態，避免兩邊打架
+    order_flow_context.pop(user_id, None)
+    pending_name_confirmations.pop(user_id, None)
+    pending_orders.pop(user_id, None)
+    if guided_mode.get(user_id) == "order_flow":
+        guided_mode.pop(user_id, None)
+    return reply
+
+
 if __name__ == "__main__":
     # 注意：正式環境（Render）是透過 gunicorn 啟動 Start Command，
     # 不會執行到這裡；這裡只有本機用 `python app.py` 測試時會用到。
@@ -12351,866 +13111,3 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-
-# -*- coding: utf-8 -*-
-"""
-=============================================================
-大漢訂書小幫手 — 真實資料庫 + 速度測試
-版本：2026-09-24 real-db-speed-v7
-=============================================================
-
-用途
-1. 真的連到目前 Google Apps Script Web App（只做讀取，不建立正式訂單）
-2. 用目前三校真實老師資料驗證：
-   - 天母國中
-   - 衛理女中
-   - 華興中學
-3. 測試版本查詢、結構化多書搜尋、真實書名
-4. 測試完整對話到「確認前」，不寫入正式訂單
-5. 記錄每個 Google action 次數、耗時、整段對話耗時
-
-安全設計
-- 不呼叫 create_order / update_order / cancel_order / create_other_order /
-  update_other_order / create_cram_order / set_order_note。
-- 如果程式意外準備呼叫任何寫入 action，本測試會直接攔截並報錯。
-- 不需要 LINE token。
-- 不啟用 OpenAI API，避免測試產生成本或被 AI fallback 干擾。
-
-執行方式：
-    python test_dahan_real_db_speed_v7.py app_v79_最後穩定版.py
-
-如果本機沒有 GOOGLE_SCRIPT_URL，執行後會請你貼上 Apps Script Web App URL。
-=============================================================
-"""
-
-import os
-import re
-import sys
-import time
-import json
-import math
-import tempfile
-import statistics
-import importlib.util
-from collections import defaultdict
-
-APP_PATH = sys.argv[1] if len(sys.argv) > 1 else "app_v71_批次數量原子修正版.py"
-
-# ----------------------------------------------------------------------
-# 連線設定
-# ----------------------------------------------------------------------
-gas_url = os.environ.get("GOOGLE_SCRIPT_URL", "").strip()
-if not gas_url:
-    print("請貼上目前 Google Apps Script Web App URL（最後通常是 /exec）：")
-    gas_url = input("> ").strip()
-
-if not gas_url:
-    print("❌ 沒有 GOOGLE_SCRIPT_URL，無法做真實資料庫測試。")
-    sys.exit(2)
-
-os.environ["GOOGLE_SCRIPT_URL"] = gas_url
-os.environ["AI_AGENT_ENABLED"] = "false"
-os.environ.pop("OPENAI_API_KEY", None)
-
-state_path = os.path.join(
-    tempfile.gettempdir(),
-    f"dahan_real_db_speed_{os.getpid()}.sqlite3"
-)
-try:
-    if os.path.exists(state_path):
-        os.remove(state_path)
-except Exception:
-    pass
-os.environ["ORDER_STATE_DB_PATH"] = state_path
-
-if not os.path.exists(APP_PATH):
-    print(f"❌ 找不到 APP：{APP_PATH}")
-    sys.exit(2)
-
-spec = importlib.util.spec_from_file_location("dahan_live_app", APP_PATH)
-mod = importlib.util.module_from_spec(spec)
-sys.modules["dahan_live_app"] = mod
-spec.loader.exec_module(mod)
-
-print(f"測試對象：{APP_PATH}")
-print(f"程式版本：{getattr(mod, 'APP_VERSION', 'unknown')}")
-print("測試模式：真實 Google 資料庫（唯讀）＋速度分析 v7（含 v79 姓名級備援／多書單次 fallback 驗證）")
-print("=" * 72)
-
-# ----------------------------------------------------------------------
-# 真實資料 fixture
-# 來源：三校老師班級資料 115學年度第1學期版
-# ----------------------------------------------------------------------
-REAL_TEACHERS = [
-    {
-        "school": "華興中學",
-        "teacher": "陳映汝",
-        "classes": {
-            "國三甲", "國三乙", "國三丙", "國三丁",
-            "國三戊", "國三己", "國三庚", "高三乙",
-        },
-        "subject_aliases": {"地球科學", "地科"},
-    },
-    {
-        "school": "華興中學",
-        "teacher": "張建國",
-        "classes": {
-            "國一甲", "國一丁", "國一戊", "國一己", "國一庚",
-            "國三甲", "國三乙", "國三丙", "國三丁",
-            "國三戊", "國三己", "國三庚",
-        },
-        "subject_aliases": {"生物"},
-    },
-    {
-        "school": "華興中學",
-        "teacher": "廖惠萱",
-        "classes": {"國二丁", "國二戊", "國三丙"},
-        "subject_aliases": {"英文", "英語"},
-    },
-    {
-        "school": "衛理女中",
-        "teacher": "謝明清",
-        "classes": {
-            "八信", "八德", "八恩", "八愛", "八慧", "八望", "八義",
-            "高二恩", "高二愛", "高二望",
-        },
-        "subject_aliases": {"地理"},
-    },
-    {
-        "school": "天母國中",
-        "teacher": "黃鈺琁",
-        # 真實資料中共 14 筆；這裡不硬寫全部班名，避免人事調整後
-        # 因一班異動讓整份速度測試完全失效。
-        "min_class_count": 10,
-        "subject_aliases": {"公民"},
-    },
-]
-
-# 真實書籍資料中已確認存在的案例
-REAL_BOOK_CASES = [
-    ("段考王英文5", "南一"),
-    ("新挑戰測驗卷自然5", "漢華"),
-    ("麻吉測驗卷自然5-康", "明霖"),
-    ("雙向溝通測驗卷自然5-康", "金安"),
-]
-
-WRITE_ACTIONS = {
-    "create_order", "update_order", "cancel_order", "set_order_note",
-    "create_other_order", "update_other_order", "create_cram_order",
-}
-
-# ----------------------------------------------------------------------
-# 統計器
-# ----------------------------------------------------------------------
-checks = 0
-fails = []
-warns = []
-action_timings = defaultdict(list)   # 真正 HTTP 傳輸時間；cache hit 記 0
-logical_timings = defaultdict(list)  # 包含 Python 包裝/解析時間，僅供異常診斷
-action_counts = defaultdict(int)
-current_case = ""
-
-# v3：直接量 requests.Session.post 的實際 HTTP 等待時間。
-# v2 只包住整個 google_post()，曾遇到 GAS log 顯示 5 秒、外層卻顯示 164 秒的
-# Windows/程序排程異常。這裡把「網路等待」和「外層包裝時間」拆開，避免速度表失真。
-_real_http_post = mod.HTTP.post
-_http_call_seq = 0
-
-def monitored_http_post(*args, **kwargs):
-    global _http_call_seq
-    payload = kwargs.get("json") or {}
-    action = str(payload.get("action", "") or "")
-    t0 = time.perf_counter()
-    try:
-        return _real_http_post(*args, **kwargs)
-    finally:
-        dt = time.perf_counter() - t0
-        _http_call_seq += 1
-        action_timings[action].append(dt)
-
-mod.HTTP.post = monitored_http_post
-
-def ok(msg):
-    global checks
-    checks += 1
-    print(f"[ OK ] {msg}")
-
-def fail(msg, detail=""):
-    global checks
-    checks += 1
-    full = msg if not detail else f"{msg} — {detail}"
-    fails.append(full)
-    print(f"[FAIL] {msg}")
-    if detail:
-        print(f"       {detail}")
-
-def warn(msg):
-    warns.append(msg)
-    print(f"[WARN] {msg}")
-
-def check(cond, msg, detail=""):
-    if cond:
-        ok(msg)
-    else:
-        fail(msg, detail)
-
-def normalize_class(s):
-    return re.sub(r"\s+|班$", "", str(s or "").strip())
-
-def class_names_from_match(item):
-    out = set()
-    for c in item.get("classes", []) or []:
-        out.add(normalize_class(c.get("class_name", "")))
-    return {x for x in out if x}
-
-def flatten_subjects(item):
-    values = set()
-    for s in item.get("subjects", []) or []:
-        values.add(str(s or "").strip())
-    for c in item.get("classes", []) or []:
-        for s in c.get("subjects", []) or []:
-            values.add(str(s or "").strip())
-    return {x for x in values if x}
-
-# ----------------------------------------------------------------------
-# 攔截寫入 + 記錄 Google action 速度
-# ----------------------------------------------------------------------
-_real_google_post = mod.google_post
-
-def monitored_google_post(payload, timeout=10, retries=1, ignore_budget=False):
-    action = str((payload or {}).get("action", "") or "")
-    if action in WRITE_ACTIONS:
-        raise RuntimeError(
-            f"安全攔截：真實資料測試禁止寫入 action={action}"
-        )
-    before_http = len(action_timings.get(action, []))
-    t0 = time.perf_counter()
-    try:
-        return _real_google_post(
-            payload,
-            timeout=timeout,
-            retries=retries,
-            ignore_budget=ignore_budget,
-        )
-    finally:
-        dt = time.perf_counter() - t0
-        action_counts[action] += 1
-        logical_timings[action].append(dt)
-        # 如果沒有真的送 HTTP，代表命中 Python 本地 cache；速度表記 0 秒。
-        if len(action_timings.get(action, [])) == before_http:
-            action_timings[action].append(0.0)
-
-mod.google_post = monitored_google_post
-
-# ----------------------------------------------------------------------
-# 小工具：直接 action 測試
-# ----------------------------------------------------------------------
-def live_post(payload, label):
-    global current_case
-    current_case = label
-    action = str((payload or {}).get("action", "") or "")
-    before = len(action_timings.get(action, []))
-    try:
-        result = monitored_google_post(payload, timeout=12, retries=1, ignore_budget=True)
-    except Exception as e:
-        fail(label, f"{type(e).__name__}: {e}")
-        result = None
-    new_times = action_timings.get(action, [])[before:]
-    # 一個 logical call 可能因重試送出多個 HTTP；實際等待時間取總和。
-    dt = sum(new_times) if new_times else 0.0
-    return result, dt
-
-def speed_label(seconds, kind="query"):
-    if kind == "local":
-        if seconds < 0.5: return "FAST"
-        if seconds < 1.0: return "OK"
-        return "SLOW"
-    if kind == "multi":
-        if seconds < 3.0: return "FAST"
-        if seconds < 4.5: return "OK"
-        if seconds < 6.0: return "SLOW"
-        return "VERY SLOW"
-    # 一般 Google 查詢
-    if seconds < 2.0: return "FAST"
-    if seconds < 3.0: return "OK"
-    if seconds < 6.0: return "SLOW"
-    return "VERY SLOW"
-
-def print_speed(label, seconds, kind="query"):
-    print(f"       ⏱ {seconds:.3f}s  [{speed_label(seconds, kind)}]  {label}")
-
-# ----------------------------------------------------------------------
-# 0. 預熱 phase：只暖索引，不列入正確性 FAIL
-# ----------------------------------------------------------------------
-print("\n【0. GAS / 索引預熱】")
-
-PREWARM_CASES = [
-    ({"action": "ping"}, "ping"),
-    ({"action": "lookup_teacher_matches", "teacher": "陳映汝", "school": "華興中學"}, "老師索引"),
-    ({"action": "lookup_fuzzy_candidates", "kind": "book", "query": "段考王英文5", "publisher": "南一"}, "書籍索引"),
-    ({"action": "lookup_versions", "school": "華興中學", "grade": "九年級", "subject": "自然", "academic_period": ""}, "版本索引"),
-    ({"action": "lookup_multi_book_candidates", "subject": "自然", "volume": "5", "category": "卷類", "applicable_version": "康軒", "publisher": "", "limit": 30}, "多書索引"),
-]
-
-for payload, label in PREWARM_CASES:
-    r, dt = live_post(payload, "預熱 " + label)
-    state = "成功" if (isinstance(r, dict) and r.get("success")) else "未成功"
-    print(f"       {label}: {dt:.3f}s / {state}")
-    if not (isinstance(r, dict) and r.get("success")):
-        warn(f"預熱 {label} 未成功；正式測試仍會繼續，避免把冷啟動直接當功能錯誤")
-
-# ----------------------------------------------------------------------
-# 0.5 v78 stale fallback：成功資料寫入 SQLite 後，模擬 Google 斷線，
-# 應直接取最近一次成功結果，不讓使用者只因 Apps Script 抖動就看到查無資料。
-# ----------------------------------------------------------------------
-print("\n【0.5. v79 Google 失敗／姓名級老師空結果自動備援】")
-if hasattr(mod, "_load_google_stale_cache") and hasattr(mod, "_store_google_stale_cache"):
-    fallback_payload = {
-        "action": "lookup_fuzzy_candidates",
-        "kind": "book",
-        "query": "段考王英文5",
-        "publisher": "南一",
-    }
-    # 先用正常 Google 確保這個 key 有最近成功資料。若預熱已命中本地 cache，
-    # 仍可由 v77 的 persistent stale store 讀取。
-    seed = mod.google_post(fallback_payload, timeout=12, retries=1, ignore_budget=True)
-    if isinstance(seed, dict) and seed.get("success"):
-        mod._google_read_cache.clear()
-        saved_post = mod.HTTP.post
-        def _forced_google_down(*args, **kwargs):
-            raise RuntimeError("v79 fallback test: simulated Google outage")
-        mod.HTTP.post = _forced_google_down
-        try:
-            fb = mod.google_post(fallback_payload, timeout=0.2, retries=1, ignore_budget=True)
-        finally:
-            mod.HTTP.post = saved_post
-        check(
-            isinstance(fb, dict) and fb.get("success") and fb.get("_stale_fallback") is True,
-            "Google 失敗時可使用最近一次成功資料備援",
-            detail=f"回傳={fb}" if not (isinstance(fb, dict) and fb.get("_stale_fallback") is True) else ""
-        )
-    else:
-        warn("v78 stale fallback 種子查詢未成功，本輪無法做斷線備援模擬；不直接判功能 FAIL")
-else:
-    fail("APP 應提供 v78 persistent stale fallback")
-
-# v78 專屬：HTTP 200 / success:true 但老師 matches=[] 時，
-# 若同一查詢已有最近一次成功資料，必須回退舊資料，而不是把空陣列當成真的查無老師。
-if hasattr(mod, "_store_google_stale_cache"):
-    teacher_payload = {
-        "action": "lookup_teacher_matches",
-        "teacher": "廖惠萱",
-        "school": "華興中學",
-        "grade": "",
-        "subject": "",
-    }
-    teacher_key = mod._cache_key(teacher_payload)
-    teacher_seed = {
-        "success": True,
-        "matches": [{
-            "school": "華興中學",
-            "teacher": "廖惠萱",
-            "subjects": ["英文"],
-            "classes": [{"class_name": "國二丁", "students": 40, "subjects": ["英文"]}],
-        }],
-    }
-    mod._store_google_stale_cache("lookup_teacher_matches", teacher_key, teacher_seed)
-    mod._google_read_cache.clear()
-
-    class _FakeEmptyTeacherResponse:
-        status_code = 200
-        def json(self):
-            return {"success": True, "matches": []}
-
-    saved_post = mod.HTTP.post
-    mod.HTTP.post = lambda *args, **kwargs: _FakeEmptyTeacherResponse()
-    try:
-        empty_fb = mod.google_post(teacher_payload, timeout=0.2, retries=1, ignore_budget=True)
-    finally:
-        mod.HTTP.post = saved_post
-
-    check(
-        isinstance(empty_fb, dict)
-        and empty_fb.get("_stale_fallback") is True
-        and bool(empty_fb.get("matches")),
-        "老師成功回空陣列時會使用最近一次成功資料備援",
-        detail=f"回傳={empty_fb}" if not (isinstance(empty_fb, dict) and empty_fb.get("matches")) else ""
-    )
-
-    # v79 專屬：exact payload 從未成功過，但同一老師姓名之前在別的 payload
-    # 成功查過，仍要能用姓名級備援救回來。這就是 v78 謝明清真實案例的缺口。
-    if hasattr(mod, "_store_teacher_name_fallback") and hasattr(mod, "_load_teacher_name_fallback"):
-        seed_payload = {
-            "action": "lookup_teacher_matches",
-            "teacher": "謝明清",
-            "school": "",
-            "grade": "",
-            "subject": "",
-        }
-        seed_data = {
-            "success": True,
-            "matches": [{
-                "school": "衛理女中",
-                "teacher": "謝明清",
-                "subjects": ["地理"],
-                "classes": [{"class_name": "八信", "students": 40, "subjects": ["地理"]}],
-            }],
-        }
-        mod._store_teacher_name_fallback(seed_payload, seed_data)
-        never_seen_exact_payload = {
-            "action": "lookup_teacher_matches",
-            "teacher": "謝明清老師",
-            "school": "衛理女中",
-            "grade": "八年級",
-            "subject": "地理",
-        }
-        mod._google_read_cache.clear()
-        saved_post2 = mod.HTTP.post
-        mod.HTTP.post = lambda *args, **kwargs: _FakeEmptyTeacherResponse()
-        try:
-            name_fb = mod.google_post(never_seen_exact_payload, timeout=0.2, retries=1, ignore_budget=True)
-        finally:
-            mod.HTTP.post = saved_post2
-        check(
-            isinstance(name_fb, dict) and bool(name_fb.get("matches")),
-            "老師 exact key 首次回空時可用姓名級備援",
-            detail=f"回傳={name_fb}" if not (isinstance(name_fb, dict) and name_fb.get("matches")) else ""
-        )
-    else:
-        fail("APP 應提供 v79 老師姓名級備援")
-
-# v79 專屬：結構化多書搜尋失敗後最多只允許 1 次 fuzzy fallback。
-if hasattr(mod, "_collect_multi_book_matches"):
-    saved_structured = mod._lookup_multi_book_candidates_structured
-    saved_fuzzy = mod.lookup_fuzzy_candidates
-    fuzzy_calls = []
-    mod._lookup_multi_book_candidates_structured = lambda *a, **k: None
-    def _count_one_fuzzy(kind, query, publisher="", school=""):
-        fuzzy_calls.append((kind, query, publisher, school))
-        return []
-    mod.lookup_fuzzy_candidates = _count_one_fuzzy
-    try:
-        mod._collect_multi_book_matches("歷史5測驗卷", "", target_count=4, required_version="康軒")
-    finally:
-        mod._lookup_multi_book_candidates_structured = saved_structured
-        mod.lookup_fuzzy_candidates = saved_fuzzy
-    check(
-        len(fuzzy_calls) <= 1,
-        "多書結構化失敗後最多只打一次 fuzzy fallback",
-        detail=f"實際 fuzzy 次數={len(fuzzy_calls)} calls={fuzzy_calls}"
-    )
-else:
-    fail("APP 應提供多書候選收集函式")
-
-# 預熱與 fallback 測試時間不混入正式速度平均，正式表只看使用體感。
-action_timings.clear()
-logical_timings.clear()
-action_counts.clear()
-
-# v76/v77 本地保險絲：先確認三個社會科目一定會被轉成「社會」。
-if hasattr(mod, "_version_lookup_subject"):
-    check(mod._version_lookup_subject("歷史") == "社會", "歷史版本查詢統一轉社會")
-    check(mod._version_lookup_subject("地理") == "社會", "地理版本查詢統一轉社會")
-    check(mod._version_lookup_subject("公民") == "社會", "公民版本查詢統一轉社會")
-else:
-    fail("APP 應提供 _version_lookup_subject 統一版本科目入口")
-
-# ----------------------------------------------------------------------
-# 1. 基礎連線
-# ----------------------------------------------------------------------
-print("\n【1. Google Apps Script 連線】")
-
-r, dt = live_post({"action": "ping"}, "GAS ping")
-if r and r.get("success"):
-    ok("GAS ping 成功")
-    print(f"       GAS version: {r.get('version','')}")
-else:
-    # ping 只反映 Apps Script 冷啟動/Google 邊緣節點狀態，不代表正式功能壞掉。
-    # v3 改成警告，不再讓單次 ping timeout 把整份正確性測試判 FAIL。
-    warn(f"GAS ping 未成功（可能是冷啟動）：回傳={r}")
-print_speed("ping", dt)
-
-# ----------------------------------------------------------------------
-# 2. 真實老師資料
-# ----------------------------------------------------------------------
-print("\n【2. 真實老師資料】")
-
-for case in REAL_TEACHERS:
-    payload = {
-        "action": "lookup_teacher_matches",
-        "teacher": case["teacher"],
-        "school": case["school"],
-    }
-    r, dt = live_post(payload, f"查老師 {case['school']} / {case['teacher']}")
-    print_speed(f"{case['teacher']}老師", dt)
-
-    matches = (r or {}).get("matches", []) if isinstance(r, dict) else []
-    if not matches and isinstance(r, dict):
-        # 相容部分舊 GAS 回傳欄位
-        matches = r.get("teachers", []) or r.get("results", []) or []
-
-    if not (r and r.get("success")):
-        warn(f"{case['teacher']} 正式查詢未成功（預熱後仍可能是 Google 邊緣節點抖動）：回傳={r}")
-        continue
-    ok(f"{case['teacher']} 查詢成功")
-    if not matches:
-        fail(f"{case['teacher']} 有資料", "成功回傳但 matches 為空")
-        continue
-
-    item = next(
-        (
-            x for x in matches
-            if str(x.get("teacher", "")).strip() == case["teacher"]
-            and str(x.get("school", "")).strip() == case["school"]
-        ),
-        matches[0],
-    )
-    check(
-        str(item.get("school", "")).strip() == case["school"],
-        f"{case['teacher']} 學校正確",
-        f"實際={item.get('school')}",
-    )
-
-    got_classes = class_names_from_match(item)
-    if case.get("classes"):
-        expected = {normalize_class(x) for x in case["classes"]}
-        missing = sorted(expected - got_classes)
-        extra = sorted(got_classes - expected)
-        check(
-            not missing,
-            f"{case['teacher']} 真實班級至少包含預期班級",
-            f"缺少={missing}；多出={extra[:8]}",
-        )
-    else:
-        check(
-            len(got_classes) >= int(case.get("min_class_count", 1)),
-            f"{case['teacher']} 班級數合理",
-            f"實際班級數={len(got_classes)}",
-        )
-
-# ----------------------------------------------------------------------
-# 3. 真實書籍查詢
-# ----------------------------------------------------------------------
-print("\n【3. 真實書籍資料】")
-
-for book, publisher in REAL_BOOK_CASES:
-    r, dt = live_post(
-        {
-            "action": "lookup_fuzzy_candidates",
-            "kind": "book",
-            "query": book,
-            "publisher": publisher,
-        },
-        f"查書 {publisher} / {book}",
-    )
-    print_speed(book, dt)
-    candidates = (r or {}).get("candidates", []) if isinstance(r, dict) else []
-    hit = any(
-        str(x.get("value", "")).strip() == book
-        and str(x.get("publisher", "")).strip() == publisher
-        for x in candidates
-    )
-    if not (r and r.get("success")):
-        warn(f"{book} 正式查詢未成功（Google 冷啟動/節點抖動）：回傳={r}")
-        continue
-    ok(f"{book} 查詢成功")
-    check(hit, f"{book}｜{publisher} 能在真實書籍資料命中",
-          f"前幾筆={candidates[:5]}")
-
-# ----------------------------------------------------------------------
-# 4. 真實版本查詢
-# 不硬寫出版版本值，因學校版本資料會更新；
-# 這裡確認「目前資料庫能查到」並把結果列出。
-# ----------------------------------------------------------------------
-print("\n【4. 真實教科書版本】")
-
-VERSION_CASES = [
-    ("華興中學", "九年級", "自然"),
-    ("華興中學", "九年級", "社會"),
-    ("衛理女中", "八年級", "社會"),
-    ("天母國中", "八年級", "社會"),
-]
-
-version_results = {}
-
-for school, grade, subject in VERSION_CASES:
-    r, dt = live_post(
-        {
-            "action": "lookup_versions",
-            "school": school,
-            "grade": grade,
-            "subject": subject,
-            "academic_period": "",
-        },
-        f"版本 {school}/{grade}/{subject}",
-    )
-    print_speed(f"{school} {grade} {subject}", dt)
-    versions = (r or {}).get("versions", []) if isinstance(r, dict) else []
-    if not (r and r.get("success")):
-        warn(f"{school}{grade}{subject}版本查詢未成功（Google 冷啟動/節點抖動）：回傳={r}")
-        continue
-    ok(f"{school}{grade}{subject}版本查詢成功")
-    if versions:
-        ok(f"{school}{grade}{subject}有版本資料")
-        print("       目前版本：" + "、".join(
-            sorted({str(v.get("version", "") or "") for v in versions if v.get("version")})
-        ))
-        version_results[(school, grade, subject)] = versions
-    else:
-        warn(f"{school}{grade}{subject}目前查無版本資料（不直接判程式 FAIL）")
-
-# ----------------------------------------------------------------------
-# 5. 真實結構化多書搜尋
-# 以華興九年級自然目前版本為準，檢查卷類。
-# ----------------------------------------------------------------------
-print("\n【5. 真實多書結構化搜尋】")
-
-current_version = ""
-for v in version_results.get(("華興中學", "九年級", "自然"), []):
-    candidate = str(v.get("version", "") or "").strip()
-    if candidate:
-        current_version = candidate
-        break
-
-if not current_version:
-    warn("華興九年級自然查不到版本，跳過該版本的多書精準驗證。")
-else:
-    r, dt = live_post(
-        {
-            "action": "lookup_multi_book_candidates",
-            # v2：完全比照正式 app 的 payload，避免測試工具自己送錯欄位，
-            # 造成「GAS 看起來回了 30 本無關書」的假失敗。
-            "subject": "自然",
-            "volume": "5",
-            "category": "卷類",
-            "applicable_version": current_version,
-            "publisher": "",
-            "limit": 30,
-        },
-        f"多書 自然5 / {current_version}",
-    )
-    print_speed(f"自然5卷類 {current_version}", dt, "multi")
-    candidates = (r or {}).get("candidates", []) if isinstance(r, dict) else []
-    check(bool(r and r.get("success")), "多書結構化搜尋成功", f"回傳={r}")
-    check(bool(candidates), "多書結構化搜尋至少有候選", f"回傳={r}")
-
-    print(f"       找到 {len(candidates)} 種：")
-    for i, x in enumerate(candidates[:20], 1):
-        print(
-            f"       {i:>2}. [{x.get('publisher','')}] "
-            f"{x.get('value','')} "
-            f"(適用:{x.get('applicable_version','') or x.get('required_version','')})"
-        )
-
-    # 康軒版本時，依今天實際確認的資料至少應看到這 3 種。
-    if current_version == "康軒":
-        expected = {
-            ("漢華", "新挑戰測驗卷自然5"),
-            ("明霖", "麻吉測驗卷自然5-康"),
-            ("金安", "雙向溝通測驗卷自然5-康"),
-        }
-        got = {
-            (str(x.get("publisher", "")).strip(), str(x.get("value", "")).strip())
-            for x in candidates
-        }
-        missing = sorted(expected - got)
-        check(
-            not missing,
-            "華興九年級自然康軒版 3 種已確認卷類都能找到",
-            f"缺少={missing}",
-        )
-
-# ----------------------------------------------------------------------
-# 6. APP 真實對話解析（唯讀 / 確認前停止）
-# ----------------------------------------------------------------------
-print("\n【6. APP 真實對話流程＋實際耗時】")
-
-def reset_user(uid):
-    try:
-        if hasattr(mod, "clear_all_user_states"):
-            mod.clear_all_user_states(uid)
-        elif hasattr(mod, "clear_task_states_for_new_mode"):
-            mod.clear_task_states_for_new_mode(uid)
-    except Exception:
-        pass
-
-def send(uid, text):
-    http_before = {k: len(v) for k, v in action_timings.items()}
-    t0 = time.perf_counter()
-    try:
-        reply = mod._route_message(uid, text)
-    except Exception as e:
-        outer = time.perf_counter() - t0
-        return f"EXCEPTION: {type(e).__name__}: {e}", outer
-    outer = time.perf_counter() - t0
-    network = 0.0
-    for action, arr in action_timings.items():
-        start = http_before.get(action, 0)
-        network += sum(arr[start:])
-    # 若外層時間比實際 HTTP 多出超過 10 秒且總時間超過 30 秒，視為測試主機
-    # 排程/休眠造成的計時異常。功能體感主要以實際 HTTP + 正常本地處理為準。
-    if outer > 30.0 and outer - network > 10.0:
-        print(f"     [計時異常] 外層 {outer:.3f}s，但實際 HTTP {network:.3f}s；速度統計採 HTTP 時間")
-        return str(reply or ""), network
-    return str(reply or ""), outer
-
-CONVERSATIONS = [
-    (
-        "查老師－陳映汝",
-        ["查老師", "陳映汝"],
-        ["陳映汝", "華興"],
-    ),
-    (
-        "多書－自然5測驗卷7種",
-        ["多書訂購", "陳映汝", "不限", "自然5測驗卷", "7"],
-        ["自然5"],
-    ),
-    (
-        "多書－歷史5需查社會版本",
-        ["多書訂購", "高毓坤", "不限", "歷史5測驗卷", "4"],
-        ["歷史5"],
-    ),
-    (
-        "其他訂單－天母教務處自由聯絡人",
-        ["其他訂單", "天母教務處要補一本國一數學講義"],
-        ["天母", "教務處"],
-    ),
-]
-
-# 如果某一步因 Google timeout 停住，v1 仍會把後面的「不限／書名／7」
-# 繼續餵進去，導致它們全部被當老師姓名，產生一串「連鎖假失敗」。
-# v2 在真正卡住時立即停止該案例，只記第一個根因。
-def _conversation_blocked(reply):
-    text = str(reply or "")
-    return any(x in text for x in [
-        "查詢逾時", "暫時無法連線", "請重新輸入姓名",
-        "請直接再輸入一次老師姓名", "目前找不到符合的老師",
-    ])
-
-for idx, (label, messages, must_contain) in enumerate(CONVERSATIONS, 1):
-    uid = f"REAL_SPEED_{idx}_{int(time.time()*1000)}"
-    reset_user(uid)
-    total = 0.0
-    print(f"\n  ▶ {label}")
-    last_reply = ""
-    blocked = False
-    before_counts = dict(action_counts)
-
-    for step_index, msg in enumerate(messages):
-        reply, dt = send(uid, msg)
-        total += dt
-        last_reply = reply
-        print(f"     你：{msg}")
-        print(f"     ⏱ {dt:.3f}s")
-        preview = reply.splitlines()
-        for line in preview[:5]:
-            print(f"     機器人：{line}")
-        if len(preview) > 5:
-            print("     機器人：...")
-
-        # 第一個功能入口（例如「多書訂購」）只是提示，不算阻塞。
-        # 後續步驟若明確因老師查詢 timeout/找不到而停住，就不要再送下一句。
-        if step_index > 0 and _conversation_blocked(reply):
-            blocked = True
-            print("     ↳ 此案例在真正失敗點停止，避免後續訊息造成連鎖假失敗。")
-            break
-
-    print_speed(label + " 總耗時", total, "multi" if "多書" in label else "query")
-
-    if blocked:
-        fail(
-            f"{label} 流程被上游查詢阻塞",
-            f"最後回覆={last_reply[:600]}"
-        )
-    else:
-        check(
-            all(x in last_reply for x in must_contain),
-            f"{label} 最後回覆包含預期資訊",
-            f"預期={must_contain}；實際={last_reply[:600]}",
-        )
-
-    if "EXCEPTION:" in last_reply:
-        fail(f"{label} 不應丟例外", last_reply)
-
-    if label == "多書－歷史5需查社會版本":
-        check(
-            total <= 12.0,
-            "多書－歷史5總耗時不應再因連續 fuzzy fallback 超過 12 秒",
-            f"實際 {total:.3f}s"
-        )
-
-    # v73 目標：三個主要學校要本地辨識。「天母教務處...」不能為了
-    # 辨識天母再打 list_schools。
-    if label == "其他訂單－天母教務處自由聯絡人":
-        delta = action_counts.get("list_schools", 0) - before_counts.get("list_schools", 0)
-        check(delta == 0, "天母其他訂單不應呼叫 list_schools", f"實際呼叫 {delta} 次")
-
-# ----------------------------------------------------------------------
-# 6.5 同條件暖快取抽測
-# ----------------------------------------------------------------------
-print("\n【6.5. 同條件暖快取抽測】")
-
-WARM_CASES = [
-    ({"action": "lookup_teacher_matches", "teacher": "陳映汝", "school": "華興中學"}, "老師 陳映汝"),
-    ({"action": "lookup_versions", "school": "華興中學", "grade": "九年級", "subject": "自然", "academic_period": ""}, "版本 華興九年級自然"),
-    ({"action": "lookup_multi_book_candidates", "subject": "自然", "volume": "5", "category": "卷類", "applicable_version": current_version or "康軒", "publisher": "", "limit": 30}, "多書 自然5"),
-]
-
-for payload, label in WARM_CASES:
-    r1, t1 = live_post(payload, label + " warm-1")
-    r2, t2 = live_post(payload, label + " warm-2")
-    print(f"       {label}: 第1次 {t1:.3f}s / 第2次 {t2:.3f}s")
-    check(bool(r2 and r2.get("success")), f"{label} 暖快取第二次查詢成功", f"回傳={r2}")
-    if t2 > 3.0:
-        warn(f"{label} 暖快取第二次仍超過 3 秒：{t2:.3f}s")
-
-# ----------------------------------------------------------------------
-# 7. 速度總表
-# ----------------------------------------------------------------------
-print("\n【7. Google action 速度總表】")
-print(f"{'action':34s} {'次數':>4s} {'最快':>8s} {'平均':>8s} {'最慢':>8s} {'判定':>10s}")
-print("-" * 80)
-
-for action in sorted(action_timings):
-    arr = action_timings[action]
-    if not arr:
-        continue
-    fastest = min(arr)
-    avg = statistics.mean(arr)
-    slowest = max(arr)
-    rating = speed_label(avg, "multi" if action == "lookup_multi_book_candidates" else "query")
-    print(
-        f"{action:34s} {len(arr):4d} "
-        f"{fastest:8.3f} {avg:8.3f} {slowest:8.3f} {rating:>10s}"
-    )
-
-# 額外提示 logical wrapper 是否出現與 HTTP 明顯不一致的極端值；不列入功能 FAIL。
-for action, arr in logical_timings.items():
-    if not arr:
-        continue
-    logical_max = max(arr)
-    http_max = max(action_timings.get(action, [0.0]) or [0.0])
-    if logical_max > 30 and logical_max - http_max > 10:
-        warn(f"{action} 曾出現外層計時異常：logical {logical_max:.3f}s / HTTP {http_max:.3f}s")
-
-# ----------------------------------------------------------------------
-# 總結
-# ----------------------------------------------------------------------
-print("\n" + "=" * 72)
-print(f"共 {checks} 個正確性檢查，失敗 {len(fails)} 個，警告 {len(warns)} 個")
-
-if warns:
-    print("\n警告：")
-    for x in warns:
-        print(f"  - {x}")
-
-if fails:
-    print("\n失敗詳情：")
-    for x in fails:
-        print(f"  - {x}")
-    print("\n❌ 真實資料庫測試未完全通過")
-    sys.exit(1)
-
-print("\n✅ 真實資料庫正確性測試通過")
-print("※ 速度屬於當下 Apps Script / 網路實測，偶爾冷啟動會造成單次偏慢。")
-print("※ 本測試沒有建立、修改、取消任何正式訂單。")
