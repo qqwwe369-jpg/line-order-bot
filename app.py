@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-25-v82-bulk-ai-fix"
+APP_VERSION = "2026-09-25-v83-bulk-list-cleanup"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -12635,7 +12635,7 @@ def _v81_bulk_system_prompt():
 輸出格式：
 {"cram_school":"","items":[{"section":"國文 第一冊","floor":"5F",
  "subjects":["國文"],"volume":1,"grade":0,"publisher":"翰林","version":"","series":"超級悍將",
- "paper":"","quantities":[43],"note":""}],"notes":["整段共通的備註"]}
+ "paper":"","quantities":[43],"note":"","line":"超級悍將 國文（ㄧ） 43本"}],"notes":["整段共通的備註"]}
 
 規則：
 1. 標題行（例如「國文 第三冊 送8F」「社會科 7年級 送5F」）決定後面每一項的 section、subject、volume／grade、floor，直到下一個標題。
@@ -12645,10 +12645,13 @@ def _v81_bulk_system_prompt():
 4. quantities：「43本」→[43]；「20+20份」→[20,20]（保留兩筆，不要加總）；「x45本」→[45]。
 5. publisher 填訊息寫的品牌（翰林、康軒、南一、奇鼎…）；「8k 奇鼎 A卷 翰林」這種，publisher=奇鼎、version=翰林。
 6. paper 只能填：A卷、B卷、C卷、D卷、KA、KB、門市卷、測驗卷，或空白。KA、KB 照寫，不要改成 A卷。
+   「翰林A卷」「翰林 翰林A卷」「翰林A 卷」都是 publisher=翰林、paper=A卷，不能漏掉卷別。
 7. series 填系列名稱原文（超級悍將、新挑戰學習講義、標竿、教學式、學習講義…），8K、8k 不用寫。
 8. 「無法出貨看有什麼版本」「沒有就門市卷」這類替代說明放到該項 note；
    「北投、石牌…（翰林版）」「幫確定列的版本是否正確」這類跟整段有關的說明放 notes。
-9. 看不懂的行也要列出來，series 填那一行原文，quantities 照寫，不要丟掉。
+9. 有數量但看不懂的行也要列出來，series 填那一行原文，quantities 照寫，不要丟掉。
+   沒有數量的行（學校名單、版本說明、「=====」分隔線）不是要買的東西，不要放進 items；有意義的說明放 notes，分隔線直接略過。
+11. line 填這一項在原訊息裡的那一行原文（照抄，不要改字）。
 10. 訊息裡有寫補習班名稱才填 cram_school，沒有就留空。"""
 
 
@@ -12851,6 +12854,58 @@ def _v81_match(item, books):
     return "choose", sorted(top, key=lambda b: (b["publisher"], b["name"]))[:6]
 
 
+_V83_PAPER_RE = re.compile(r"門市卷|K\s*([AB])(?![A-Za-z])|(?<![A-Za-z])([ABCD])\s*卷", re.I)
+
+
+def _v83_has_quantity(it):
+    for q in (it.get("quantities") or []):
+        try:
+            if int(q) > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _v83_fix_paper(it):
+    """v83：AI 漏填卷別時（例如「翰林 翰林A卷 20+20份」），從 series／原文／備註把 A卷、KB… 找回來。"""
+    if str(it.get("paper", "") or "").strip():
+        return it
+    it = dict(it)
+    for field in ("series", "line", "note"):
+        text = str(it.get(field, "") or "")
+        m = _V83_PAPER_RE.search(text)
+        if not m:
+            continue
+        if m.group(0) == "門市卷":
+            it["paper"] = "門市卷"
+        elif m.group(1):
+            it["paper"] = "K" + m.group(1).upper()
+        else:
+            it["paper"] = m.group(2).upper() + "卷"
+        if field == "series":
+            rest = _V83_PAPER_RE.sub("", text)
+            pub = str(it.get("publisher", "") or "")
+            if pub:
+                rest = rest.replace(pub, "")
+            it["series"] = rest.strip(" 　8Kk")
+        break
+    return it
+
+
+def _v83_clean_notes(notes):
+    out = []
+    for n in notes or []:
+        t = str(n or "").strip()
+        core = re.sub(r"[=＝\-－_~～\s　]+", "", t)
+        core_wo_floor = re.sub(r"送?\d+\s*[FfＦ樓]", "", core)
+        if not core or not core_wo_floor:
+            continue          # 只剩分隔線、或只有「送5F」
+        if t not in out:
+            out.append(t)
+    return out
+
+
 def _v81_build_rows(data, books):
     rows = []
     expanded = []
@@ -12864,7 +12919,17 @@ def _v81_build_rows(data, books):
             subs = [it.get("subject", "")]
         for sub in subs:
             expanded.append(dict(it, subject=sub))
+    extra_notes = data.setdefault("notes", []) if isinstance(data.get("notes", []), list) else []
     for it in expanded:
+        if not _v83_has_quantity(it):
+            # v83：沒有數量的行（學校名單、版本說明）不是要買的東西，改放備註
+            text = "；".join(x for x in (str(it.get("note", "") or "").strip(),
+                                         str(it.get("line", "") or "").strip()) if x) \
+                or str(it.get("series", "") or "").strip()
+            if text and text not in extra_notes:
+                extra_notes.append(text)
+            continue
+        it = _v83_fix_paper(it)
         subject = str(it.get("subject", "") or "").strip().replace("英語", "英文")
         try:
             volume = int(it.get("volume") or 0)
@@ -12932,7 +12997,10 @@ def _v81_confirmation(order):
     blocks = []          # 每個分段一塊
     section, cur = None, None
     for r in rows:
-        sec = "｜".join(x for x in (r["section"], f"送{r['floor']}" if r["floor"] else "") if x) or "其他"
+        floor_txt = f"送{r['floor']}" if r["floor"] else ""
+        if floor_txt and floor_txt in r["section"].replace(" ", "").upper():
+            floor_txt = ""
+        sec = "｜".join(x for x in (r["section"], floor_txt) if x) or "其他"
         if sec != section:
             section = sec
             title = f"【{sec}】"
@@ -13041,7 +13109,7 @@ def _v81_start_bulk(user_id, raw_text):
     order = {
         "cram_school": _v81_resolve_cram_school(cram) if cram else "",
         "rows": rows,
-        "notes": [str(n).strip() for n in (data.get("notes") or []) if str(n).strip()],
+        "notes": _v83_clean_notes(data.get("notes") or []),
         "created_at": time.time(),
     }
     pending_bulk_orders[user_id] = order
