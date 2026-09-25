@@ -148,7 +148,7 @@ logging.basicConfig(
 logger = logging.getLogger("order_bot")
 
 app = Flask(__name__)
-APP_VERSION = "2026-09-26-v91-compact-lebron"
+APP_VERSION = "2026-09-26-v92-unified-replies"
 
 # 單一使用者單則訊息的長度上限。純粹是防呆／防濫用，
 # 避免異常長的輸入把後面一大串正規表示式處理效能拖垮。
@@ -448,7 +448,7 @@ def _v87_mark_stale(action):
     logger.warning("stale fallback used: action=%s", action)
 
 
-_V87_STALE_NOTICE = "⚠️ Google 這次沒有即時回應，以上是稍早暫存的資料，可能不是最新；需要的話等一下再問一次。"
+_V87_STALE_NOTICE = "⚠️ Google 剛剛慢了一拍，以上是暫存資料，可能不是最新。"
 
 
 def _v87_add_stale_notice(reply):
@@ -607,7 +607,7 @@ for _env_name, _env_value in [
     if not _env_value:
         logger.warning(f"啟動時發現環境變數未設定：{_env_name}")
 
-FIXED_FALLBACK_MESSAGE = "⚠️ 這句我目前還無法確定你的意思。\n\n你可以換個方式再說一次，或輸入「功能」查看可以使用的功能。"
+FIXED_FALLBACK_MESSAGE = "🏀 這球我沒接到 😅\n換個說法再傳一次，或輸入「功能」。"
 
 DEFAULT_SCHOOL = os.environ.get("DEFAULT_SCHOOL", "天母國中")
 
@@ -1063,13 +1063,13 @@ def serve_purchase_order_pdf(token):
         return "Not found", 404
     path = os.path.join(PURCHASE_ORDER_DIR, f"{token}.pdf")
     if not os.path.exists(path):
-        return "這個連結已經過期或不存在，請回到 LINE 重新產生訂購單 PDF。", 404
+        return "📄 連結失效了 😅 請回 LINE 重新產生 PDF。", 404
     if time.time() - os.path.getmtime(path) > PURCHASE_ORDER_LINK_TTL_SECONDS:
         try:
             os.remove(path)
         except Exception:
             pass
-        return "這個連結已經過期，請回到 LINE 重新產生訂購單 PDF。", 404
+        return "📄 連結過期了 😅 請回 LINE 重新產生 PDF。", 404
     return send_file(path, mimetype="application/pdf", download_name="訂購單.pdf")
 
 
@@ -1140,13 +1140,14 @@ def _v84_access_gate(user_id, text):
     """回傳要直接回覆的文字；None 代表照原本流程處理。"""
     t = str(text or "").strip()
     if t in _V84_MY_ID_WORDS:
-        return f"🆔 你的 LINE ID：\n{user_id}\n\n要開通使用權限的話，把這串 ID 傳給管理員。"
+        return f"🆔 你的 LINE ID\n{user_id}\n\n把這串傳給管理員即可開通。"
     allowed = _v84_allowed_ids()
     if not allowed or user_id in allowed:
         return None
     return (
-        "🔒 這個機器人目前只開放給大漢的同仁使用。\n\n"
-        f"如需開通，請把下面這串 ID 傳給管理員：\n{user_id}"
+        "🔒 尚未開通使用權限\n"
+        f"LINE ID：{user_id}\n\n"
+        "把這串傳給管理員即可。"
     )
 
 
@@ -2427,7 +2428,7 @@ def _route_message(user_id, user_text):
         if text in ["取消", "不要了", "這筆不要"] and user_id in pending_other_orders:
             pending_other_orders.pop(user_id, None)
             guided_mode.pop(user_id, None)
-            return "❌ 已取消這筆「其他訂單」，Google 沒有寫入。"
+            return "❌ 已取消｜沒有寫入。"
 
         if user_id in pending_other_orders and not str(pending_other_orders[user_id].get("school", "") or "").strip():
             return handle_pending_other_order_school_input(user_id, text)
@@ -2512,15 +2513,15 @@ def _route_message(user_id, user_text):
     if text in ["取消修改", "不要修改"]:
         if user_id in pending_other_updates:
             pending_other_updates.pop(user_id, None)
-            return "❌ 已取消這次「其他訂單」修改，Google 資料沒有變動。"
+            return "❌ 修改已取消｜資料沒變。"
 
         if user_id in pending_history_updates:
             pending_history_updates.pop(user_id, None)
-            return "❌ 已取消這次歷史訂單修改，Google 原訂單沒有變動。"
+            return "❌ 修改已取消｜原訂單沒變。"
 
         if user_id in pending_history_cancels:
             pending_history_cancels.pop(user_id, None)
-            return "❌ 已取消這次歷史訂單取消動作，Google 原訂單沒有變動。"
+            return "❌ 取消動作已撤回｜原訂單還在。"
 
         return "目前沒有等待確認的修改。"
 
@@ -2548,7 +2549,7 @@ def _route_message(user_id, user_text):
     if text in ["取消", "取消訂單", "不要了", "這筆不要"]:
         if user_id in pending_other_orders:
             pending_other_orders.pop(user_id, None)
-            return "❌ 已取消這筆「其他訂單」，Google 沒有寫入。"
+            return "❌ 已取消｜沒有寫入。"
 
         if user_id in pending_orders:
             pending_orders.pop(user_id, None)
@@ -2876,17 +2877,14 @@ def _guided_mode_escape_reply(user_id, text, current_mode=None):
 def get_main_menu_reply():
     _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
     return (
-        "🏠 大漢訂書小幫手｜主選單\n\n"
-        "直接告訴我你要做什麼就可以，不用背指令。\n\n"
-        "📚 訂書｜例如：王老師701、703訂國一數學講義\n"
-        "👨‍🏫 查老師｜例如：謝明清有幾個班\n"
-        "📅 查訂單｜例如：查001、昨天的訂單\n"
-        "📖 查版本｜例如：華興七年級英文版本\n"
-        "📊 查人數｜例如：天母七年級人數\n\n"
-        "其他功能：補習班訂書、多書訂購、其他訂單、今日統計、照片訂書。\n"
-        "需要完整說明時，輸入「功能」。"
+        "🏠 主選單\n\n"
+        "📚 學校訂書\n"
+        "🏫 補習班訂書\n"
+        "📦 其他訂單\n"
+        "🔍 查老師／訂單／版本／人數\n"
+        "➕ 更多功能\n\n"
+        "直接講需求就行，不用背指令。"
     )
-
 
 def is_teacher_mode_start(text):
     compact=re.sub(r"[\s，,。.!！?？]+","",str(text or ""))
@@ -2939,26 +2937,20 @@ def is_stats_mode_start(text):
 
 def get_history_lookup_guide_reply():
     return (
-        "📅 訂單查詢\n\n"
-        "直接告訴我你想找哪一張：\n\n"
-        "• 今天／昨天\n"
-        "• 8月30日\n"
-        "• 001 或 查001\n"
+        "📅 查訂單\n\n"
+        "可以直接說：\n"
+        "• 查001\n"
+        "• 今天／昨天的訂單\n"
         "• 王老師的訂單\n\n"
-        "查到訂單後，可以直接修改班級數量或取消訂單。"
+        "查到後可直接修改或取消。"
     )
-
-
 
 def get_stats_lookup_guide_reply():
     return (
-        "📊 學生人數查詢\n\n"
-        "請告訴我「學校＋年級」。\n"
-        "例如：天母七年級、華興高一\n\n"
-        "查完後可以直接接著查下一個年級。"
+        "📊 查人數\n\n"
+        "直接輸入「學校＋年級」\n"
+        "例如：天母七年級"
     )
-
-
 
 def _finish_guided_mode(user_id, reply):
     guided_mode.pop(user_id, None)
@@ -2978,9 +2970,9 @@ def handle_guided_version_lookup(user_id, text):
         if smart_reply is not None:
             return smart_reply
         return (
-            "📖 教科書版本查詢\n\n"
-            "我還在「查版本」模式。\n"
-            "請輸入學校名稱，例如：天母國中、衛理女中、華興中學。"
+            "📖 查版本\n\n"
+            "請告訴我學校名稱。\n"
+            "例如：天母國中"
         )
     stats_version_context[user_id] = {"school": school}
 
@@ -3009,10 +3001,7 @@ def handle_guided_version_lookup(user_id, text):
         )
 
     if result is None:
-        return (
-            "⚠️ 教科書版本資料庫暫時查詢失敗。\n\n"
-            "我還在「查版本」模式，請稍後直接再輸入學校名稱。"
-        )
+        return "⚠️ 版本資料卡了一下 🏀\n直接再輸入一次學校即可。"
     if not result.get("versions"):
         return (
             "⚠️ 查不到這個條件的教科書版本資料。\n\n"
@@ -3032,11 +3021,7 @@ def handle_guided_stats_lookup(user_id, text):
         smart_reply = _guided_mode_smart_rescue(user_id, text, "stats_lookup")
         if smart_reply is not None:
             return smart_reply
-        return (
-            "📊 學生人數查詢\n\n"
-            "我還在「查人數」模式。\n"
-            "請輸入「學校＋年級」，例如：天母七年級、華興高一。"
-        )
+        return "📊 查人數\n\n輸入「學校＋年級」。\n例如：天母七年級"
 
     reply = handle_school_stats_query(query)
     if reply.startswith("⚠️"):
@@ -3173,13 +3158,13 @@ def handle_guided_history_lookup(user_id, text):
         if orders is None:
             return (
                 "⚠️ 訂單查詢暫時無法讀取，請稍後再試一次。\n\n"
-                "我還在「查訂單」模式，可以直接改輸入其他老師、日期或訂單編號。"
+                "↪️ 換老師、日期或編號再查。"
             )
         if not orders:
             return (
                 "⚠️ 查不到這位老師的訂書紀錄。\n\n"
                 f"老師：{canonical}\n\n"
-                "我還在「查訂單」模式，可以直接改輸入其他老師、日期或訂單編號。"
+                "↪️ 換老師、日期或編號再查。"
             )
 
         reply = make_teacher_book_orders_reply(canonical, orders)
@@ -3596,9 +3581,7 @@ def handle_guided_teacher_lookup(user_id,text):
     matches, teacher_query_ok = lookup_teacher_matches_status(name+"老師",school="")
     if not teacher_query_ok:
         return (
-            "⚠️ 老師資料庫目前查詢逾時或暫時無法連線。\n\n"
-            "我沒有再追加模糊搜尋，避免讓你多等十幾秒。\n"
-            "請直接再輸入一次老師姓名即可。"
+            "⚠️ 老師資料卡住了 🏀\n再輸入一次老師姓名。"
         )
     if len(matches)==1: return finish_teacher_lookup(user_id,matches[0])
     if len(matches)>1:
@@ -3647,19 +3630,13 @@ def _pick_players(count=3):
 
 
 def get_greeting_reply():
-    p1 = _pick_players(1)[0]
     _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
     return (
         "📚 大漢訂書小幫手\n\n"
-        "你好！不用背指令，直接告訴我今天要處理什麼。\n\n"
-        "常用功能\n"
-        "📚 學校訂書　🏫 補習班訂書\n"
-        "📦 新增其他訂單　🔍 查詢資料\n\n"
-        f"💬 例如：{p1}老師701、703訂國一數學講義\n"
-        "📷 有訂書照片的話，直接傳給我就可以。\n\n"
-        "也可以點下面的快速按鈕 👇"
+        "嗨 👋 今天要處理什麼？\n\n"
+        "直接講就行，不用背指令。\n"
+        "📷 有訂書照片也可以直接丟給我。"
     )
-
 
 def is_query_menu_request(text):
     compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or ""))
@@ -3670,10 +3647,9 @@ def get_query_menu_reply():
     _set_quick_reply(QUICK_REPLY_QUERY_ITEMS)
     return (
         "🔍 查詢資料\n\n"
-        "要查什麼？點下面的按鈕，或直接打關鍵字也可以，"
-        "例如「謝明清有幾個班」「查001」。"
+        "直接選下面按鈕，或直接問：\n"
+        "「謝明清有幾個班」／「查001」"
     )
-
 
 def is_help_request(text):
     compact = re.sub(r"\s+", "", str(text or "").lower())
@@ -3699,23 +3675,11 @@ def is_photo_order_help_request(text):
 def get_photo_order_help_reply():
     return (
         "📷 拍照訂書\n\n"
-        "請直接上傳訂書照片，我會先辨識內容，再查資料庫補齊資料。\n\n"
-        "🏫【學校訂書】\n"
-        "照片至少要看得到：\n"
-        "• 老師姓名\n"
-        "• 書名（可以一次寫多本）\n\n"
-        "學校、出版社、老師授課班級與各班人數，我會從資料庫自動查詢。\n"
-        "如果某一本只訂部分班級、數量不同或有備註，請寫在那本書旁邊。\n\n"
-        "🏢【補習班訂書】\n"
-        "照片至少要看得到：\n"
-        "• 補習班名稱\n"
-        "• 書名（可以一次寫多本）\n"
-        "• 每一本的訂購數量\n\n"
-        "出版社會從書籍資料庫自動查詢；同書名有不同出版社時，我會再請你選擇。\n\n"
-        "辨識完成後一定先顯示「訂購確認」，不會直接寫入 Google。\n"
-        "👉 現在直接傳圖片給我就可以了。"
+        "直接上傳照片即可。\n\n"
+        "學校訂書：看得到老師＋書名\n"
+        "補習班：看得到名稱＋書名＋數量\n\n"
+        "我會先整理，再讓你確認；不會直接下單。"
     )
-
 
 def is_ai_assistant_help_request(text):
     compact = re.sub(r"[\s，,。.!！?？]+", "", str(text or "")).lower()
@@ -3724,43 +3688,30 @@ def is_ai_assistant_help_request(text):
 
 def get_ai_assistant_help_reply():
     return (
-        "🧠 AI 智慧理解\n\n"
-        "你不用記固定指令，照平常說話就可以。\n"
-        "我會先理解你的意思，需要公司資料時會再查 Google 資料庫。\n\n"
+        "🧠 AI 助手\n\n"
+        "直接用平常說話的方式問就行。\n"
         "例如：\n"
-        "• 張建國老師要訂段考王英文3\n"
-        "• 幫我看華興國一英文是哪幾個老師\n"
-        "• 王老師昨天有沒有訂東西\n"
-        "• 華興七年級現在用什麼數學課本\n\n"
-        "也可以接著說「他呢？」「那上次訂什麼？」「幫我整理成訊息」。\n\n"
-        "資料庫答案仍以 Google 資料為準；建立、修改或取消訂單仍會先讓你確認。"
+        "• 張建國要訂段考王英文3\n"
+        "• 華興國一英文誰教？\n"
+        "• 王老師昨天訂了什麼？\n\n"
+        "涉及訂單異動，我還是會先請你確認。"
     )
-
 
 def get_help_reply():
-    p3 = _pick_players(1)[0]
     _set_quick_reply(QUICK_REPLY_MORE_ITEMS)
     return (
-        "📚 大漢訂書小幫手｜完整功能\n\n"
-        "不用背指令，直接用平常說話的方式告訴我需求。\n\n"
-        "【常用功能】\n"
-        "📚 訂書｜王老師701、703訂國一數學講義\n"
-        "👨‍🏫 查老師｜謝明清有幾個班\n"
-        "📅 查訂單｜查001／王老師昨天的訂單\n"
-        "📖 查版本｜華興七年級英文版本\n"
-        "📊 查人數｜天母七年級人數\n\n"
-        "【智慧功能】\n"
-        "📷 拍照訂書｜直接傳圖片，自動整理訂單\n"
-        "🧠 大漢 AI 助手｜直接講人話，可理解前後文並自動選擇查詢功能\n"
-        "📚 多書訂購｜一位老師，不同班級配不同本書\n\n"
-        "【其他功能】\n"
+        "📚 功能\n\n"
+        "📚 訂書\n"
+        "👨‍🏫 查老師\n"
+        "📅 查訂單\n"
+        "📖 查版本\n"
+        "📊 查人數\n"
+        "📷 拍照訂書\n"
         "🏫 補習班訂書\n"
-        f"📦 其他訂單｜例如：天母{p3}老師書面紙20張\n"
-        "📊 今日訂單統計\n\n"
-        "💡 輸入「拍照訂書」可看圖片使用說明；輸入「AI助手」可看智慧理解範例。\n"
-        "任何時候輸入「主選單」可離開目前流程；輸入「重來」會清除目前進度。"
+        "📚 多書訂購\n"
+        "📦 其他訂單\n\n"
+        "直接講需求就可以。"
     )
-
 
 # =========================================================
 # 訂書流程
@@ -3955,7 +3906,7 @@ def validate_order_teacher_input(user_id, raw_text, draft):
             lines.append(f"{i}. {label}")
 
         lines.append("")
-        lines.append("請直接回覆數字選擇；如果都不是，直接重新輸入正確老師姓名。")
+        lines.append("回覆數字選擇；都不是就直接輸入姓名。")
         return "\n".join(lines)
 
     return (
@@ -4051,10 +4002,10 @@ def validate_order_publisher_input(user_id, raw_text, draft):
             lines.append(f"{i}. {opt['value']}")
         lines.append("")
         if len(options) > 1:
-            lines.append("請直接回覆數字（例如「1」）選擇要的那一家；回覆「確認」等同選第 1 個。")
+            lines.append("回覆數字選擇；「確認」＝第1個。")
         else:
             lines.append("是的請回覆「確認」。")
-        lines.append("如果都不是，請直接輸入正確出版社名稱，我會取消這個候選並重新查資料庫。")
+        lines.append("都不是就直接輸入出版社名稱。")
         return "\n".join(lines)
 
     return ("⚠️ 出版社資料庫目前無法確認這個名稱。\n\n"
@@ -4269,7 +4220,7 @@ def handle_order_flow(user_id, text):
         if draft.get("teacher") and not draft.get("book"):
             return "請告訴我要訂哪一本書？"
         if draft.get("teacher") and draft.get("book") and not draft.get("publisher"):
-            return "這本書目前無法從資料庫確認出版社，請告訴我出版社。"
+            return "📚 這本的出版社還不確定，請告訴我出版社。"
 
     if user_id in order_flow_context and not draft.get("teacher"):
         candidates = draft.get("teacher_candidates") or []
@@ -4786,7 +4737,7 @@ def build_order_from_draft(user_id, draft):
             # 已經多訂了不相干年級的班。改成直接回一句澄清問句列出
             # 候選，不要用「全部班級」這種影響最大的方式默默猜。
             order_flow_context[user_id] = draft
-            lines = ["⚠️ 班級代號無法判斷是哪一班，請直接告訴我完整班級名稱。", ""]
+            lines = ["🏀 班級沒接準 😅\n請輸入完整班級名稱。", ""]
             for ch, candidates in ambiguous.items():
                 if candidates:
                     lines.append(f"「{ch}」可能是：{'、'.join(candidates)}")
@@ -5059,7 +5010,7 @@ def cram_next_item_prompt(user_id, draft, first=False):
             f"補習班：{draft.get('cram_school', '')}\n\n"
             "請告訴我第一本書的出版社？"
         )
-    return "請告訴我下一本書的出版社？\n如果訂好了，請回覆「好了」。"
+    return "📚 下一本的出版社？\n訂完了就回「好了」。"
 
 
 def make_cram_items_progress_reply(draft):
@@ -5212,10 +5163,10 @@ def validate_cram_item_publisher_input(user_id, raw_text, draft):
             lines.append(f"{i}. {opt['value']}")
         lines.append("")
         if len(options) > 1:
-            lines.append("請直接回覆數字（例如「1」）選擇要的那一家；回覆「確認」等同選第 1 個。")
+            lines.append("回覆數字選擇；「確認」＝第1個。")
         else:
             lines.append("是的請回覆「確認」。")
-        lines.append("如果都不是，請直接輸入正確出版社名稱，我會取消這個候選並重新查資料庫。")
+        lines.append("都不是就直接輸入出版社名稱。")
         return "\n".join(lines)
 
     return ("⚠️ 出版社資料庫目前無法確認這個名稱。\n\n"
@@ -5292,7 +5243,7 @@ def validate_cram_item_book_input(user_id, raw_text, draft):
 def validate_cram_item_quantity_input(user_id, raw_text, draft):
     m = re.fullmatch(r"(\d{1,4})\s*本?", str(raw_text or "").strip())
     if not m:
-        return "請告訴我這本書要訂幾本？直接輸入數字就好，例如「2」。"
+        return "🔢 要幾本？直接輸入數字。"
 
     quantity = int(m.group(1))
     if quantity <= 0:
@@ -5315,7 +5266,7 @@ def validate_cram_item_quantity_input(user_id, raw_text, draft):
 
 def _enter_cram_confirm_stage(user_id, draft):
     if not draft.get("items"):
-        return "⚠️ 你還沒有登記任何書，請先告訴我要訂的第一本書的出版社。"
+        return "📚 還沒有書喔 😅\n先告訴我第一本的出版社。"
 
     draft["confirming"] = True
     cram_order_context[user_id] = draft
@@ -5431,11 +5382,11 @@ def _v84_write_cram(draft):
 def _v84_uncertain_reply(clean, holder):
     """holder 在「結果不確定」狀態時處理回覆；回傳 (動作, 訊息)。動作：done / retry / cancel / wait"""
     if clean in _V84_CRAM_DONE_WORDS:
-        return "done", "👌 好，這筆補習班訂單就當作已經寫入、直接結案（訂單編號請看試算表）。"
+        return "done", "✅ 好，這筆視為已寫入。"
     if clean in _V84_CRAM_RETRY_WORDS:
         return "retry", ""
     if clean in {"取消", "不要了", "這筆不要", "取消訂單"}:
-        return "cancel", "❌ 已取消。⚠️ 如果剛剛其實有寫入，請到試算表「補習班訂單」手動刪掉那筆。"
+        return "cancel", "❌ 已取消。若剛剛其實有寫入，請到試算表刪除。"
     return "wait", _V84_UNCERTAIN_MSG
 
 
@@ -5610,9 +5561,7 @@ def validate_multi_book_teacher_input(user_id, raw_text, draft):
     exact_matches, teacher_query_ok = lookup_teacher_matches_status(clean)
     if not teacher_query_ok:
         return (
-            "⚠️ 老師資料庫目前查詢逾時或暫時無法連線。\n\n"
-            "為了避免連續模糊搜尋讓等待時間更久，我先停在這一步。\n"
-            "請直接再輸入一次老師姓名。"
+            "⚠️ 老師資料卡住了 🏀\n再輸入一次老師姓名。"
         )
 
     if len(exact_matches) == 1:
@@ -5631,7 +5580,7 @@ def validate_multi_book_teacher_input(user_id, raw_text, draft):
         matches = lookup_teacher_matches(match["value"], school=match.get("school", ""))
         if len(matches) == 1:
             return _apply_multi_book_teacher(user_id, draft, matches[0])
-        return "⚠️ 老師資料庫目前找不到唯一符合的班級資料，請重新輸入老師姓名。"
+        return "🏀 老師資料沒對上 😅\n請重新輸入老師姓名。"
 
     if match.get("status") == "confirm":
         pending_name_confirmations[user_id] = {
@@ -6072,7 +6021,7 @@ def validate_multi_book_count_input(user_id, raw_text, draft):
     clean = re.sub(r"[，,。.!！?？\s]+", "", str(raw_text or ""))
     m = re.fullmatch(r"([0-9]{1,3}|[一二三四五六七八九十]{1,3})種?", clean)
     if not m:
-        return "請直接告訴我要挑幾種書，用數字回覆就好，例如「7」。"
+        return "🔢 要挑幾種？直接輸入數字。"
 
     raw_count = m.group(1)
     count = _cn_number_to_int(raw_count) or 0
@@ -6264,7 +6213,7 @@ def make_multi_book_shortfall_reply(draft):
     lines.append("")
     lines.append(f"共找到 {len(candidates)} 種，跟你說的 {expected} 種不一樣。")
     lines.append("")
-    lines.append("回覆「採用」直接用這幾種；或直接輸入新的書名關鍵字重新查詢。")
+    lines.append("回「採用」，或直接輸入新關鍵字。")
     return "\n".join(lines)
 
 
@@ -10812,6 +10761,9 @@ def _openai_agent_chat(user_id, text):
         return None
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     system = """你是「大漢 AI 助手」，在 LINE 裡用繁體中文自然、簡潔地協助使用者。
+回覆風格：像 LINE 訊息，先給答案，不講長篇前言。一般情況 2～4 行、120 字內；
+需要列資料時才可較長。每段短句，可用 1～2 個適合的 emoji，但不要滿版 emoji。
+如果不知道或資料不足，要誠實說不知道，並用輕鬆的籃球式幽默一句帶過，不可硬猜。
 你可以一般對話、整理文字、改寫訊息、解釋問題，也要理解前後文。
 但是老師、班級、人數、書名資料庫、出版社、學校版本、歷史訂單等公司內部事實絕對不能自行猜測。
 這些資料若目前沒有由系統工具提供，就清楚說需要查資料庫，不要編造。
@@ -10835,6 +10787,7 @@ def _openai_agent_chat(user_id, text):
 
 def _smart_function_system_prompt():
     return """你是「大漢 AI Agent」的意圖路由器。只輸出 JSON，不要直接回答。
+若有 reply/message 類自由文字欄位，文字務必簡短，不要寫長篇說明。
 你會看到最近對話，因此必須理解「他、那本、剛剛那個、上次、其他班也要」等前後文。
 intent 只能是：teacher_lookup、history_lookup、version_lookup、stats_lookup、school_order、cram_order、other_order、chat、unknown。
 
@@ -12790,101 +12743,156 @@ def build_purchase_order_reply(offer):
 
 
 # =========================================================
+# v92：LINE 回覆統一排版層
+# 統一風格契約：
+#   成功：✅ 結果 / 下一步
+#   查詢：🔎 或對應功能 icon + 核心資料
+#   警告：⚠️ 一句原因 + 一句怎麼做
+#   查不到：🏀/😅 一句幽默 + 一句可執行下一步
+#   確認：只保留必要欄位，不加長篇說明
+#   AI：一般 2～4 行、120 字內；資料清單例外
+# =========================================================
+# 目的只有一個：所有對外回覆都「短、清楚、好掃讀」。
+# 不改訂單資料、不改判斷、不刪除重要數字，只整理文字呈現。
+#
+# 規則：
+#   1. 連續空白行最多留 1 行
+#   2. 去掉每行多餘頭尾空白
+#   3. 短回覆不再硬加冗長人設前言
+#   4. 錯誤／查不到時保留一點籃球幽默，但不裝懂
+#   5. 訂單、班級、候選清單這種「資料型回覆」完整保留
+# =========================================================
+def _v91_compact_one_reply(message):
+    body = str(message or "").strip()
+    if not body:
+        return "🏀 這球是空的 😅\n再丟一次給我。"
+
+    # 每行去掉多餘空白；連續空行最多 1 行。
+    raw_lines = [line.rstrip() for line in body.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    lines = []
+    blank = False
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            if lines and not blank:
+                lines.append("")
+            blank = True
+            continue
+        lines.append(line)
+        blank = False
+    while lines and lines[-1] == "":
+        lines.pop()
+    body = "\n".join(lines)
+
+    # 常見過長提示，統一縮短，但不動資料欄位。
+    replacements = [
+        ("請稍後再試一次。", "晚點再試一次。"),
+        ("請重新輸入一次。", "請再輸入一次。"),
+        ("請重新輸入", "請再輸入"),
+        ("你可以換個方式再說一次", "換個說法再傳一次"),
+        ("以上是目前 Google「老師班級資料」中的完整資料。", ""),
+        ("以上是目前 Google 資料庫中的完整資料。", ""),
+        ("如果需要重新開始，請輸入「重來」。", "要重來就輸入「重來」。"),
+    ]
+    for a, b in replacements:
+        body = body.replace(a, b)
+
+    # v92：全域短句化。只刪「流程說明」，不動訂單/班級/書名資料列。
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    body = body.replace("如果要離開，輸入「主選單」。", "離開請輸入「主選單」。")
+    body = body.replace("不用再打一次「查老師」", "")
+    body = body.replace("不用再打一次「查訂單」", "")
+    body = body.replace("我會繼續留在查老師模式。", "")
+    body = body.replace("我會繼續留在查訂單模式。", "")
+    body = re.sub(r"[ \t]+\n", "\n", body)
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+
+    # 沒有明確標題的「答不出來」回覆，加短版幽默，不讓它冷冰冰。
+    compact = re.sub(r"\s+", "", body)
+    fail_words = (
+        "無法確認", "無法辨識", "看不懂", "聽不懂", "查不到",
+        "找不到", "沒有找到", "目前還無法", "沒辦法可靠",
+        "不知道你的意思", "不確定你的意思"
+    )
+    serious_words = ("寫入失敗", "更新失敗", "取消失敗", "系統錯誤", "程式錯誤")
+    already_fun = body.startswith(("🏀", "😅", "⚠️", "❌"))
+    if any(x in compact for x in fail_words) and not any(x in compact for x in serious_words) and not already_fun:
+        jokes = (
+            "🏀 這球我沒接到 😅",
+            "🏀 這題投短了 😆",
+            "🏀 我剛剛漏接一球",
+            "😅 這句有點變化球",
+        )
+        body = jokes[sum(ord(c) for c in compact) % len(jokes)] + "\n" + body
+
+    # v92：把「還在XX模式」這種系統口吻改成使用者看得懂的短提示。
+    body = re.sub(
+        r"我還在「?([^」\n]+)」?模式[，。]?\s*",
+        "↪️ ",
+        body
+    )
+    body = body.replace("可以繼續", "可繼續")
+    body = body.replace("請直接重新輸入", "請再輸入")
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+
+    return body
+
+
+def _v91_compact_reply(message):
+    if isinstance(message, (list, tuple)):
+        return [_v91_compact_one_reply(x) for x in message if str(x or "").strip()]
+    return _v91_compact_one_reply(message)
+
+
+# =========================================================
 # LeBron 固定人設層
 # =========================================================
 def add_lebron_flavor(message):
+    """
+    v91：人設只做「短點綴」，不再每則回覆都多塞一大段 LeBron 前言。
+    重要資料直接顯示；錯誤才用一點籃球幽默。
+    """
     if isinstance(message, (list, tuple)):
-        items = list(message)
-        if not items:
-            return []
-        return [add_lebron_flavor(items[0])] + [str(x or "").strip() for x in items[1:]]
+        return [_v91_compact_one_reply(x) for x in message if str(x or "").strip()]
 
-    body = str(message or "").strip()
-    if not body:
-        body = "目前沒有可顯示的內容。"
-
-    if body.startswith("👑 LeBron James"):
-        return body
-
-    if body.startswith("請協助幫忙下訂單"):
-        return body
-
-    if body.startswith("📄 訂購單 PDF 已產生"):
-        return body
-
+    body = _v91_compact_one_reply(message)
     compact = re.sub(r"\s+", "", body)
 
-    # 候選選擇還沒處理完成，不加「LeBron James 幫你處理好了」這類完成語。
-    if "🔎找到接近的書名" in compact or "🔎資料庫沒有相符書名" in compact:
+    # 這些本身就有清楚標題，直接顯示最乾淨。
+    if body.startswith((
+        "📚", "📅", "📖", "📊", "📷", "🧠", "🏫", "🏢", "📦",
+        "🔎", "✅", "❌", "⚠️", "🆔", "🔒", "🏠", "📄", "🏀"
+    )):
         return body
 
-    if any(key in compact for key in [
-        "查不到", "找不到", "處理失敗", "查詢失敗", "寫入失敗",
-        "更新失敗", "沒有讀到", "系統剛剛處理失敗"
+    # 寫入／系統錯誤不要開玩笑，資訊要最清楚。
+    if any(x in compact for x in [
+        "寫入失敗", "更新失敗", "取消失敗", "系統錯誤",
+        "程式錯誤", "處理失敗"
     ]):
-        intro = "👑 LeBron James 這球沒找到目標"
+        return "⚠️ 這球卡住了\n" + body
 
-    elif any(key in compact for key in [
-        "還差", "請告訴我", "請提供", "請問是哪", "需要哪",
-        "尚未提供", "請選擇", "請直接告訴我"
+    # 一般查不到／聽不懂：幽默但誠實。
+    if any(x in compact for x in [
+        "查不到", "找不到", "無法確認", "無法辨識",
+        "目前還無法", "不確定你的意思", "沒有找到"
     ]):
-        intro = "👑 LeBron James 還差一個助攻"
+        if body.startswith(("🏀", "😅")):
+            return body
+        return "🏀 這球我沒接到 😅\n" + body
 
-    elif any(key in compact for key in [
-        "確認取消", "已取消", "取消這張", "取消這筆", "取消訂單"
-    ]):
-        intro = "👑 LeBron James 幫你把這球撤回來了"
-
-    elif any(key in compact for key in [
-        "確認修改", "修改確認", "已修改", "調整", "改成", "更新成功"
-    ]):
-        intro = "👑 LeBron James 幫你把陣容調整好了"
-
-    elif "出版社" in compact and ("候選" in compact or "可能有錯字" in compact):
-        intro = "👑 LeBron James 幫你認清東家了"
-
-    elif "訂購確認" in compact or "訂書確認" in compact:
-        intro = "👑 LeBron James 幫你把這張單整理好了"
-
-    elif any(key in compact for key in ["教科書版本", "版本資料", "版本："]):
-        intro = "👑 LeBron James 幫你把版本查好了"
-
-    elif "🏫" in compact and ("總人數" in compact or "班級總數" in compact):
-        intro = "👑 LeBron James 幫你點完名了"
-
-    elif any(key in compact for key in [
-        "班級資料", "學生人數", "總學生人數", "班級總數", "幾個班", "多少人"
-    ]):
-        intro = "👑 LeBron James 幫你點完名了"
-
-    elif "訂單已確認" in compact and ("已成功寫入" in compact or "訂單編號" in compact):
-        intro = "👑 LeBron James 這筆訂單完成助攻"
-
-    elif any(key in compact for key in [
-        "歷史訂單", "訂書紀錄", "訂書進度", "單日訂單", "筆訂單", "訂單編號"
-    ]):
-        intro = "👑 LeBron James 幫你把紀錄翻出來了"
-
-    elif any(key in compact for key in [
-        "大漢訂書小幫手", "我可以幫你", "功能", "直接用平常講話", "今天想幹嘛"
-    ]):
-        intro = "👑 LeBron James 幫你把戰術板打開了"
-
-    elif any(key in compact for key in [
-        "訂單已確認", "已建立", "成功", "已寫入", "完成"
-    ]):
-        intro = "👑 LeBron James 這球漂亮收尾"
-
-    else:
-        intro = "👑 LeBron James 幫你處理好了"
-
-    return f"{intro}\n\n{body}"
+    # 一般成功訊息不再加「LeBron 幫你處理好了」。
+    return body
 
 
 # =========================================================
 # LINE 回覆
 # =========================================================
 def reply_to_line(reply_token, message, quick_reply=None):
+    # v91：最後出口再統一整理一次，確保白名單、例外 fallback、
+    # 一般流程、圖片流程、PDF 流程全部使用同一套簡潔排版。
+    message = _v91_compact_reply(message)
+
     if not reply_token:
         logger.warning("reply_token missing")
         return
@@ -14557,150 +14565,6 @@ def _route_message(user_id, user_text):
     except Exception:
         pass
     return reply
-
-
-# =========================================================
-# v91 2026-09-26：回覆變短、好讀（保留 LeBron 語氣）
-# 只改「文字長相」，不改任何判斷、查詢、寫入。
-#   1. 選單／說明文字縮短
-#   2. 送出前整理：多餘空行壓成一行、行尾空白去掉（行首縮排保留，清單層次不會亂）
-#   3. 「✅ 成功」開頭的回覆，就算下面有一行「找不到…」，也不會被 LeBron 說成「沒找到目標」
-# =========================================================
-FIXED_FALLBACK_MESSAGE = "⚠️ 這句我還看不懂 😅\n換個說法再傳一次，或輸入「功能」。"
-
-
-def _v84_access_gate(user_id, text):
-    t = str(text or "").strip()
-    if t in _V84_MY_ID_WORDS:
-        return f"🆔 你的 LINE ID\n{user_id}\n\n把這串傳給管理員即可開通。"
-    allowed = _v84_allowed_ids()
-    if not allowed or user_id in allowed:
-        return None
-    return f"🔒 尚未開通使用權限\nLINE ID：{user_id}\n\n把這串傳給管理員即可。"
-
-
-def get_main_menu_reply():
-    _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
-    return (
-        "🏠 主選單\n\n"
-        "📚 學校訂書\n"
-        "🏫 補習班訂書\n"
-        "📦 其他訂單\n"
-        "🔍 查老師／訂單／版本／人數\n"
-        "➕ 更多功能\n\n"
-        "直接講需求就行，不用背指令。"
-    )
-
-
-def get_greeting_reply():
-    _set_quick_reply(QUICK_REPLY_MAIN_ITEMS)
-    return (
-        "📚 大漢訂書小幫手\n\n"
-        "嗨 👋 今天要處理什麼？\n\n"
-        "直接講就行，不用背指令。\n"
-        "📷 有訂書照片也可以直接丟給我。"
-    )
-
-
-def get_query_menu_reply():
-    _set_quick_reply(QUICK_REPLY_QUERY_ITEMS)
-    return (
-        "🔍 查詢資料\n\n"
-        "直接選下面按鈕，或直接問：\n"
-        "「謝明清有幾個班」／「查001」"
-    )
-
-
-def get_help_reply():
-    _set_quick_reply(QUICK_REPLY_MORE_ITEMS)
-    return (
-        "📚 功能\n\n"
-        "📚 訂書\n"
-        "👨‍🏫 查老師\n"
-        "📅 查訂單\n"
-        "📖 查版本\n"
-        "📊 查人數\n"
-        "📷 拍照訂書\n"
-        "🏫 補習班訂書\n"
-        "📚 多書訂購\n"
-        "📦 其他訂單\n\n"
-        "直接講需求就可以。"
-    )
-
-
-def get_photo_order_help_reply():
-    return (
-        "📷 拍照訂書\n\n"
-        "直接上傳照片即可。\n\n"
-        "學校訂書：看得到老師＋書名\n"
-        "補習班：看得到名稱＋書名＋數量\n\n"
-        "我會先整理，再讓你確認；不會直接下單。"
-    )
-
-
-def get_ai_assistant_help_reply():
-    return (
-        "🧠 AI 助手\n\n"
-        "直接用平常說話的方式問就行。\n"
-        "例如：\n"
-        "• 張建國要訂段考王英文3\n"
-        "• 華興國一英文誰教？\n"
-        "• 王老師昨天訂了什麼？\n\n"
-        "涉及訂單異動，我還是會先請你確認。"
-    )
-
-
-def get_history_lookup_guide_reply():
-    return (
-        "📅 查訂單\n\n"
-        "可以直接說：\n"
-        "• 查001\n"
-        "• 今天／昨天的訂單\n"
-        "• 王老師的訂單\n\n"
-        "查到後可直接修改或取消。"
-    )
-
-
-def get_stats_lookup_guide_reply():
-    return (
-        "📊 查人數\n\n"
-        "直接輸入「學校＋年級」\n"
-        "例如：天母七年級"
-    )
-
-
-_V91_SHORTER = (
-    ("請稍後再試一次。", "晚點再試一次。"),
-    ("你可以換個方式再說一次", "換個說法再傳一次"),
-    ("如果需要重新開始，請輸入「重來」。", "要重來就輸入「重來」。"),
-)
-
-
-def _v91_tidy_one(text):
-    body = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
-    body = "\n".join(line.rstrip() for line in body.split("\n"))   # 只去行尾，行首縮排保留
-    for a, b in _V91_SHORTER:
-        body = body.replace(a, b)
-    body = re.sub(r"\n{3,}", "\n\n", body)
-    return body.strip()
-
-
-def _v91_tidy(message):
-    if isinstance(message, (list, tuple)):
-        return [_v91_tidy_one(x) for x in message if str(x or "").strip()]
-    return _v91_tidy_one(message)
-
-
-_v90_add_lebron_flavor = add_lebron_flavor
-
-
-def add_lebron_flavor(message):
-    out = _v90_add_lebron_flavor(message)
-    first = out[0] if isinstance(out, list) and out else out
-    if isinstance(first, str) and first.startswith("👑 LeBron James 這球沒找到目標\n\n✅"):
-        fixed = first.replace("👑 LeBron James 這球沒找到目標", "👑 LeBron James 這球漂亮收尾", 1)
-        out = [fixed] + list(out[1:]) if isinstance(out, list) else fixed
-    return _v91_tidy(out)
 
 if __name__ == "__main__":
     # 注意：正式環境（Render）是透過 gunicorn 啟動 Start Command，
